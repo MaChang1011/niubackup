@@ -1,0 +1,22 @@
+# build outputs
+out/
+**/out/
+*.class
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+*.apk
+local.properties
+
+# runtime state
+.machang-hashcache
+.machang-hashcache.tmp
+
+# merged fix copies (contents already in the main tree)
+android/fix1/
+
+# editor / OS
+.idea/
+*.iml
+.DS_Store

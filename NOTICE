@@ -1,0 +1,18 @@
+NiuBackup （牛备） — Third-Party Notices
+
+This project's own code is licensed under the MIT License (see LICENSE).
+
+Third-party component:
+
+- EasyTier (https://github.com/EasyTier/EasyTier), licensed under the
+  GNU Lesser General Public License v3.0 (LGPL-3.0).
+
+  EasyTier is used as dynamically loaded shared libraries
+  (android/app/src/main/jniLibs/arm64-v8a/libeasytier_ffi.so and
+  libeasytier_android_jni.so) together with its published JNI/Kotlin bridge
+  sources under android/app/src/main/java/com/easytier/jni/, which retain
+  their original copyright and license terms.
+
+  The EasyTier libraries remain replaceable by rebuilt versions without
+  modifying this project's code, and EasyTier's source code is available
+  from the upstream repository linked above.
