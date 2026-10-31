@@ -926,6 +926,7 @@ public class BackupReceiver {
             pendingReceipt = rr.pendingReceipt;
             sessionBytes += rr.bytes;
             allEntries.addAll(round);
+            if (rr.byeReceived) { byeConsumed = true; break; }
             if (terminator == null || "MANIFEST-END".equals(terminator) || rr.senderGone) break;
             // BATCH-END: the sender either starts another round or sends BYE.
         }
@@ -959,6 +960,10 @@ public class BackupReceiver {
     static final class RoundResult {
         long bytes;
         boolean senderGone;
+        /** The client sent BYE mid-round (a paused session): the round's
+         *  un-sent wants are simply not transferred — neither ok nor
+         *  failed — and the session closes through the normal epilogue. */
+        boolean byeReceived;
         /** Last stream-hash entry whose DONE was sent in this round and whose
          *  HASH-MISMATCH window is still open at round end (the verdict may
          *  arrive as the first line of the next round / before BYE). */
@@ -1119,6 +1124,19 @@ public class BackupReceiver {
                 flushFileReceipt(out, auth, pendingReceipt);
                 pendingReceipt = null;
                 lastStreamDone = null;
+            }
+            if (hdr.equals("BYE")) {
+                // Cooperative pause: the client ends the session with
+                // wants still outstanding in this round. Those files are
+                // not failures — they were never started — so leave them
+                // uncounted and let the session epilogue run (deferred
+                // stream receipt flush + whole-session receipt + the
+                // session row). Without this, BYE fell into the
+                // "sender stopped early" path below and the epilogue's
+                // best-effort BYE read then deadlocked against the
+                // client's receipt drain until the read timeout.
+                rr.byeReceived = true;
+                break;
             }
             if (batchRound && hdr.startsWith("FILE-ERROR ")) {
                 // The sender cannot open this file (deleted/unreadable since

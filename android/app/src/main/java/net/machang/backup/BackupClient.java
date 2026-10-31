@@ -151,6 +151,39 @@ public class BackupClient {
     /** Files the most recent scan skipped as unreadable (see class doc). */
     public volatile int lastSkippedCount;
 
+    // ---- cooperative pause (manual sessions) ----
+    // Set from another thread (the UI's 暂停备份 button) via requestStop();
+    // a session polls it at safe checkpoints only: between files, between
+    // batches, and at 64 KiB chunk boundaries inside a payload copy. A stop
+    // seen between files takes the normal BYE epilogue, so every pending
+    // per-file receipt is collected first. A stop seen mid-file aborts
+    // that file by closing the connection — the protocol has no in-file
+    // abort, and the receiver keeps the bytes that already arrived as its
+    // .part, so the next session resumes from exactly that offset.
+    // Receipts already verified + stored are never touched by a pause;
+    // one still queued at the receiver is re-issued through the next
+    // session's skip decisions, so pausing loses no evidence.
+    private volatile boolean stopRequested;
+    /** True when the most recent session ended because requestStop() fired. */
+    public volatile boolean lastStoppedByPause;
+
+    /**
+     * Ask the running session to pause at the next checkpoint. Safe to
+     * call from any thread, idempotent, and a no-op once the session is
+     * over. The flag is per-instance: the auto-backup worker drives its
+     * own BackupClient instance and is never paused by the manual UI.
+     */
+    public void requestStop() {
+        stopRequested = true;
+    }
+
+    /** Thrown out of a payload copy loop when a pause lands mid-file. */
+    private static final class StopRequestedException extends IOException {
+        StopRequestedException() {
+            super("pause requested mid-transfer");
+        }
+    }
+
     static final int PROTO = 1;
     public static final String DEFAULT_HOST = "10.200.0.2"; // laptop, mesh address
     public static final int DEFAULT_PORT = 28741;           // BackupReceiver
@@ -272,6 +305,7 @@ public class BackupClient {
 
     public int runBackup(String host, int port, String device, File rootDir,
                          ProgressListener progress) {
+        lastStoppedByPause = false;
         if (!v2()) {
             // Legacy v1 (the still-running M1 receiver): unchanged flow —
             // full scan first, then the single-manifest session.
@@ -578,6 +612,12 @@ public class BackupClient {
     private int runSingleManifest(InputStream in, OutputStream out, File rootDir,
                                   List<Entry> entries, ProgressListener progress) {
         int failures = 0;
+        // Hoisted above the try so a mid-file pause abort (caught below)
+        // can still report the counts of what completed before it.
+        int skipped = 0;
+        int okCount = 0;
+        long[] sentBytes = {0};
+        boolean stopped = false;
         try {
             for (Entry e : entries) {
                 Wire.writeLine(out, "{\"path\":\"" + MiniJson.esc(e.path) + "\",\"size\":" + e.size
@@ -586,7 +626,7 @@ public class BackupClient {
             Wire.writeLine(out, "MANIFEST-END");
 
             Map<String, Long> wanted = readDecisions(in);
-            int skipped = entries.size() - wanted.size();
+            skipped = entries.size() - wanted.size();
             logger.log("接收端需要 " + wanted.size() + " 个文件，跳过 " + skipped + " 个");
             for (Entry e : entries) {
                 // Not wanted = the receiver already holds this exact file.
@@ -600,9 +640,13 @@ public class BackupClient {
                 Entry e = byPath.get(w.getKey());
                 if (e != null) totalBytes += e.size - w.getValue();
             }
-            long[] sentBytes = {0};
-            int okCount = 0;
             for (Map.Entry<String, Long> w : wanted.entrySet()) {
+                // Pause checkpoint: between files — the session then
+                // finishes through the normal BYE epilogue below.
+                if (stopRequested) {
+                    stopped = true;
+                    break;
+                }
                 Entry e = byPath.get(w.getKey());
                 long offset = w.getValue();
                 long bytes = e.size - offset;
@@ -633,10 +677,29 @@ public class BackupClient {
                 logger.log("回执未取得：BYE 后未收到签名回执，本轮文件在手机侧无回执凭证");
             }
             sinkFlush();
+        } catch (StopRequestedException stop) {
+            // Mid-file pause: the FILE header already promised bytes the
+            // receiver is still waiting for, so no graceful close exists —
+            // returning lets the caller close the socket, and the receiver
+            // keeps the arrived prefix as .part for the next session's
+            // resume. Files completed before this one already collected
+            // their receipts during the session.
+            sinkFlush();
+            lastOkCount = okCount + skipped;
+            lastFailCount = failures;
+            lastBytesSent = sentBytes[0];
+            lastStoppedByPause = true;
+            logger.log("已暂停：当前文件传输中断，接收端保留已收部分，下次从断点续传");
+            return failures;
         } catch (IOException e) {
             sinkFlush();
             logger.log("连接/传输失败: " + e.getMessage());
             return Math.max(failures, 1);
+        }
+        if (stopped) {
+            lastStoppedByPause = true;
+            logger.log("已暂停：本轮到此为止（已完成文件的回执已在上方收齐，未传完的下次续传）");
+            return failures;
         }
         String tail = lastSkippedCount > 0
                 ? "，另跳过 " + lastSkippedCount + " 个无法读取的文件" : "";
@@ -694,22 +757,31 @@ public class BackupClient {
                                 List<File> files, HashSession hs, boolean streamHash,
                                 ProgressListener progress) {
         int failures = 0;
+        // Hoisted above the try so a mid-file pause abort (caught below)
+        // can still report the counts of what completed before it.
+        int okCount = 0, receiverSkipped = 0, offered = 0;
+        long[] sentBytes = {0};
+        boolean stopped = false;
+        MetaSession ms = null;
         try {
             int filesLimit = batchFilesLimit();
             long bytesLimit = batchBytesLimit();
             logger.log("分批备份模式：每批最多 " + filesLimit + " 个文件 / "
                     + (bytesLimit / (1024 * 1024)) + " MiB，扫一批传一批");
-            MetaSession ms = null;
             if (streamHash) {
                 logger.log("边传边算模式：不预先计算哈希，边传输边校验");
                 logger.log("扫描完成（元数据）：" + files.size() + " 个文件");
                 ms = new MetaSession(files.size());
             }
             String pendingMismatch = null; // stream-hash verdict owed for the previous file
-            int idx = 0, batchNo = 0, okCount = 0, receiverSkipped = 0, offered = 0;
+            int idx = 0, batchNo = 0;
             long decidedTotal = 0;
-            long[] sentBytes = {0};
             while (idx < files.size()) {
+                // Pause checkpoint: between batches — finish via BYE.
+                if (stopRequested) {
+                    stopped = true;
+                    break;
+                }
                 List<Entry> batch = new ArrayList<>();
                 long batchBytes = 0;
                 while (idx < files.size() && batch.size() < filesLimit
@@ -720,6 +792,12 @@ public class BackupClient {
                         batch.add(e);
                         batchBytes += e.size;
                     }
+                }
+                if (stopRequested) {
+                    // The stop landed while slicing this batch: nothing of
+                    // it was offered yet, so abandoning it is protocol-free.
+                    stopped = true;
+                    break;
                 }
                 if (batch.isEmpty()) continue; // this slice was all unreadable skips
                 batchNo++;
@@ -750,6 +828,12 @@ public class BackupClient {
                 logger.log("批次 " + batchNo + "：本批 " + batch.size() + " 个文件，接收端需要 "
                         + wanted.size() + " 个，跳过 " + skippedHere + " 个");
                 for (Map.Entry<String, Long> w : wanted.entrySet()) {
+                    // Pause checkpoint: between files — the batch-end
+                    // HASH-MISMATCH flush below still runs, then BYE.
+                    if (stopRequested) {
+                        stopped = true;
+                        break;
+                    }
                     Entry e = byPath.get(w.getKey());
                     long offset = w.getValue();
                     long bytes = e.size - offset;
@@ -821,6 +905,7 @@ public class BackupClient {
                             + MiniJson.esc(pendingMismatch) + "\"}");
                     pendingMismatch = null;
                 }
+                if (stopped) break;
             }
             if (streamHash) {
                 lastSkippedCount = ms.skippedCount;
@@ -842,14 +927,39 @@ public class BackupClient {
                 logger.log("回执未取得：BYE 后未收到签名回执，本轮文件在手机侧无回执凭证");
             }
             sinkFlush();
-            if (offered == 0) {
+            if (stopped) lastStoppedByPause = true;
+            if (offered == 0 && !stopped) {
                 logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
                 return 0;
             }
+        } catch (StopRequestedException stop) {
+            // Mid-file pause: returning closes the connection (the
+            // caller's try-with-resources); the receiver keeps the bytes
+            // that arrived as .part and the next session resumes from
+            // exactly that offset. A stream-hash verdict can never be
+            // owed at this point — a pending mismatch is always flushed
+            // before the next FILE header goes out.
+            sinkFlush();
+            if (streamHash) {
+                lastSkippedCount = ms.skippedCount;
+            } else if (hs != null) {
+                hs.finish();
+                lastSkippedCount = hs.skippedCount;
+            }
+            lastOkCount = okCount + receiverSkipped;
+            lastFailCount = failures;
+            lastBytesSent = sentBytes[0];
+            lastStoppedByPause = true;
+            logger.log("已暂停：当前文件传输中断，接收端保留已收部分，下次从断点续传");
+            return failures;
         } catch (IOException e) {
             sinkFlush();
             logger.log("连接/传输失败: " + e.getMessage());
             return Math.max(failures, 1);
+        }
+        if (lastStoppedByPause) {
+            logger.log("已暂停：本轮到此为止（已完成文件的回执已在上方收齐，未传完的下次续传）");
+            return failures;
         }
         String tail = lastSkippedCount > 0
                 ? "，另跳过 " + lastSkippedCount + " 个无法读取的文件" : "";
@@ -1102,6 +1212,8 @@ public class BackupClient {
         byte[] buf = new byte[64 * 1024];
         long left = n;
         while (left > 0) {
+            // Pause checkpoint: chunk boundary of an in-flight file.
+            if (stopRequested) throw new StopRequestedException();
             int r = in.read(buf, 0, (int) Math.min(buf.length, left));
             if (r == -1) throw new EOFException("source file shrank during send");
             out.write(buf, 0, r);
@@ -1136,6 +1248,8 @@ public class BackupClient {
         byte[] buf = new byte[64 * 1024];
         long left = n;
         while (left > 0) {
+            // Pause checkpoint: chunk boundary of an in-flight file.
+            if (stopRequested) throw new StopRequestedException();
             int r = in.read(buf, 0, (int) Math.min(buf.length, left));
             if (r == -1) throw new EOFException("source file shrank during send");
             md.update(buf, 0, r);

@@ -64,6 +64,13 @@ class MainActivity : Activity() {
     private lateinit var progressFile: TextView
     private lateinit var progressSize: TextView
     private lateinit var progressBar: Ui.ProgressBarView
+    private lateinit var pauseButton: Button
+
+    /** The manual session's client while one runs (null otherwise), so
+     *  the pause button can ask THAT instance to stop. The auto-backup
+     *  worker's client is a different instance and stays unaffected. */
+    @Volatile
+    private var runningClient: BackupClient? = null
     private lateinit var sessionLine: TextView
     private lateinit var logView: TextView
 
@@ -186,9 +193,20 @@ class MainActivity : Activity() {
             progressBadgeSlot.addView(
                 Ui.badge(this, "备份中 · ${BackupProgress.percent}%", Ui.StatusKind.RUN)
             )
+            // Pause belongs to the manual session only: during a worker
+            // session there is no manual client to stop, so hide it.
+            pauseButton.visibility = if (runningClient != null) View.VISIBLE else View.GONE
+            if (BackupProgress.pauseRequested) {
+                pauseButton.text = "正在暂停…"
+                pauseButton.isEnabled = false
+            } else {
+                pauseButton.text = "暂停备份"
+                pauseButton.isEnabled = true
+            }
         } else {
             progressCard.visibility = View.GONE
             backupButton.visibility = View.VISIBLE
+            backupButton.text = if (BackupProgress.paused) "继续备份" else "立即备份"
         }
         sessionLine.text =
             prefs().getString(KEY_LAST_SESSION, "暂无记录 — 完成一次备份后显示摘要")
@@ -338,6 +356,9 @@ class MainActivity : Activity() {
             } else {
                 BackupClient(logger, filesDir)
             }
+            runningClient = client
+            BackupProgress.paused = false
+            BackupProgress.pauseRequested = false
             BackupProgress.begin()
             val failures = try {
                 client.runBackup(host, port, BackupClient.DEVICE_NAME, dcim) { sent, total, path ->
@@ -345,10 +366,15 @@ class MainActivity : Activity() {
                 }
             } finally {
                 BackupProgress.end()
+                if (runningClient === client) runningClient = null
             }
+            val stoppedByPause = client.lastStoppedByPause
+            if (stoppedByPause) BackupProgress.paused = true
+            BackupProgress.pauseRequested = false
             val summary = buildString {
                 append("上次备份: ")
                 append(SimpleDateFormat("HH:mm", Locale.US).format(Date()))
+                if (stoppedByPause) append(" · 已暂停")
                 append(" · 成功 ${client.lastOkCount} 个 · ${fmtBytes(client.lastBytesSent)}")
                 if (failures > 0) append(" · 失败 $failures 个")
                 if (client.lastSkippedCount > 0) append(" · 跳过 ${client.lastSkippedCount} 个无法读取")
@@ -358,7 +384,7 @@ class MainActivity : Activity() {
                 try {
                     AccountClient(PcConn.serverUrl(this)).postSessionLog(
                         identity.token, client.lastOkCount, client.lastBytesSent,
-                        if (failures == 0) "ok" else "partial"
+                        if (stoppedByPause) "paused" else if (failures == 0) "ok" else "partial"
                     )
                     AppLog.log("会话记录已上报（仅计数）")
                 } catch (t: Throwable) {
@@ -366,6 +392,21 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    /**
+     * 暂停备份: ask the running manual session to stop at its next
+     * checkpoint (between files / batches, or the chunk boundary of an
+     * in-flight file). The client finishes gracefully — BYE epilogue
+     * when between files, connection close mid-file with the receiver's
+     * .part kept for resume — and this page then shows 已暂停 + 继续备份.
+     */
+    private fun onPauseBackup() {
+        val client = runningClient ?: return
+        BackupProgress.requestPause()
+        client.requestStop()
+        AppLog.log("已请求暂停：将在当前文件传完后停下；大文件会在块边界中断，未传完部分下次续传")
+        refreshSessionLine()
     }
 
     private fun fmtBytes(b: Long): String = when {
@@ -504,6 +545,10 @@ class MainActivity : Activity() {
             addView(fileRow)
             progressBar = Ui.progressBar(this@MainActivity, Ui.RUN)
             addView(progressBar)
+            pauseButton = Ui.ghostButton(this@MainActivity, "暂停备份").apply {
+                setOnClickListener { onPauseBackup() }
+            }
+            addView(pauseButton, Ui.spaced(Ui.matchWrap(), 10, this@MainActivity))
             addView(
                 Ui.subText(this@MainActivity, "正在经直连传输；断点续传已启用，中断后可继续。"),
                 Ui.spaced(Ui.matchWrap(), 8, this@MainActivity)
