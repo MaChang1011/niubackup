@@ -58,6 +58,15 @@ import java.util.function.IntSupplier;
  * token get the pre-batch flow byte-for-byte (full scan before the
  * backup connection; capability is probed on a throwaway fs-mode HELLO).
  *
+ * Stream-hash sessions (batch + {@code "streamhash":1}): the scan is
+ * METADATA-ONLY — no hash cache, no content reads before sending; the
+ * manifest carries an empty sha256. Each file is SHA-256'd while it
+ * streams (a resumed file's already-sent prefix is hashed from local
+ * storage first), the receiver answers DONE with the hash IT computed
+ * over the assembled file, and the two are compared here. A mismatch is
+ * reported as HASH-MISMATCH in the slot where the next FILE header would
+ * go; the receiver then deletes its copy and marks the record bad.
+ *
  * M4a (protocol v2): when user_id / device_id / device token are configured,
  * the client speaks protocol v2 — HELLO carries the identity plus the
  * EasyTier route cost to the PC (1 = p2p direct, &gt;=2 relay, -1 unknown;
@@ -185,10 +194,13 @@ public class BackupClient {
         // killed by the receiver's session read timeout. Capability is
         // therefore probed on a throwaway fs-mode HELLO, which writes no
         // backup session state on the receiver.
-        boolean batchCapable = probeBatchCapable(host, port);
-        HashSession hs = new HashSession(rootDir, files.size());
+        boolean[] caps = probeCaps(host, port);
+        boolean batchCapable = caps[0];
+        boolean streamCapable = caps[1];
+        HashSession hs = null; // lazy: stream-hash sessions never hash up front
         List<Entry> entries = null;
         if (!batchCapable) {
+            hs = new HashSession(rootDir, files.size());
             entries = hs.hashAll(rootDir, files);
             hs.finish();
             lastSkippedCount = hs.skippedCount;
@@ -219,11 +231,14 @@ public class BackupClient {
             }
             logger.log("协议 v2 握手成功（直连 cost=" + routeCost + "）");
             if (batchCapable && MiniJson.num(resp, "batch", 0) == 1) {
-                return runBatchSession(in, out, rootDir, files, hs, progress);
+                boolean streamHash = streamCapable && MiniJson.num(resp, "streamhash", 0) == 1;
+                if (!streamHash && hs == null) hs = new HashSession(rootDir, files.size());
+                return runBatchSession(in, out, rootDir, files, hs, streamHash, progress);
             }
             if (entries == null) {
                 // The probe advertised batch but this HELLO_ACK does not:
                 // fall back to the single-manifest flow on this connection.
+                if (hs == null) hs = new HashSession(rootDir, files.size());
                 entries = hs.hashAll(rootDir, files);
                 hs.finish();
                 lastSkippedCount = hs.skippedCount;
@@ -258,12 +273,13 @@ public class BackupClient {
     }
 
     /**
-     * Capability probe on a throwaway fs-mode connection: true when the
-     * receiver's HELLO_ACK advertises {@code "batch":1}. fs sessions write
+     * Capability probe on a throwaway fs-mode connection: returns
+     * {batch, streamhash} as advertised by the receiver's HELLO_ACK
+     * ({@code "batch":1} / {@code "streamhash":1}). fs sessions write
      * no backup session state on the receiver, so probing is side-effect
-     * free apart from one session log pair. Any failure → false.
+     * free apart from one session log pair. Any failure → both false.
      */
-    private boolean probeBatchCapable(String host, int port) {
+    private boolean[] probeCaps(String host, int port) {
         Socket rawSocket = new Socket();
         try (Socket s = rawSocket) {
             rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
@@ -279,10 +295,11 @@ public class BackupClient {
                     + "\",\"device_token\":\"" + MiniJson.esc(deviceToken)
                     + "\",\"route_cost\":" + routeCost + ",\"mode\":\"fs\"}");
             String resp = Wire.readLine(in);
-            return resp != null && resp.startsWith("HELLO_ACK")
-                    && MiniJson.num(resp, "batch", 0) == 1;
+            if (resp == null || !resp.startsWith("HELLO_ACK")) return new boolean[]{false, false};
+            return new boolean[]{MiniJson.num(resp, "batch", 0) == 1,
+                    MiniJson.num(resp, "streamhash", 0) == 1};
         } catch (Exception e) {
-            return false;
+            return new boolean[]{false, false};
         }
     }
 
@@ -407,16 +424,26 @@ public class BackupClient {
      * send); it counts failed and the session continues. The progress
      * total is the bytes decided SO FAR, so it grows as later batches
      * are decided — the UI percentage can step back when a new batch
-     * lands; that is expected, not a regression.
+     * lands; that is expected, not a regression. With streamHash the
+     * per-batch step is metadata-only and each file is hashed while it
+     * streams (see the class doc).
      */
     private int runBatchSession(InputStream in, OutputStream out, File rootDir,
-                                List<File> files, HashSession hs, ProgressListener progress) {
+                                List<File> files, HashSession hs, boolean streamHash,
+                                ProgressListener progress) {
         int failures = 0;
         try {
             int filesLimit = batchFilesLimit();
             long bytesLimit = batchBytesLimit();
             logger.log("分批备份模式：每批最多 " + filesLimit + " 个文件 / "
                     + (bytesLimit / (1024 * 1024)) + " MiB，扫一批传一批");
+            MetaSession ms = null;
+            if (streamHash) {
+                logger.log("边传边算模式：不预先计算哈希，边传输边校验");
+                logger.log("扫描完成（元数据）：" + files.size() + " 个文件");
+                ms = new MetaSession(files.size());
+            }
+            String pendingMismatch = null; // stream-hash verdict owed for the previous file
             int idx = 0, batchNo = 0, okCount = 0, receiverSkipped = 0, offered = 0;
             long decidedTotal = 0;
             long[] sentBytes = {0};
@@ -425,7 +452,8 @@ public class BackupClient {
                 long batchBytes = 0;
                 while (idx < files.size() && batch.size() < filesLimit
                         && (batch.isEmpty() || batchBytes < bytesLimit)) {
-                    Entry e = hs.hashOne(rootDir, files.get(idx++));
+                    Entry e = streamHash ? ms.metaOne(rootDir, files.get(idx++))
+                            : hs.hashOne(rootDir, files.get(idx++));
                     if (e != null) {
                         batch.add(e);
                         batchBytes += e.size;
@@ -455,11 +483,20 @@ public class BackupClient {
                     Entry e = byPath.get(w.getKey());
                     long offset = w.getValue();
                     long bytes = e.size - offset;
+                    if (pendingMismatch != null) {
+                        // The verdict for the PREVIOUS file goes in the
+                        // slot where this file's header would go.
+                        Wire.writeLine(out, "HASH-MISMATCH {\"path\":\""
+                                + MiniJson.esc(pendingMismatch) + "\"}");
+                        pendingMismatch = null;
+                    }
                     InputStream fis;
                     try {
                         fis = new FileInputStream(new File(rootDir, e.path));
                         try {
-                            skipFully(fis, offset);
+                            // Stream-hash reads the prefix back for
+                            // hashing during the send instead of skipping.
+                            if (!streamHash) skipFully(fis, offset);
                         } catch (IOException skipErr) {
                             try { fis.close(); } catch (IOException ignore) { }
                             throw skipErr;
@@ -476,22 +513,50 @@ public class BackupClient {
                     }
                     Wire.writeLine(out, "FILE {\"path\":\"" + MiniJson.esc(e.path)
                             + "\",\"bytes\":" + bytes + "}");
+                    String clientSha = null;
                     try (InputStream f = fis) {
-                        copyN(f, out, bytes, progress, sentBytes, decidedTotal, e.path);
+                        if (streamHash) {
+                            MessageDigest md = Hash.digest();
+                            if (offset > 0) hashPrefix(f, md, offset);
+                            copyNHash(f, out, bytes, md, progress, sentBytes, decidedTotal, e.path);
+                            clientSha = Hash.hex(md.digest());
+                        } else {
+                            copyN(f, out, bytes, progress, sentBytes, decidedTotal, e.path);
+                        }
                     }
                     out.flush();
                     String res = Wire.readLine(in);
                     if (res != null && res.startsWith("DONE")) {
-                        okCount++;
-                        logger.log("  已发送 " + e.path + " (" + bytes + " 字节，偏移 " + offset + ")");
+                        String rsha = streamHash ? MiniJson.str(res, "sha256") : null;
+                        if (streamHash && (rsha == null || !rsha.equals(clientSha))) {
+                            failures++;
+                            pendingMismatch = e.path;
+                            logger.log("  哈希不一致 " + e.path + "：本机=" + clientSha
+                                    + " 接收端=" + rsha + "，将通知接收端删除该副本");
+                        } else {
+                            okCount++;
+                            logger.log("  已发送 " + e.path + " (" + bytes + " 字节，偏移 " + offset + ")"
+                                    + (streamHash ? "，哈希校验一致" : ""));
+                        }
                     } else {
                         failures++;
                         logger.log("  失败 " + e.path + " -> " + res);
                     }
                 }
+                if (pendingMismatch != null) {
+                    // Last file of the batch: the verdict goes out before
+                    // the next batch's manifest (or BYE).
+                    Wire.writeLine(out, "HASH-MISMATCH {\"path\":\""
+                            + MiniJson.esc(pendingMismatch) + "\"}");
+                    pendingMismatch = null;
+                }
             }
-            hs.finish();
-            lastSkippedCount = hs.skippedCount;
+            if (streamHash) {
+                lastSkippedCount = ms.skippedCount;
+            } else {
+                hs.finish();
+                lastSkippedCount = hs.skippedCount;
+            }
             lastOkCount = okCount + receiverSkipped;
             lastFailCount = failures;
             lastBytesSent = sentBytes[0];
@@ -571,6 +636,43 @@ public class BackupClient {
         collectFiles(root, files);
         Collections.sort(files, (a, b) -> relPath(root, a).compareTo(relPath(root, b)));
         return files;
+    }
+
+    /**
+     * Metadata-only scan state for stream-hash sessions: stat only — no
+     * hash cache, no content reads; entries carry an empty sha. Same
+     * per-file skip tolerance and logging shape as {@link HashSession}.
+     */
+    private final class MetaSession {
+        final int total;
+        int done;
+        int skippedCount;
+
+        MetaSession(int total) {
+            this.total = total;
+        }
+
+        /** Stat one enumerated file; null when it was skipped as unreadable. */
+        Entry metaOne(File root, File f) {
+            String path = relPath(root, f);
+            Entry e = null;
+            try {
+                e = new Entry();
+                e.path = path;
+                e.size = f.length();
+                e.mtime = f.lastModified();
+                e.sha = ""; // unknown until the file streams (stream-hash)
+            } catch (Exception ex) { // per-file stat failure -> skip
+                skippedCount++;
+                logger.log("跳过无法读取的文件: " + path + " (" + ex.getMessage() + ")");
+                e = null;
+            }
+            done++;
+            if (done % 200 == 0 || done == total) {
+                logger.log("扫描进度（元数据）: " + done + "/" + total);
+            }
+            return e;
+        }
     }
 
     /**
@@ -713,6 +815,39 @@ public class BackupClient {
         }
     }
 
+    /** Stream-hash: read and hash n bytes WITHOUT sending (the resume
+     *  prefix [0, offset) of a partially transferred file), so the digest
+     *  ends up covering the whole file. */
+    static void hashPrefix(InputStream in, MessageDigest md, long n) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r == -1) throw new EOFException("source file shorter than resume offset");
+            md.update(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    /** Stream-hash: copyN-with-progress that also feeds every sent byte into md. */
+    static void copyNHash(InputStream in, OutputStream out, long n, MessageDigest md,
+                          ProgressListener progress, long[] sentBytes, long totalBytes,
+                          String currentPath) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r == -1) throw new EOFException("source file shrank during send");
+            md.update(buf, 0, r);
+            out.write(buf, 0, r);
+            left -= r;
+            sentBytes[0] += r;
+            if (progress != null) {
+                progress.onProgress(sentBytes[0], totalBytes, currentPath);
+            }
+        }
+    }
+
     static final class Entry {
         String path; long size; long mtime; String sha;
     }
@@ -833,22 +968,28 @@ final class Wire {
 }
 
 final class Hash {
-    static String sha256(File f) throws IOException {
-        MessageDigest md;
-        try { md = MessageDigest.getInstance("SHA-256"); }
+    static MessageDigest digest() {
+        try { return MessageDigest.getInstance("SHA-256"); }
         catch (Exception e) { throw new IllegalStateException(e); }
-        try (InputStream in = new FileInputStream(f)) {
-            byte[] buf = new byte[64 * 1024];
-            int n;
-            while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
-        }
-        byte[] d = md.digest();
+    }
+
+    static String hex(byte[] d) {
         StringBuilder b = new StringBuilder(d.length * 2);
         for (byte x : d) {
             b.append(Character.forDigit((x >> 4) & 0xF, 16));
             b.append(Character.forDigit(x & 0xF, 16));
         }
         return b.toString();
+    }
+
+    static String sha256(File f) throws IOException {
+        MessageDigest md = digest();
+        try (InputStream in = new FileInputStream(f)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
+        }
+        return hex(md.digest());
     }
 }
 

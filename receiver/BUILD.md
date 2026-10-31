@@ -79,6 +79,27 @@ java -cp out BackupSender --host ... --fs-thumb photo.jpg [--out thumb.jpg]
 # legacy v1 mode: omit --user/--device-id/--token
 ```
 
+## Stream-hash sessions (protocol v2 extension)
+
+When the HELLO_ACK advertises `"streamhash":1` alongside `"batch":1`,
+a batch session needs no hashing pass: the client's scan is
+metadata-only and manifest entries carry `"sha256":""` (unknown).
+Decisions for such an entry key on the files table: a row with the
+same size AND mtime, integrity `ok`, and a present stored copy of
+matching size is skipped (the row's stored hash stands); a `.part`
+whose `.part.meta` matches size+mtime resumes as usual; anything else
+is received from offset 0. The receiver SHA-256s each ASSEMBLED file
+itself; that hash is stored in the files table (which gained an
+`mtime` column for this; pre-existing rows have mtime 0 and are
+re-received once), goes into the signed receipt, and is returned in
+`DONE {"path":...,"sha256":...}`. The client, which hashed the file
+while streaming (hashing a resumed file's local prefix first),
+compares: on mismatch it sends `HASH-MISMATCH {"path":...}` in the
+slot where the next FILE header would go (or as the first line before
+the next round / BYE); the receiver deletes the stored copy, marks
+the row `bad`, and counts the file failed. Non-stream-hash rounds are
+unchanged in every detail.
+
 ## Batch sessions (protocol v2 extension)
 
 When the receiver answers HELLO with `HELLO_ACK {"ok":true,"batch":1}`,

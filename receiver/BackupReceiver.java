@@ -762,7 +762,7 @@ public class BackupReceiver {
         }
         if (auth.mode.equals("fs")) {
             // fs sessions are read-only and unlimited — no backup slot.
-            Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1}");
+            Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1,\"streamhash\":1}");
             log("v2 session start: user=" + auth.userId + " device=" + auth.deviceId + " mode=" + auth.mode);
             handleFs(in, out, auth);
             return;
@@ -776,7 +776,7 @@ public class BackupReceiver {
             return;
         }
         try {
-            Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1}");
+            Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1,\"streamhash\":1}");
             log("v2 session start: user=" + auth.userId + " device=" + auth.deviceId + " mode=" + auth.mode);
             Files.createDirectories(deviceDir);
             runBackupSession(in, out, deviceDir, auth);
@@ -835,6 +835,18 @@ public class BackupReceiver {
      * and the batch continues. In legacy single-manifest rounds the same
      * line is a protocol violation, exactly like any other unexpected
      * header.
+     *
+     * <p>Stream-hash rounds (the HELLO_ACK advertised
+     * {@code "streamhash":1}; entries carry {@code "sha256":""}): the
+     * scan was metadata-only, so decisions key on size+mtime against the
+     * files table, transfers are verified by the RECEIVER hashing the
+     * assembled file (its hash goes into the DONE reply, the record and
+     * the signed receipt), and the client cross-checks that hash against
+     * its own stream-computed one. A mismatch is reported with
+     * {@code HASH-MISMATCH {path}} in the slot where the next FILE header
+     * would go — inside the round's transfer loop, or, for the round's
+     * last file, as the first line before the next round / BYE (handled
+     * below via the pending-mismatch window).
      */
     void runBackupSession(InputStream in, OutputStream out, Path deviceDir, Auth auth) throws Exception {
         List<String> ok = new ArrayList<>();
@@ -844,16 +856,34 @@ public class BackupReceiver {
         long sessionBytes = 0;
         boolean byeConsumed = false;
         int rounds = 0;
+        // Stream-hash: the last stream entry whose DONE cross-check window
+        // is still open (the client may answer HASH-MISMATCH as the first
+        // line of the next round instead of inside the transfer loop).
+        Entry pendingMismatch = null;
         while (true) {
             // ---- read one manifest round ----
             List<Entry> round = new ArrayList<>();
             String terminator = null;
             String line;
+            boolean firstLine = true;
             while ((line = Wire.readLine(in)) != null) {
+                boolean first = firstLine;
+                firstLine = false;
                 if (line.equals("BATCH-END") || line.equals("MANIFEST-END") || line.equals("BYE")) {
                     terminator = line;
                     break;
                 }
+                if (first && pendingMismatch != null && line.startsWith("HASH-MISMATCH ")) {
+                    String fpath = MiniJson.str(line.substring("HASH-MISMATCH ".length()), "path");
+                    if (fpath != null && fpath.equals(pendingMismatch.path)) {
+                        applyHashMismatch(auth, pendingMismatch, ok, failed);
+                    } else {
+                        log("ignoring HASH-MISMATCH for unexpected path: " + line);
+                    }
+                    pendingMismatch = null;
+                    continue;
+                }
+                if (first) pendingMismatch = null; // any other first line closes the window
                 Entry e = new Entry();
                 e.path = MiniJson.str(line, "path");
                 e.size = MiniJson.num(line, "size", -1);
@@ -866,6 +896,7 @@ public class BackupReceiver {
             boolean batchRound = "BATCH-END".equals(terminator);
             RoundResult rr = runManifestRound(in, out, deviceDir, auth, round, batchRound,
                     ok, skipped, failed);
+            pendingMismatch = rr.pendingMismatch;
             sessionBytes += rr.bytes;
             allEntries.addAll(round);
             if (terminator == null || "MANIFEST-END".equals(terminator) || rr.senderGone) break;
@@ -894,6 +925,10 @@ public class BackupReceiver {
     static final class RoundResult {
         long bytes;
         boolean senderGone;
+        /** Last stream-hash entry whose DONE was sent in this round and whose
+         *  HASH-MISMATCH window is still open at round end (the verdict may
+         *  arrive as the first line of the next round / before BYE). */
+        Entry pendingMismatch;
     }
 
     /**
@@ -922,19 +957,26 @@ public class BackupReceiver {
             e.part = dest.resolveSibling(dest.getFileName().toString() + ".part");
             e.meta = dest.resolveSibling(dest.getFileName().toString() + ".part.meta");
             byPath.put(e.path, e);
+            // Stream-hash entry (batch rounds only): the client scanned
+            // metadata-only and does not know the content hash yet.
+            e.stream = batchRound && (e.sha == null || e.sha.isEmpty());
 
             // Receiver-side index: a matching files-table row + present copy = skip,
             // no re-hash of the stored file (the M3.5 receiver bottleneck fix).
+            // Stream-hash entries key the row match on size+mtime instead of
+            // the (unknown) content hash; the row's stored hash stands.
             if (auth != null) {
                 FileRow row = store.findFile(auth.userId, auth.deviceId, e.path);
-                if (row != null && row.size == e.size && row.sha256.equals(e.sha)
-                        && "ok".equals(row.integrity)
-                        && Files.isRegularFile(dest) && Files.size(dest) == e.size) {
+                if (row != null && "ok".equals(row.integrity)
+                        && Files.isRegularFile(dest) && Files.size(dest) == e.size
+                        && (e.stream
+                            ? (row.size == e.size && row.mtime == e.mtime)
+                            : (row.size == e.size && row.sha256.equals(e.sha)))) {
                     skipped.add(e.path);
                     continue;
                 }
             }
-            if (Files.isRegularFile(dest) && Files.size(dest) == e.size
+            if (!e.stream && Files.isRegularFile(dest) && Files.size(dest) == e.size
                     && Hash.sha256(dest).equals(e.sha)) {
                 skipped.add(e.path);
                 if (auth != null) recordVerified(auth, e, dest);
@@ -951,6 +993,18 @@ public class BackupReceiver {
                     Files.deleteIfExists(e.part);
                     Files.deleteIfExists(e.meta);
                 } else if (plen == e.size) {
+                    if (e.stream) {
+                        // Stream-hash: the .part IS the assembled file; the
+                        // receiver's own hash of it becomes the record +
+                        // receipt hash (no manifest hash exists to compare).
+                        e.sha = Hash.sha256(e.part);
+                        promote(e);
+                        ok.add(e.path);
+                        if (auth != null) recordVerified(auth, e, dest);
+                        log("completed from leftover .part (stream-hash, receiver-hashed): "
+                                + e.path);
+                        continue;
+                    }
                     if (Hash.sha256(e.part).equals(e.sha)) {
                         promote(e);
                         ok.add(e.path);
@@ -976,6 +1030,7 @@ public class BackupReceiver {
                 + toSend.size() + " to receive" + (batchRound ? " (batch round)" : ""));
 
         // ---- transfer, stop-and-wait per file ----
+        Entry lastStreamDone = null; // stream entry whose cross-check window is open
         for (int i = 0; i < toSend.size(); i++) {
             String hdr = Wire.readLine(in);
             if (hdr == null) {
@@ -984,6 +1039,27 @@ public class BackupReceiver {
                 rr.senderGone = true;
                 break;
             }
+            // Stream-hash cross-check window: the line right after a
+            // stream DONE may be the client's HASH-MISMATCH verdict for
+            // THAT file instead of this file's header.
+            if (batchRound && lastStreamDone != null && hdr.startsWith("HASH-MISMATCH ")) {
+                String fjson = hdr.substring("HASH-MISMATCH ".length());
+                String fpath = MiniJson.str(fjson, "path");
+                if (fpath != null && fpath.equals(lastStreamDone.path)) {
+                    applyHashMismatch(auth, lastStreamDone, ok, failed);
+                } else {
+                    log("ignoring HASH-MISMATCH for unexpected path: " + hdr);
+                }
+                lastStreamDone = null;
+                hdr = Wire.readLine(in);
+                if (hdr == null) {
+                    for (int j = i; j < toSend.size(); j++) failed.add(toSend.get(j).path);
+                    log("sender stopped early");
+                    rr.senderGone = true;
+                    break;
+                }
+            }
+            lastStreamDone = null; // any other line closes the window
             if (batchRound && hdr.startsWith("FILE-ERROR ")) {
                 // The sender cannot open this file (deleted/unreadable since
                 // the scan). No bytes follow and no reply is expected — the
@@ -1028,7 +1104,23 @@ public class BackupReceiver {
                 copyN(in, fos, bytes);
             }
             rr.bytes += bytes;
-            if (Hash.sha256(e.part).equals(e.sha)) {
+            if (e.stream) {
+                // Stream-hash: the receiver hashes the ASSEMBLED file;
+                // that hash becomes the record + receipt value and goes
+                // back in DONE so the client can cross-check it against
+                // the hash it computed while streaming.
+                String assembled = Hash.sha256(e.part);
+                e.sha = assembled;
+                promote(e);
+                Files.deleteIfExists(e.meta);
+                ok.add(e.path);
+                if (auth != null) recordVerified(auth, e, e.dest);
+                Wire.writeLine(out, "DONE {\"path\":\"" + MiniJson.esc(e.path)
+                        + "\",\"sha256\":\"" + assembled + "\"}");
+                log("received " + e.path + " (" + e.size + " bytes, resumed at " + e.offset
+                        + ", stream-hash sha256=" + assembled + ")");
+                lastStreamDone = e;
+            } else if (Hash.sha256(e.part).equals(e.sha)) {
                 promote(e);
                 Files.deleteIfExists(e.meta);
                 ok.add(e.path);
@@ -1044,7 +1136,34 @@ public class BackupReceiver {
                 log("FAILED (sha256 mismatch): " + e.path);
             }
         }
+        rr.pendingMismatch = lastStreamDone;
         return rr;
+    }
+
+    /**
+     * Stream-hash only: the client's cross-check rejected the copy this
+     * receiver just assembled (its stream hash differs from the DONE
+     * hash). The stored copy cannot be trusted: delete it, mark the
+     * files-table row integrity "bad", and move the file from ok to
+     * failed for the session (so it also leaves the signed receipt).
+     * The content-addressed thumbnail is left alone — other files with
+     * identical content may legitimately reference it.
+     */
+    void applyHashMismatch(Auth auth, Entry e, List<String> ok, List<String> failed) {
+        try { Files.deleteIfExists(e.dest); } catch (IOException ignore) { }
+        try { Files.deleteIfExists(e.part); } catch (IOException ignore) { }
+        try { Files.deleteIfExists(e.meta); } catch (IOException ignore) { }
+        if (auth != null) {
+            try {
+                store.markFileBad(auth.userId, auth.deviceId, e.path);
+            } catch (Exception ex) {
+                log("mark-bad failed for " + e.path + ": " + ex);
+            }
+        }
+        ok.remove(e.path);
+        failed.add(e.path);
+        log("HASH-MISMATCH from client for " + e.path
+                + " — stored copy deleted, record marked bad, counted failed");
     }
 
     /** Files-table write for a file whose stored copy is verified (transferred or already present). */
@@ -1056,7 +1175,7 @@ public class BackupReceiver {
             log("thumbnail failed for " + e.path + ": " + ex);
         }
         try {
-            store.upsertFile(auth.userId, auth.deviceId, e.path, e.size, e.sha,
+            store.upsertFile(auth.userId, auth.deviceId, e.path, e.size, e.mtime, e.sha,
                     System.currentTimeMillis(), "ok", thumb);
         } catch (Exception ex) {
             log("record write failed for " + e.path + ": " + ex);
@@ -1382,6 +1501,8 @@ public class BackupReceiver {
     static final class Entry {
         String path; long size; long mtime; String sha;
         long offset; Path dest; Path part; Path meta;
+        /** Stream-hash entry: batch round + empty manifest sha (set at decide time). */
+        boolean stream;
     }
 
     static final class DeviceRow {
@@ -1392,6 +1513,8 @@ public class BackupReceiver {
     static final class FileRow {
         long id; String userId, deviceId, relPath, sha256, integrity, thumb;
         long size, backedAt;
+        /** Source mtime recorded at ingest (stream-hash skip decisions key on size+mtime). */
+        long mtime;
     }
 
     // ------------------------------------------------------------------ SQLite store
@@ -1440,7 +1563,20 @@ public class BackupReceiver {
                         + "device_id TEXT NOT NULL, rel_path TEXT NOT NULL, size INTEGER NOT NULL, "
                         + "sha256 TEXT NOT NULL, backed_at INTEGER NOT NULL, "
                         + "integrity TEXT NOT NULL DEFAULT 'ok', thumb TEXT, "
+                        + "mtime INTEGER NOT NULL DEFAULT 0, "
                         + "UNIQUE(user_id, device_id, rel_path))");
+                // Migration for pre-stream-hash databases: files.mtime did
+                // not exist before. Rows written earlier keep mtime = 0,
+                // which simply never matches a real source mtime — a
+                // stream-hash session re-receives such a file once and the
+                // row is then complete. Safe, no backfill attempted.
+                boolean hasMtime = false;
+                try (ResultSet cols = db.getMetaData().getColumns(null, null, "files", "mtime")) {
+                    hasMtime = cols.next();
+                }
+                if (!hasMtime) {
+                    st.execute("ALTER TABLE files ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0");
+                }
                 st.execute("CREATE TABLE IF NOT EXISTS sessions ("
                         + "ts INTEGER NOT NULL, device_id TEXT NOT NULL, files_ok INTEGER NOT NULL, "
                         + "bytes INTEGER NOT NULL, result TEXT NOT NULL)");
@@ -1642,23 +1778,37 @@ public class BackupReceiver {
         }
 
         synchronized void upsertFile(String userId, String deviceId, String relPath, long size,
-                                     String sha256, long backedAt, String integrity,
+                                     long mtime, String sha256, long backedAt, String integrity,
                                      String thumb) throws SQLException {
             try (PreparedStatement q = db.prepareStatement(
-                    "INSERT INTO files(user_id, device_id, rel_path, size, sha256, backed_at, integrity, thumb) "
-                            + "VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO files(user_id, device_id, rel_path, size, mtime, sha256, backed_at, integrity, thumb) "
+                            + "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
                             + "ON CONFLICT(user_id, device_id, rel_path) DO UPDATE SET "
-                            + "size = excluded.size, sha256 = excluded.sha256, "
+                            + "size = excluded.size, mtime = excluded.mtime, sha256 = excluded.sha256, "
                             + "backed_at = excluded.backed_at, integrity = excluded.integrity, "
                             + "thumb = excluded.thumb")) {
                 q.setString(1, userId);
                 q.setString(2, deviceId);
                 q.setString(3, relPath);
                 q.setLong(4, size);
-                q.setString(5, sha256);
-                q.setLong(6, backedAt);
-                q.setString(7, integrity);
-                q.setString(8, thumb);
+                q.setLong(5, mtime);
+                q.setString(6, sha256);
+                q.setLong(7, backedAt);
+                q.setString(8, integrity);
+                q.setString(9, thumb);
+                q.executeUpdate();
+            }
+        }
+
+        /** Stream-hash cross-check failure: keep the row (and its receiver
+         *  hash) but flag the stored copy as untrusted. */
+        synchronized void markFileBad(String userId, String deviceId, String relPath)
+                throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "UPDATE files SET integrity = 'bad' WHERE user_id = ? AND device_id = ? AND rel_path = ?")) {
+                q.setString(1, userId);
+                q.setString(2, deviceId);
+                q.setString(3, relPath);
                 q.executeUpdate();
             }
         }
@@ -1763,6 +1913,7 @@ public class BackupReceiver {
             f.backedAt = rs.getLong("backed_at");
             f.integrity = rs.getString("integrity");
             f.thumb = rs.getString("thumb");
+            f.mtime = rs.getLong("mtime");
             return f;
         }
     }

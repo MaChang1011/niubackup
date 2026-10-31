@@ -32,6 +32,18 @@ import java.util.stream.Stream;
  * reported as FILE-ERROR (counts failed, session continues). Receivers
  * without the token get the single-manifest flow, unchanged.
  *
+ * Stream-hash mode: when the HELLO_ACK additionally advertises
+ * "streamhash":1, the scan is METADATA-ONLY (path/size/mtime, manifest
+ * sha256 empty): no hash cache, no content reads before sending. Each
+ * file is SHA-256'd while it streams (a resumed file's already-sent
+ * prefix is hashed from local disk first), the receiver answers DONE
+ * with the hash IT computed over the assembled file, and the two are
+ * compared here. A mismatch is reported as HASH-MISMATCH in the slot
+ * where the next FILE header would go; the receiver then deletes its
+ * copy and marks the record bad. Test hook: env NB_TAMPER=1 flips one
+ * byte mid-stream of the first sent file (the client hash still covers
+ * the true bytes) to exercise that path — never set it outside tests.
+ *
  * Usage:
  *   java BackupSender --host 10.200.0.2 [--port 28742] --dir &lt;sourceDir&gt;
  *       --user &lt;id&gt; --device-id &lt;id&gt; --token &lt;hex&gt; [--route-cost 1]
@@ -150,7 +162,8 @@ public class BackupSender {
                 String ack = helloV2(in, out, "backup");
                 if (ack == null) return 1;
                 if (MiniJson.num(ack, "batch", 0) == 1) {
-                    return runBatchBackup(in, out, dir);
+                    boolean streamHash = MiniJson.num(ack, "streamhash", 0) == 1;
+                    return runBatchBackup(in, out, dir, streamHash);
                 }
                 List<Entry> entries = scan(dir);
                 System.out.println("scanned " + entries.size() + " files under " + dir);
@@ -270,13 +283,22 @@ public class BackupSender {
      * ONE signed receipt over the whole session. A wanted file that cannot
      * be opened when its turn comes is reported as FILE-ERROR instead of
      * the FILE header (it may have vanished between scan and send) and
-     * counts failed without aborting the session.
+     * counts failed without aborting the session. With streamHash (the
+     * receiver also advertised "streamhash":1) the per-batch "hash" step
+     * is metadata-only; see the class doc.
      */
-    static int runBatchBackup(InputStream in, OutputStream out, Path dir) throws Exception {
+    static int runBatchBackup(InputStream in, OutputStream out, Path dir,
+                              boolean streamHash) throws Exception {
         List<Path> files = enumerate(dir);
         System.out.println("batch mode: enumerated " + files.size() + " files under " + dir
                 + " (batch limit " + batchFilesLimit() + " files / " + batchBytesLimit() + " bytes)");
-        ScanState st = new ScanState(dir, files.size());
+        if (streamHash) {
+            System.out.println("stream-hash mode: metadata-only scan — no hash cache, "
+                    + "no content reads before sending; files are hashed while streaming");
+        }
+        ScanState st = new ScanState(dir, files.size(), streamHash);
+        String pendingMismatch = null; // stream-hash verdict owed for the previous file
+        boolean[] tamperArmed = { streamHash && env("NB_TAMPER") != null };
         int filesLimit = batchFilesLimit();
         long bytesLimit = batchBytesLimit();
         int idx = 0, batchNo = 0, failures = 0;
@@ -285,7 +307,7 @@ public class BackupSender {
             long batchBytes = 0;
             while (idx < files.size() && batch.size() < filesLimit
                     && (batch.isEmpty() || batchBytes < bytesLimit)) {
-                Entry e = st.hashOne(files.get(idx++));
+                Entry e = streamHash ? st.metaOne(files.get(idx++)) : st.hashOne(files.get(idx++));
                 if (e != null) {
                     batch.add(e);
                     batchBytes += e.size;
@@ -309,11 +331,20 @@ public class BackupSender {
                 Entry e = byPath.get(w.getKey());
                 long offset = w.getValue();
                 long bytes = e.size - offset;
+                if (pendingMismatch != null) {
+                    // The verdict for the PREVIOUS file goes in the slot
+                    // where this file's header would go (no reply awaited).
+                    Wire.writeLine(out, "HASH-MISMATCH {\"path\":\""
+                            + MiniJson.esc(pendingMismatch) + "\"}");
+                    pendingMismatch = null;
+                }
                 InputStream fis;
                 try {
                     fis = Files.newInputStream(dir.resolve(e.path));
                     try {
-                        skipFully(fis, offset);
+                        // Stream-hash reads the prefix back for hashing
+                        // during the send; only hashed mode skips blindly.
+                        if (!streamHash) skipFully(fis, offset);
                     } catch (IOException skipErr) {
                         try { fis.close(); } catch (IOException ignore) { }
                         throw skipErr;
@@ -331,17 +362,47 @@ public class BackupSender {
                 }
                 Wire.writeLine(out, "FILE {\"path\":\"" + MiniJson.esc(e.path)
                         + "\",\"bytes\":" + bytes + "}");
+                String clientSha = null;
                 try (InputStream f = fis) {
-                    copyN(f, out, bytes);
+                    if (streamHash) {
+                        MessageDigest md = Hash.digest();
+                        if (offset > 0) hashPrefix(f, md, offset);
+                        if (tamperArmed[0] && bytes >= 2) {
+                            tamperArmed[0] = false;
+                            copyNHashTamper(f, out, bytes, md, bytes / 2);
+                        } else {
+                            copyNHash(f, out, bytes, md);
+                        }
+                        clientSha = Hash.hex(md.digest());
+                    } else {
+                        copyN(f, out, bytes);
+                    }
                 }
                 out.flush();
                 String res = Wire.readLine(in);
                 if (res != null && res.startsWith("DONE")) {
-                    System.out.println("  sent " + e.path + " (" + bytes + " bytes from offset " + offset + ")");
+                    String rsha = streamHash ? MiniJson.str(res, "sha256") : null;
+                    if (streamHash && (rsha == null || !rsha.equals(clientSha))) {
+                        failures++;
+                        pendingMismatch = e.path;
+                        System.out.println("  HASH-MISMATCH " + e.path + ": client sha256="
+                                + clientSha + " receiver sha256=" + rsha);
+                    } else {
+                        System.out.println("  sent " + e.path + " (" + bytes + " bytes from offset "
+                                + offset + ")" + (streamHash ? ", stream-hash verified" : ""));
+                    }
                 } else {
                     failures++;
                     System.out.println("  FAILED " + e.path + " -> " + res);
                 }
+            }
+            if (pendingMismatch != null) {
+                // Last file of the batch: the verdict goes out before the
+                // next batch's manifest (or BYE); the receiver consumes it
+                // as the first line of the next round.
+                Wire.writeLine(out, "HASH-MISMATCH {\"path\":\""
+                        + MiniJson.esc(pendingMismatch) + "\"}");
+                pendingMismatch = null;
             }
         }
         st.finish();
@@ -480,9 +541,38 @@ public class BackupSender {
         int skippedCount;
 
         ScanState(Path root, int total) {
+            this(root, total, false);
+        }
+
+        /** metadataOnly (stream-hash sessions): no cache is loaded at all. */
+        ScanState(Path root, int total, boolean metadataOnly) {
             this.root = root;
             this.total = total;
-            this.cache = HashCache.load(root.resolve(HashCache.FILE_NAME));
+            this.cache = metadataOnly ? null : HashCache.load(root.resolve(HashCache.FILE_NAME));
+        }
+
+        /** Metadata-only twin of hashOne for stream-hash sessions: stat
+         *  only — no cache, no content reads. Same per-file skip tolerance. */
+        Entry metaOne(Path p) {
+            String rel = root.relativize(p).toString().replace(File.separatorChar, '/');
+            Entry e = null;
+            try {
+                e = new Entry();
+                e.path = rel;
+                e.size = Files.size(p);
+                e.mtime = Files.getLastModifiedTime(p).toMillis();
+                e.sha = ""; // unknown until the file streams (stream-hash)
+            } catch (Exception ex) { // per-file stat failure -> skip
+                skippedCount++;
+                System.out.println("  skipped unreadable file: " + rel
+                        + " (" + ex.getMessage() + ")");
+                e = null;
+            }
+            done++;
+            if (done % 200 == 0 || done == total) {
+                System.out.println("  scan progress (metadata): " + done + "/" + total);
+            }
+            return e;
         }
 
         /** Hash one enumerated file; null when it was skipped as unreadable. */
@@ -511,6 +601,12 @@ public class BackupSender {
 
         /** Flush the cache and print the scan summary lines. */
         void finish() {
+            if (cache == null) { // metadata-only (stream-hash) scan
+                if (skippedCount > 0) {
+                    System.out.println("scan skipped " + skippedCount + " unreadable file(s)");
+                }
+                return;
+            }
             try {
                 cache.persistIfDirty();
             } catch (IOException ex) {
@@ -557,6 +653,63 @@ public class BackupSender {
             int r = in.read(buf, 0, (int) Math.min(buf.length, left));
             if (r == -1) throw new EOFException("source file shrank during send");
             out.write(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    /** Stream-hash: read and hash n bytes WITHOUT sending (the resume
+     *  prefix [0, offset) of a partially transferred file), so the digest
+     *  ends up covering the whole file. */
+    static void hashPrefix(InputStream in, MessageDigest md, long n) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r == -1) throw new EOFException("source file shorter than resume offset");
+            md.update(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    /** Stream-hash: copyN that also feeds every sent byte into md. */
+    static void copyNHash(InputStream in, OutputStream out, long n,
+                          MessageDigest md) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r == -1) throw new EOFException("source file shrank during send");
+            md.update(buf, 0, r);
+            out.write(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    /**
+     * TEST HOOK (NB_TAMPER): like copyNHash, but flips one byte of the
+     * stream at flipAt (offset within the sent range) WITHOUT telling the
+     * digest — md still covers the true bytes, so the receiver's hash of
+     * what actually arrived differs and the HASH-MISMATCH path fires.
+     */
+    static void copyNHashTamper(InputStream in, OutputStream out, long n,
+                                MessageDigest md, long flipAt) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n, pos = 0;
+        boolean flipped = false;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r == -1) throw new EOFException("source file shrank during send");
+            md.update(buf, 0, r); // the client hash always covers the TRUE bytes
+            if (!flipped && flipAt >= pos && flipAt < pos + r) {
+                byte[] mut = buf.clone();
+                mut[(int) (flipAt - pos)] ^= 0xFF;
+                out.write(mut, 0, r);
+                flipped = true;
+                System.out.println("  [NB_TAMPER] flipped one byte at sent-range offset " + flipAt);
+            } else {
+                out.write(buf, 0, r);
+            }
+            pos += r;
             left -= r;
         }
     }
