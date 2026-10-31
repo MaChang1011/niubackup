@@ -44,26 +44,42 @@ class RecordsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val page = Ui.page(this, Ui.Page.RECORDS)
+        val col = page.content
+        col.addView(Ui.header(this, "记录", "电脑上的备份记录"))
         statusView = TextView(this).apply {
             text = "正在读取电脑上的备份记录…"
-            setPadding(24, 24, 24, 12)
+            textSize = 13.5f
+            setTextColor(Ui.TEXT_SUB)
+            setPadding(Ui.dp(this@RecordsActivity, 16), 4, Ui.dp(this@RecordsActivity, 16), 8)
         }
         listView = ListView(this).apply {
             adapter = RecordAdapter()
             setOnItemClickListener { _, _, pos, _ -> onRecordTap(records[pos]) }
         }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(statusView)
-            addView(
-                listView,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-                )
+        col.addView(statusView)
+        col.addView(
+            listView,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
-        }
-        setContentView(root)
+        )
+        createdOnce = true
         loadRecords()
+    }
+
+    private var createdOnce = false
+    private var wasPaused = false
+
+    override fun onResume() {
+        super.onResume()
+        // singleTop tab: reload when returning to this page.
+        if (createdOnce && wasPaused) loadRecords()
+    }
+
+    override fun onPause() {
+        wasPaused = true
+        super.onPause()
     }
 
     private fun loadRecords() {
@@ -98,10 +114,10 @@ class RecordsActivity : Activity() {
 
     private fun show(list: List<FsClient.Record>, staleAt: Long?) {
         records = list
-        val label = if (staleAt == null) {
-            "实时记录 · 共 ${list.size} 个文件"
-        } else {
-            "电脑离线 · 记录截至 ${fmtTime(staleAt)} · 共 ${list.size} 个文件"
+        val label = when {
+            list.isEmpty() -> "电脑上暂无备份记录。先在「备份」页完成一次备份。"
+            staleAt == null -> "实时记录 · 共 ${list.size} 个文件"
+            else -> "电脑离线 · 记录截至 ${fmtTime(staleAt)} · 共 ${list.size} 个文件"
         }
         statusView.text = label
         (listView.adapter as BaseAdapter).notifyDataSetChanged()

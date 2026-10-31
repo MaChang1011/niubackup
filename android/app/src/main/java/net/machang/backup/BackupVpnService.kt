@@ -23,6 +23,13 @@ import kotlin.concurrent.thread
  *
  * The mesh secret arrives via the start Intent (from MainActivity's settings)
  * and is never persisted by this service or baked into code.
+ *
+ * Foreground-service strategy (two steps, see promoteBoot /
+ * promoteToForeground): onStartCommand first promotes with the dataSync
+ * type — legal before the VPN exists — so the startForegroundService
+ * contract is met even when mesh startup is slow; after establish() the
+ * service switches to the systemExempted type its manifest primarily
+ * declares.
  */
 class BackupVpnService : VpnService() {
 
@@ -53,10 +60,23 @@ class BackupVpnService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> {
                 stopMesh()
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
             else -> {
+                // FGS contract first, slow work second. startForegroundService
+                // gives us ~5 s to call startForeground; the mesh startup
+                // (config fetch + JNI init + establish) can exceed that, which
+                // is exactly what crashed us with
+                // ForegroundServiceDidNotStartInTimeException. So promote
+                // IMMEDIATELY with the dataSync type (legal pre-VPN — see
+                // promoteBoot), then run startup on the worker thread; after
+                // establish() succeeds, promoteToForeground() switches the
+                // service to the systemExempted type. This also covers the
+                // error paths below: they promote first, then fail gracefully
+                // with a log line and stopSelf — never a crash.
+                promoteBoot()
                 val fullConfig = intent?.getStringExtra(EXTRA_CONFIG)
                 if (!fullConfig.isNullOrBlank()) {
                     if (!running) {
@@ -78,7 +98,7 @@ class BackupVpnService : VpnService() {
                 val secret = intent?.getStringExtra(EXTRA_SECRET).orEmpty()
                 if (secret.isBlank()) {
                     AppLog.log("组网密钥为空，无法启动组网")
-                    stopSelf()
+                    demoteAndStop()
                     return START_NOT_STICKY
                 }
                 if (!running) {
@@ -99,14 +119,16 @@ class BackupVpnService : VpnService() {
         config: String, instanceName: String, tunIp: String, tunPrefix: Int,
         routeNet: String, routePrefix: Int, session: String
     ) {
-        // NOTE: foreground promotion happens only after establish() below —
-        // the systemExempted FGS type requires this app to already be the
-        // active VPN, otherwise startForeground throws SecurityException.
+        // NOTE: the boot promotion (dataSync type) already happened on the
+        // main thread in onStartCommand. Switching to the systemExempted type
+        // still has to wait for establish() below — that type requires this
+        // app to already be the active VPN, otherwise startForeground throws
+        // SecurityException.
         val err = EasyTierBridge.startInstance(config)
         if (err.isNotEmpty()) {
             AppLog.log(err)
             running = false
-            stopSelf()
+            demoteAndStop()
             return
         }
         AppLog.log("EasyTier 实例已启动，正在建立 TUN…")
@@ -123,14 +145,14 @@ class BackupVpnService : VpnService() {
             AppLog.log("建立 TUN 失败: ${t.message}")
             running = false
             EasyTierBridge.stopInstance()
-            stopSelf()
+            demoteAndStop()
             return
         }
         if (pfd == null) {
             AppLog.log("建立 TUN 失败: establish() 返回 null")
             running = false
             EasyTierBridge.stopInstance()
-            stopSelf()
+            demoteAndStop()
             return
         }
         tun = pfd
@@ -167,21 +189,98 @@ class BackupVpnService : VpnService() {
 
     override fun onDestroy() {
         if (running) stopMesh()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
 
+    /** Leave the foreground state and stop — the graceful failure exit. */
+    private fun demoteAndStop() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun ensureChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "组网备份", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+    }
+
+    private fun buildNotification(text: String): Notification =
+        Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("牛备组网")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .build()
+
     /**
-     * Promote to a foreground service, retrying briefly: the platform grants
-     * the `android:activate_vpn` appop (one of the systemExempted prerequisites)
-     * when the VPN becomes active, which can lag establish() by a short moment.
-     * If promotion ultimately fails we log and carry on instead of crashing —
-     * the mesh itself does not depend on the notification.
+     * Boot promotion: satisfies the startForegroundService contract
+     * immediately, before any slow startup work runs.
+     *
+     * Why dataSync and not systemExempted: the systemExempted type carries a
+     * runtime prerequisite — the FOREGROUND_SERVICE_SYSTEM_EXEMPTED permission
+     * (held, in the manifest) PLUS one of SCHEDULE_EXACT_ALARM /
+     * USE_EXACT_ALARM / the `android:activate_vpn` appop, and that appop only
+     * exists once THIS app is the active VPN. Passing SYSTEM_EXEMPTED to
+     * startForeground before establish() therefore throws SecurityException
+     * (the M2 finding). dataSync's only prerequisite is the
+     * FOREGROUND_SERVICE_DATA_SYNC permission, which we hold unconditionally,
+     * so the typed call cannot throw it pre-VPN. The manifest declares both
+     * types (systemExempted|dataSync), which is what makes the runtime type
+     * argument legal. The dataSync phase is brief: promoteToForeground()
+     * switches the service to systemExempted right after establish(), which
+     * also keeps us clear of the Android 15 dataSync time limits.
+     *
+     * Fallbacks are belt-and-braces only: if the typed call ever threw, the
+     * plain two-arg overload is tried next; if even that fails we log and let
+     * startup proceed (killing the whole mesh over a notification would be
+     * worse) — in practice the dataSync call is the one that lands.
+     */
+    private fun promoteBoot() {
+        ensureChannel()
+        val notif = buildNotification("组网启动中…")
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        } catch (t: Throwable) {
+            try {
+                startForeground(NOTIF_ID, notif)
+            } catch (t2: Throwable) {
+                AppLog.log("警告: 前台服务启动失败，组网继续启动: ${t2.message}")
+            }
+        }
+    }
+
+    /**
+     * Post-establish promotion: switch the foreground type to systemExempted
+     * (the correct long-run type for a VPN service) and refresh the
+     * notification text. Retries briefly: the platform grants the
+     * `android:activate_vpn` appop when the VPN becomes active, which can lag
+     * establish() by a short moment. If the switch ultimately fails we log and
+     * carry on with the dataSync boot promotion instead of crashing — the
+     * mesh itself does not depend on the notification.
      */
     private fun promoteToForeground() {
         var lastError: SecurityException? = null
         repeat(6) { attempt ->
             try {
-                startForegroundCompat()
+                ensureChannel()
+                val notif = buildNotification(notifText)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(
+                        NOTIF_ID, notif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+                    )
+                } else {
+                    startForeground(NOTIF_ID, notif)
+                }
                 if (attempt > 0) AppLog.log("前台服务已启动（第 ${attempt + 1} 次尝试）")
                 return
             } catch (e: SecurityException) {
@@ -189,25 +288,6 @@ class BackupVpnService : VpnService() {
                 Thread.sleep(300)
             }
         }
-        AppLog.log("警告: 前台服务启动失败，组网继续运行: ${lastError?.message}")
-    }
-
-    private fun startForegroundCompat() {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm?.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "组网备份", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-        val notif: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("组网备份")
-            .setContentText(notifText)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
+        AppLog.log("警告: 前台服务类型切换失败，组网继续运行: ${lastError?.message}")
     }
 }

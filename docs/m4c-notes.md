@@ -145,3 +145,12 @@ New pieces:
 * `ReceiptStore` — generalizes M4a's `last-receipt.json`: every signature-
   *verified
 ...[truncated 5626 chars]
+## Addendum (2026-10-31) — login-session persistence
+
+Both clients now persist the account session （登录后保存会话）: the PC
+restores from account.json straight into the GUI's logged-in card and
+rolls the 30-day rotating refresh token at launch (new `--logout` CLI;
+rejection -> wipe + re-login form); the Android app gained
+`SessionRestore` (silent refresh rotation on cold start, expired-session
+hint, device identity retained across session expiry). Full behavior,
+evidence and remaining limits: docs/session-persistence.md.

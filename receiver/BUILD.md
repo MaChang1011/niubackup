@@ -93,6 +93,12 @@ java -cp classes:$CP BackupReceiver --devices  --data-dir ~/.niubackup
 java -cp classes:$CP BackupReceiver --approve <deviceId> --data-dir ~/.niubackup
 java -cp classes:$CP BackupReceiver --sync     --data-dir ~/.niubackup
 
+# sign out: revoke the stored refresh token server-side (best effort) and
+# delete account.json; the GUI's 退出登录 does the same. The session in
+# account.json otherwise persists across restarts (see
+# docs/session-persistence.md)
+java -cp classes:$CP BackupReceiver --logout   --data-dir ~/.niubackup
+
 # PC operator UI / packaging entry point (same classes)
 java -cp classes:$CP NiuPcApp                 # Swing window + tray
 java -cp classes:$CP NiuPcApp --serve --account ...   # headless passthrough

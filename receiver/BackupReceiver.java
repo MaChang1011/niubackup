@@ -130,7 +130,7 @@ public class BackupReceiver {
         String bind = System.getenv("BACKUP_BIND");
         Path dataDir = null;
         boolean allowV1 = false, seed = false, verify = false;
-        boolean login = false, accountMode = false, syncCmd = false, devicesCmd = false;
+        boolean login = false, logout = false, accountMode = false, syncCmd = false, devicesCmd = false;
         boolean noMesh = false;
         String server = System.getenv("NB_SERVER");
         String approveId = null, meshBin = null, pcIp = null;
@@ -144,6 +144,7 @@ public class BackupReceiver {
                 case "--seed": seed = true; break;
                 case "--verify": verify = true; break;
                 case "--login": login = true; break;
+                case "--logout": logout = true; break;
                 case "--account": accountMode = true; break;
                 case "--sync": syncCmd = true; break;
                 case "--devices": devicesCmd = true; break;
@@ -189,6 +190,17 @@ public class BackupReceiver {
                     + " pc_ip=" + st.pcIp);
             System.out.println("account state saved to " + dataDir.resolve("account.json")
                     + " (mode 600; the pc device token is stored there, never printed)");
+            return;
+        }
+        if (logout) {
+            AccountLink.State st = AccountLink.load(dataDir);
+            if (st == null) {
+                System.out.println("no saved session in " + dataDir + " (already logged out)");
+                return;
+            }
+            AccountLink.logoutSession(st);
+            System.out.println("logged out: refresh token revoked server-side (best effort), "
+                    + dataDir.resolve("account.json") + " removed");
             return;
         }
         if (approveId != null || syncCmd || devicesCmd) {
@@ -1595,6 +1607,63 @@ final class AccountLink {
         requireOk(r, "login");
         return new String[]{MiniJson.str(r.body, "access_token"),
                 MiniJson.str(r.body, "refresh_token")};
+    }
+
+    /** Outcome of a session-restore attempt against the stored refresh token. */
+    enum RefreshResult { OK, REJECTED, UNREACHABLE }
+
+    /**
+     * Session persistence (2026-10-31): POST /api/auth/refresh (rotating)
+     * with the state's refresh token — the pair the server issued at login
+     * (access 2 h, refresh 30 days, each refresh mints a fresh 30-day
+     * refresh token, so a client that reaches the service at least once a
+     * month stays signed in indefinitely; no password is ever stored).
+     * OK: st.refreshToken replaced by the rotated one and account.json
+     * re-saved. REJECTED: the server answered 401/403 — the session is dead
+     * (refresh revoked/expired or the user disabled); the caller drops the
+     * saved state and asks for the password again. UNREACHABLE: transport
+     * failure or no refresh token stored — the session may still be fine,
+     * keep the saved state untouched.
+     */
+    static RefreshResult refreshSession(State st) {
+        if (st == null || st.refreshToken == null || st.refreshToken.isEmpty()) {
+            return RefreshResult.UNREACHABLE;
+        }
+        ApiResult r;
+        try {
+            r = http("POST", st.server + "/api/auth/refresh", null,
+                    "{\"refresh_token\":\"" + MiniJson.esc(st.refreshToken) + "\"}");
+        } catch (Exception e) {
+            return RefreshResult.UNREACHABLE;
+        }
+        if (r.status == 401 || r.status == 403) return RefreshResult.REJECTED;
+        if (!r.ok()) return RefreshResult.UNREACHABLE;
+        String next = MiniJson.str(r.body, "refresh_token");
+        if (next == null || next.isEmpty()) return RefreshResult.UNREACHABLE;
+        st.refreshToken = next;
+        try {
+            st.save();
+        } catch (IOException ignore) { /* next launch retries with the old token */ }
+        return RefreshResult.OK;
+    }
+
+    /**
+     * Sign out: best-effort server-side revocation, then wipe the local
+     * state file. /api/auth/logout revokes whatever bearer it is given;
+     * presenting the refresh token kills the stored session (the access
+     * half is short-lived and the PC never keeps one). After this returns,
+     * this PC holds no account credential material until the next login.
+     */
+    static void logoutSession(State st) {
+        if (st == null) return;
+        if (st.refreshToken != null && !st.refreshToken.isEmpty()) {
+            try {
+                http("POST", st.server + "/api/auth/logout", st.refreshToken, "");
+            } catch (Exception ignore) { /* best effort */ }
+        }
+        try {
+            Files.deleteIfExists(st.file());
+        } catch (Exception ignore) { }
     }
 
     /** POST /api/license/validate (no bearer) → {valid, reason, expiresEpochMsOrNull}. */

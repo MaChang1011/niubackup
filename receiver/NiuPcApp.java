@@ -19,8 +19,10 @@ import java.util.List;
  *   --login <args...>  passthrough to BackupReceiver.main's --login flow.
  *
  * The window covers the operator's whole loop: account login (the only
- * password moment — afterwards the PC works with its device token from
- * account.json), starting/stopping the embedded account-mode receiver
+ * password moment — the session is then persisted in account.json and
+ * later launches restore straight into the logged-in state; the password
+ * is asked again only after 退出登录 or when the server rejects the saved
+ * session), starting/stopping the embedded account-mode receiver
  * (which supervises the easytier sidecar itself), approving pending phone
  * devices of the same account (PC-approves-phone, §6), bound-device and
  * quota status, and the session log. Receiver stdout is mirrored into the
@@ -33,6 +35,10 @@ public class NiuPcApp {
     private AccountLink.State state;       // loaded account state (null until login)
     private Thread serveThread;
 
+    private JPanel accountCards;
+    private CardLayout accountCardLayout;
+    private JLabel sessionInfoLabel;
+    private JLabel loginHintLabel;
     private JTextField serverField;
     private JTextField accountField;
     private JPasswordField passwordField;
@@ -109,19 +115,52 @@ public class NiuPcApp {
         c.insets = new Insets(4, 6, 4, 6);
         c.fill = GridBagConstraints.HORIZONTAL;
         int row = 0;
-        serverField = addField(form, c, row++, "账号服务",
+
+        // ---- account area: login form XOR logged-in session card. A saved
+        // session (account.json) restores straight into the session card;
+        // the password form is shown only when there is no saved session,
+        // after 退出登录, or when the server rejected the saved session at
+        // launch (see startRestoreCheck).
+        accountCardLayout = new CardLayout();
+        accountCards = new JPanel(accountCardLayout);
+        JPanel loginCard = new JPanel(new GridBagLayout());
+        GridBagConstraints lc = new GridBagConstraints();
+        lc.insets = new Insets(4, 6, 4, 6);
+        lc.fill = GridBagConstraints.HORIZONTAL;
+        serverField = addField(loginCard, lc, 0, "账号服务",
                 state != null ? state.server : "http://10.200.0.1:18090");
-        accountField = addField(form, c, row++, "账号",
+        accountField = addField(loginCard, lc, 1, "账号",
                 state != null ? state.account : "");
         passwordField = new JPasswordField();
-        addRow(form, c, row++, "密码（仅登录时用）", passwordField);
+        addRow(loginCard, lc, 2, "密码（仅登录时用）", passwordField);
+        loginHintLabel = new JLabel("");
+        lc.gridx = 0; lc.gridy = 3; lc.gridwidth = 2;
+        loginCard.add(loginHintLabel, lc);
+        JButton loginButton = new JButton("登录");
+        loginButton.addActionListener(e -> doLogin());
+        JPanel loginButtons = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        loginButtons.add(loginButton);
+        lc.gridy = 4;
+        loginCard.add(loginButtons, lc);
+
+        JPanel sessionCard = new JPanel(new BorderLayout());
+        sessionInfoLabel = new JLabel("");
+        sessionCard.add(sessionInfoLabel, BorderLayout.CENTER);
+        JButton logoutButton = new JButton("退出登录");
+        logoutButton.addActionListener(e -> doLogout());
+        JPanel sessionButtons = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        sessionButtons.add(logoutButton);
+        sessionCard.add(sessionButtons, BorderLayout.SOUTH);
+        accountCards.add(loginCard, "login");
+        accountCards.add(sessionCard, "session");
+        c.gridx = 0; c.gridy = row++; c.gridwidth = 2;
+        form.add(accountCards, c);
+
         targetField = addField(form, c, row++, "存储目录",
                 Paths.get(System.getProperty("user.home"), "NiuBackup").toString());
         portField = addField(form, c, row++, "备份端口", "28741");
 
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JButton loginButton = new JButton("登录");
-        loginButton.addActionListener(e -> doLogin());
         startButton = new JButton("启动服务");
         startButton.addActionListener(e -> doStart());
         stopButton = new JButton("停止服务");
@@ -129,7 +168,6 @@ public class NiuPcApp {
         stopButton.addActionListener(e -> doStop());
         JButton refreshButton = new JButton("刷新设备/会话");
         refreshButton.addActionListener(e -> refreshPanels());
-        buttons.add(loginButton);
         buttons.add(startButton);
         buttons.add(stopButton);
         buttons.add(refreshButton);
@@ -189,7 +227,75 @@ public class NiuPcApp {
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
         installTray(frame);
+        if (state != null) {
+            // Saved session: come back logged in, no password form; verify
+            // (and roll) the session against the server in the background.
+            showSessionCard();
+            startRestoreCheck();
+        } else {
+            showLoginCard(null);
+        }
         refreshPanels();
+    }
+
+    private void showSessionCard() {
+        sessionInfoLabel.setText(stateSummary());
+        accountCardLayout.show(accountCards, "session");
+        statusLabel.setText(stateSummary());
+    }
+
+    private void showLoginCard(String hint) {
+        loginHintLabel.setText(hint == null ? "" : hint);
+        accountCardLayout.show(accountCards, "login");
+        statusLabel.setText(hint != null ? hint
+                : "未登录 — 先填写账号服务/账号/密码并点「登录」");
+        if (pendingModel != null) pendingModel.clear();
+        if (devicesArea != null) devicesArea.setText("");
+        if (sessionsArea != null) sessionsArea.setText("");
+        if (quotaLabel != null) quotaLabel.setText("");
+    }
+
+    /**
+     * Launch-time session restore check: the saved account.json already put
+     * us in the logged-in state; this proves the stored session is still
+     * accepted by the server and rolls its 30-day refresh window (the
+     * refresh call rotates the token in account.json). Only a definitive
+     * server rejection (401/403) drops back to the password form — an
+     * unreachable server keeps the saved login untouched.
+     */
+    private void startRestoreCheck() {
+        final AccountLink.State st = state;
+        if (st == null) return;
+        new Thread(() -> {
+            AccountLink.RefreshResult rr = AccountLink.refreshSession(st);
+            switch (rr) {
+                case OK -> log("session restored: " + st.account
+                        + " (refresh token rotated)");
+                case REJECTED -> {
+                    log("saved session rejected by the server; cleared — password required");
+                    AccountLink.logoutSession(st);
+                    if (state == st) state = null;
+                    SwingUtilities.invokeLater(() -> showLoginCard("登录已过期，请重新登录"));
+                }
+                case UNREACHABLE -> log("account service unreachable at launch; "
+                        + "keeping the saved login (device-token features unaffected)");
+            }
+        }, "session-restore").start();
+    }
+
+    private void doLogout() {
+        if (state == null) return;
+        AccountLink.State st = state;
+        state = null;
+        BackupReceiver.stopCurrentServer();
+        startButton.setEnabled(true);
+        stopButton.setEnabled(false);
+        // Server-side revocation is best-effort and off the UI thread; the
+        // local wipe happens in logoutSession right after it.
+        new Thread(() -> AccountLink.logoutSession(st), "logout").start();
+        passwordField.setText("");
+        log("logged out: saved session wiped");
+        showLoginCard(null);
     }
 
     private JTextField addField(JPanel p, GridBagConstraints c, int row, String label, String value) {
@@ -230,7 +336,7 @@ public class NiuPcApp {
                 state = st;
                 log("login ok: user_id=" + st.userId + " network=" + st.networkName);
                 SwingUtilities.invokeLater(() -> {
-                    statusLabel.setText(stateSummary());
+                    showSessionCard();
                     refreshPanels();
                 });
             } catch (Exception e) {

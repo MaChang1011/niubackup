@@ -13,15 +13,27 @@ import java.net.URL
  * API shapes (docs/m4b-notes.md):
  *  - POST /api/auth/register {account,password} -> {user_id, ...}
  *  - POST /api/auth/login {account,password} -> {access_token, refresh_token}
+ *  - POST /api/auth/refresh {refresh_token} -> rotated pair (access 2 h, refresh 30 d)
+ *  - POST /api/auth/logout (bearer) -> revokes the presented token
  *  - POST /api/devices/register (session) {kind,name} -> {device_id, device_token} (token once)
  *  - GET  /api/devices (session or device bearer) -> {devices:[...]}
  *  - GET  /api/provisioning (session or device bearer) -> {public_node, network_name, network_secret}
  *  - POST /api/license/validate {device_id, device_token} -> {valid, reason}
  *  - POST /api/session-logs (device bearer) {files_count, bytes, result}
  */
+/** Non-2xx response. Message keeps the historic "HTTP <code> (<error>)" shape. */
+class HttpStatusException(val code: Int, val serverError: String) :
+    IOException("HTTP $code" + if (serverError.isNotEmpty()) " ($serverError)" else "")
+
 class AccountClient(private val baseUrl: String) {
 
-    data class Session(val accessToken: String, val refreshToken: String)
+    /** An account session pair. [expiresAtMs] is when the ACCESS token dies
+     *  (server TTL 2 h); the refresh token lives 30 days and rotates. */
+    data class Session(
+        val accessToken: String,
+        val refreshToken: String,
+        val expiresAtMs: Long
+    )
     data class DeviceInfo(
         val id: Long, val kind: String, val name: String,
         val approved: Boolean, val revoked: Boolean
@@ -60,9 +72,18 @@ class AccountClient(private val baseUrl: String) {
             } catch (e: Exception) {
                 ""
             }
-            throw IOException("HTTP $code" + if (err.isNotEmpty()) " ($err)" else "")
+            throw HttpStatusException(code, err)
         }
         return JSONObject(text.ifEmpty { "{}" })
+    }
+
+    private fun sessionFrom(r: JSONObject): Session {
+        val expiresInSec = r.optLong("expires_in", 7200)
+        return Session(
+            r.getString("access_token"),
+            r.getString("refresh_token"),
+            System.currentTimeMillis() + expiresInSec * 1000
+        )
     }
 
     fun register(account: String, password: String): Long {
@@ -78,15 +99,29 @@ class AccountClient(private val baseUrl: String) {
             "POST", "/api/auth/login", null,
             JSONObject().put("account", account).put("password", password)
         )
-        return Session(r.getString("access_token"), r.getString("refresh_token"))
+        return sessionFrom(r)
     }
 
+    /** Rotating refresh: the presented token dies, a fresh pair comes back. */
     fun refresh(refreshToken: String): Session {
         val r = request(
             "POST", "/api/auth/refresh", null,
             JSONObject().put("refresh_token", refreshToken)
         )
-        return Session(r.getString("access_token"), r.getString("refresh_token"))
+        return sessionFrom(r)
+    }
+
+    /**
+     * Best-effort server-side sign-out: /api/auth/logout revokes whatever
+     * bearer it is given, so presenting the refresh token kills the stored
+     * session. Never throws — local logout proceeds regardless.
+     */
+    fun logout(bearer: String) {
+        try {
+            request("POST", "/api/auth/logout", bearer, null)
+        } catch (t: Throwable) {
+            // best effort
+        }
     }
 
     /** Returns (device_id, device_token); the token is shown exactly once. */

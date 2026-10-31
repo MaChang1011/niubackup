@@ -27,6 +27,7 @@ object SecureStore {
 
     const val KEY_ACCESS_TOKEN = "access_token"
     const val KEY_REFRESH_TOKEN = "refresh_token"
+    const val KEY_ACCESS_EXPIRES_AT = "access_expires_at"
     const val KEY_DEVICE_TOKEN = "device_token"
     const val KEY_USER_ID = "user_id"
     const val KEY_DEVICE_ID = "device_id"
@@ -84,6 +85,7 @@ object SecureStore {
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         prefs.edit()
             .remove(KEY_ACCESS_TOKEN).remove(KEY_REFRESH_TOKEN)
+            .remove(KEY_ACCESS_EXPIRES_AT)
             .remove(KEY_DEVICE_TOKEN).remove(KEY_USER_ID).remove(KEY_DEVICE_ID)
             .remove(KEY_ACCOUNT).remove(KEY_NETWORK_SECRET)
             .apply()

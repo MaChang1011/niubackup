@@ -45,3 +45,58 @@ Recipe (vendor build.sh equivalent, run manually because the tree came from a ta
 - Verified: `./gradlew assembleDebug` BUILD SUCCESSFUL;
   app-debug.apk 21,650,801 bytes. Not installed on a device this round.
 - Feature map and dev limitations: docs/m4c-notes.md (P3).
+
+## Addendum (2026-10-31) — FGS crash fix + 4-page restructure
+
+1. **Mesh-start crash fixed** (`ForegroundServiceDidNotStartInTimeException`):
+   account-mode startup (provisioning fetch + JNI init + establish) can exceed
+   the 5 s startForeground contract, and the M2 pattern (promote after
+   establish with SYSTEM_EXEMPTED type) cannot promote earlier because that
+   type throws SecurityException before the VPN appop exists. Two-step
+   promotion in `BackupVpnService`:
+   - Step 1 (top of onStartCommand, every non-STOP intent): promote
+     immediately with FOREGROUND_SERVICE_TYPE_DATA_SYNC (manifest:
+     `systemExempted|dataSync` + FOREGROUND_SERVICE_DATA_SYNC permission) —
+     its only prerequisite is the permission, so it cannot throw pre-VPN.
+   - Step 2 (after establish()): existing retry-loop promotion switches the
+     type to SYSTEM_EXEMPTED (also avoids Android 15 dataSync time limits).
+   Error paths promote first, then log + stopSelf (`demoteAndStop()`); the
+   service can no longer crash on config/network failure.
+2. **UI restructured into 4 pages** (bottom nav, separate singleTop
+   activities; engine/protocol classes untouched): MainActivity=备份
+   (status/mesh/manual backup/last session/auto-backup conditions/log),
+   LibraryActivity=文件库 (thumbnail grid + badges + §6.4 free-up-space),
+   RecordsActivity=记录 (fs records, download-back, playback),
+   AccountActivity=我的 (login/register, server address, pc_port, device
+   info, dev overrides, about). Shared structural helpers in `Ui.kt`.
+   STYLING IS INTENTIONALLY PLAIN (system defaults, no brand skin) pending
+   the user's design pass — `Ui.kt` helpers are the reskin seams.
+
+## Addendum (2026-10-31) — login-session persistence
+
+User requirement: 登录后保存会话 (log in once; reopening restores the
+session; password only after explicit logout or server-side invalidation).
+
+- New `SessionRestore.kt`: cold-start restore once per process (from
+  MainActivity). Stored session = access + refresh + access_expires_at
+  in SecureStore (new key `access_expires_at`; Session now carries
+  expiresAtMs from the server's `expires_in`). Access token fresh ->
+  restored silently; lapsed -> rotate via POST /api/auth/refresh (the
+  previously dead-code call) and persist the new pair. Refresh tokens
+  are 30-day rotating, so monthly contact keeps the session alive
+  indefinitely. Server 401/403 -> session dropped + one-shot
+  `session_expired_hint` flag -> form shows 登录已过期，请重新登录;
+  the DEVICE identity is kept (re-login reuses the device, no second
+  PC approval). Network failure -> session kept (dev endpoint is
+  mesh-only; offline cold starts are the norm).
+- AccountActivity: with a stored session the password field and
+  注册/登录 buttons are hidden; 退出登录 also calls the new
+  AccountClient.logout(refreshToken) (best effort — the endpoint
+  revokes whatever bearer it is given) before the local wipe.
+- AccountClient: non-2xx now throws HttpStatusException (message format
+  unchanged) so restore can tell rejection (401/403) from offline.
+- Verified: ./gradlew assembleDebug BUILD SUCCESSFUL on the laptop;
+  app-debug.apk 21,750,978 bytes; SessionRestore + new keys confirmed
+  in the dex. NOT installed this round — see docs/session-persistence.md
+  for the on-device checklist and the remaining limits (30-day refresh
+  window, lost-rotation-response edge).
