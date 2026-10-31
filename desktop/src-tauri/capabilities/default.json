@@ -1,0 +1,1 @@
+{"$schema":"../gen/schemas/desktop-schema.json","description":"Main window: core defaults only; all app operations go through the shell's own commands and the loopback control API.","identifier":"default","permissions":["core:default"],"windows":["main"]}

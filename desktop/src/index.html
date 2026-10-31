@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>牛备 NiuBackup — 电脑端</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ============ boot: waiting for the engine ============ -->
+<div id="bootView" class="boot">
+  <div class="boot-card">
+    <div class="mark mark-lg" aria-hidden="true"></div>
+    <div class="boot-title">牛备 NiuBackup</div>
+    <div class="boot-sub" id="bootMsg">正在启动接收引擎…</div>
+    <div class="spinner"></div>
+    <button id="bootRetry" class="btn btn-ghost" hidden>重启引擎</button>
+    <div class="boot-err" id="bootErr"></div>
+  </div>
+</div>
+
+<!-- ============ login (design: compact centered card) ============ -->
+<div id="loginView" class="login-wrap" hidden>
+  <form id="loginCard" class="login-card" autocomplete="off">
+    <div class="mark mark-md" aria-hidden="true"></div>
+    <h1>登录牛备</h1>
+    <p class="login-sub">备份数据只存在你自己的电脑上；<br>账号服务只负责登录、授权与组网。</p>
+    <label class="fld">
+      <span>服务地址</span>
+      <input id="loginServer" type="text" spellcheck="false">
+    </label>
+    <label class="fld">
+      <span>账号</span>
+      <input id="loginAccount" type="text" spellcheck="false" placeholder="邮箱 / 账号名">
+    </label>
+    <label class="fld">
+      <span>密码</span>
+      <input id="loginPassword" type="password" placeholder="仅本次登录使用，不保存">
+    </label>
+    <div class="login-err" id="loginErr"></div>
+    <button id="loginBtn" class="btn btn-accent btn-block" type="submit">登录</button>
+    <p class="login-note">登录状态会保存在这台电脑上，下次打开直接进入；<br>只有退出登录或服务端吊销时才需要重新输入密码。</p>
+  </form>
+</div>
+
+<!-- ============ app shell ============ -->
+<div id="appView" class="layout" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="mark mark-sm" aria-hidden="true"></div>
+      <div class="brand-text">
+        <div class="brand-name">牛备</div>
+        <div class="brand-sub">NiuBackup</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-page="overview"><span class="nav-ico">▦</span>概览</button>
+      <button class="nav-item" data-page="devices"><span class="nav-ico">▤</span>设备<span class="nav-badge" id="pendingBadge" hidden></span></button>
+      <button class="nav-item" data-page="storage"><span class="nav-ico">▣</span>存储</button>
+      <button class="nav-item" data-page="records"><span class="nav-ico">▧</span>备份记录</button>
+      <button class="nav-item" data-page="logs"><span class="nav-ico">≣</span>日志</button>
+      <button class="nav-item" data-page="settings"><span class="nav-ico">⚙</span>设置</button>
+    </nav>
+    <div class="side-foot">
+      <div class="side-account" id="sideAccount">—</div>
+      <button class="btn btn-side" id="logoutBtn">退出登录</button>
+    </div>
+  </aside>
+
+  <main class="content">
+    <!-- 概览 -->
+    <section class="page" id="page-overview">
+      <div class="banner" id="pendingBanner" hidden>
+        <span>📱 有 <b id="pendingCount">0</b> 台设备等待批准，批准后才能开始备份。</span>
+        <button class="btn btn-accent btn-sm" id="bannerGo">去处理</button>
+      </div>
+      <div class="cards">
+        <div class="card">
+          <div class="card-title">接收服务</div>
+          <div class="card-main" id="ovService">—</div>
+          <div class="card-sub" id="ovServiceSub">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">产品组网</div>
+          <div class="card-main" id="ovMesh">—</div>
+          <div class="card-sub" id="ovMeshSub">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">账户与授权</div>
+          <div class="card-main" id="ovAccount">—</div>
+          <div class="card-sub" id="ovAccountSub">—</div>
+        </div>
+      </div>
+      <div class="card wide">
+        <div class="card-title">存储用量</div>
+        <div class="bar"><div class="bar-fill" id="ovBarFill" style="width:0%"></div></div>
+        <div class="card-sub" id="ovStorageSub">—</div>
+      </div>
+      <div class="card wide">
+        <div class="card-title">最近会话</div>
+        <div id="ovSessions" class="sess-list"><div class="empty">暂无备份会话</div></div>
+      </div>
+    </section>
+
+    <!-- 设备 -->
+    <section class="page" id="page-devices" hidden>
+      <div class="page-head">
+        <h2>设备</h2>
+        <button class="btn btn-ghost btn-sm" id="devRefresh">刷新</button>
+      </div>
+      <div id="devPendingWrap">
+        <h3 class="sec-title">待批准</h3>
+        <div id="devPending"></div>
+      </div>
+      <h3 class="sec-title">已绑定设备</h3>
+      <table class="tbl" id="devTable">
+        <thead><tr><th>设备</th><th>类型</th><th>编号</th><th>状态</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 存储 -->
+    <section class="page" id="page-storage" hidden>
+      <div class="page-head"><h2>存储</h2></div>
+      <div class="card wide">
+        <div class="card-title">备份占用</div>
+        <div class="bar bar-lg"><div class="bar-fill" id="stBarFill" style="width:0%"></div></div>
+        <div class="kv" id="stKv"></div>
+        <div class="row-gap">
+          <button class="btn btn-primary btn-sm" id="stOpenTarget">打开存储目录</button>
+          <button class="btn btn-ghost btn-sm" id="stOpenData">打开数据目录</button>
+        </div>
+        <p class="hint">配额来自你的授权（license）；文件内容只保存在这台电脑上，账号服务不保存任何文件名或文件内容。</p>
+      </div>
+    </section>
+
+    <!-- 备份记录 -->
+    <section class="page" id="page-records" hidden>
+      <div class="page-head">
+        <h2>备份记录</h2>
+        <span class="page-sub" id="recTotal"></span>
+        <button class="btn btn-ghost btn-sm" id="recRefresh">刷新</button>
+      </div>
+      <div class="records-layout">
+        <div class="records-list" id="recList"></div>
+        <div class="preview-pane" id="previewPane">
+          <div class="empty">从左侧选择一条记录查看预览</div>
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-sm" id="recMore" hidden>加载更多</button>
+    </section>
+
+    <!-- 日志 -->
+    <section class="page" id="page-logs" hidden>
+      <div class="page-head">
+        <h2>运行日志</h2>
+        <button class="btn btn-ghost btn-sm" id="logRefresh">刷新</button>
+      </div>
+      <pre class="logbox" id="logBox">…</pre>
+    </section>
+
+    <!-- 设置 -->
+    <section class="page" id="page-settings" hidden>
+      <div class="page-head"><h2>设置</h2></div>
+      <form class="card wide settings" id="settingsForm" autocomplete="off">
+        <label class="fld">
+          <span>服务地址</span>
+          <input id="setServer" type="text" spellcheck="false">
+          <em>账号服务地址，登录前可改；留空则用默认公网地址。</em>
+        </label>
+        <label class="fld">
+          <span>存储目录</span>
+          <input id="setTarget" type="text" spellcheck="false">
+          <em>备份文件落盘目录，修改后会重启接收引擎。</em>
+        </label>
+        <label class="fld">
+          <span>备份端口</span>
+          <input id="setPort" type="number" min="1024" max="65535">
+          <em>手机备份连接的端口（默认 28741），修改后会重启接收引擎。</em>
+        </label>
+        <label class="fld fld-check">
+          <input id="setAutostart" type="checkbox">
+          <span>开机自启（登录桌面后自动打开牛备）</span>
+        </label>
+        <div class="row-gap">
+          <button class="btn btn-primary" type="submit">保存设置</button>
+          <button class="btn btn-ghost" type="button" id="setRestart">重启接收引擎</button>
+          <button class="btn btn-danger-ghost" type="button" id="setLogout">退出登录</button>
+        </div>
+      </form>
+      <div class="card wide about">
+        <div class="card-title">关于</div>
+        <div class="kv" id="aboutKv"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

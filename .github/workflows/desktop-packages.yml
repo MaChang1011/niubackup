@@ -1,0 +1,100 @@
+# NiuBackup PC packages — Tauri shell build (written 2026-10-31, NOT yet run)
+#
+# Mirrors what the local Linux build actually needed:
+#   apt Tauri deps (Linux) -> JDK 21 -> compile receiver -> assemble the
+#   engine/ layout (runtime + app/classes + app/lib + easytier-core)
+#   into desktop/src-tauri/engine -> Node + Rust -> npx tauri build.
+#
+# The engine layout and resolution order are documented in
+# docs/tauri-shell.md. The old jpackage workflow (pc-packages.yml) is
+# kept untouched until the Tauri bundles are confirmed on all three OSes.
+
+name: desktop-packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["desktop-v*"]
+
+jobs:
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            et_asset: easytier-linux-x86_64-v2.6.4.zip
+            et_bin: easytier-core
+          - os: windows-latest
+            et_asset: easytier-windows-x86_64-v2.6.4.zip
+            et_bin: easytier-core.exe
+          - os: macos-14
+            et_asset: easytier-macos-aarch64-v2.6.4.zip
+            et_bin: easytier-core
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tauri Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
+            libssl-dev pkg-config build-essential file
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch dependency jars
+        shell: bash
+        run: |
+          mkdir -p lib
+          curl -fL -o lib/sqlite-jdbc-3.47.1.0.jar \
+            https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.47.1.0/sqlite-jdbc-3.47.1.0.jar
+          curl -fL -o lib/slf4j-api-2.0.16.jar \
+            https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar
+
+      - name: Assemble engine layout
+        shell: bash
+        run: |
+          ENG=desktop/src-tauri/engine
+          mkdir -p $ENG/app/classes $ENG/app/lib $ENG/runtime
+          javac -cp "lib/sqlite-jdbc-3.47.1.0.jar:lib/slf4j-api-2.0.16.jar" \
+            -d $ENG/app/classes receiver/BackupReceiver.java
+          cp lib/sqlite-jdbc-3.47.1.0.jar lib/slf4j-api-2.0.16.jar $ENG/app/lib/
+          cp -r "$JAVA_HOME"/* $ENG/runtime/
+          curl -fL -o et.zip \
+            "https://github.com/EasyTier/EasyTier/releases/download/v2.6.4/${{ matrix.et_asset }}"
+          mkdir -p et && unzip -o et.zip -d et
+          ET=$(find et -name '${{ matrix.et_bin }}' | head -1)
+          cp "$ET" $ENG/app/
+          chmod +x "$ENG/app/${{ matrix.et_bin }}" || true
+          rm -f $ENG/README.txt
+          find $ENG -maxdepth 3 | head -30
+
+      - name: Install frontend deps (Tauri CLI)
+        shell: bash
+        working-directory: desktop
+        run: npm install
+
+      - name: Tauri build
+        shell: bash
+        working-directory: desktop
+        run: npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: niubackup-desktop-${{ matrix.os }}
+          path: |
+            desktop/src-tauri/target/release/bundle/

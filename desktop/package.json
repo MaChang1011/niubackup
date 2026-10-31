@@ -1,0 +1,1 @@
+{"description":"牛备 NiuBackup PC desktop shell (Tauri v2). Only used for the Tauri CLI in CI/local bundling; the app itself is plain cargo + static frontend.","devDependencies":{"@tauri-apps/cli":"^2"},"name":"niubackup-desktop","private":true,"scripts":{"build":"tauri build","dev":"tauri dev","tauri":"tauri"},"version":"0.1.0"}

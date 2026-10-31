@@ -17,8 +17,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.*;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 
 /**
  * BackupReceiver — PC-side receiver for NiuBackup （牛备）, protocol v2 (M4a).
@@ -76,6 +79,13 @@ public class BackupReceiver {
 
     static final int PROTO_V2 = 2;
     static final int DEFAULT_PORT = 28741;
+    /**
+     * Default account-service address for --login / the control API's login
+     * when neither --server nor NB_SERVER is given (user decision
+     * 2026-10-31): the PUBLIC endpoint, because login must work before any
+     * mesh exists. An explicitly passed/env/saved address always wins.
+     */
+    static final String DEFAULT_SERVER = "http://36.133.114.164:18090";
     static final long MAX_READ_CHUNK = 1024 * 1024;
     static final int THUMB_EDGE = 320;
 
@@ -99,6 +109,12 @@ public class BackupReceiver {
     MeshSidecar sidecar;
     volatile long lastSyncOkMs = 0;
     static volatile ServerSocket currentServer;
+
+    // Tauri shell control API (--control): loopback-only JSON HTTP API.
+    // controlOnly = the process parked with no saved session, serving ONLY
+    // the control API until the shell drives a login and restarts us.
+    boolean controlOnly;
+    ControlApi controlApi;
 
     /** Close the currently-serving socket (used by the PC operator UI's stop button). */
     public static void stopCurrentServer() {
@@ -131,7 +147,7 @@ public class BackupReceiver {
         Path dataDir = null;
         boolean allowV1 = false, seed = false, verify = false;
         boolean login = false, logout = false, accountMode = false, syncCmd = false, devicesCmd = false;
-        boolean noMesh = false;
+        boolean noMesh = false, control = false;
         String server = System.getenv("NB_SERVER");
         String approveId = null, meshBin = null, pcIp = null;
         int syncSeconds = 300;
@@ -149,6 +165,7 @@ public class BackupReceiver {
                 case "--sync": syncCmd = true; break;
                 case "--devices": devicesCmd = true; break;
                 case "--no-mesh": noMesh = true; break;
+                case "--control": control = true; break;
                 case "--approve": approveId = args[++i]; break;
                 case "--server": server = args[++i]; break;
                 case "--mesh-bin": meshBin = args[++i]; break;
@@ -177,8 +194,9 @@ public class BackupReceiver {
                     : System.getenv("NB_ACCOUNT");
             String password = opt.containsKey("--account-pass") ? opt.get("--account-pass")
                     : System.getenv("NB_PASSWORD");
-            if (server == null || account == null || password == null) {
-                System.err.println("usage: --login --server <url> with credentials in "
+            if (server == null) server = DEFAULT_SERVER;
+            if (account == null || password == null) {
+                System.err.println("usage: --login [--server <url>] with credentials in "
                         + "NB_ACCOUNT / NB_PASSWORD (or --account-user / --account-pass)");
                 System.exit(2);
             }
@@ -235,6 +253,20 @@ public class BackupReceiver {
         // ---- M4c account-mode serve ----
         if (accountMode) {
             AccountLink.State st = earlyState;
+            if (st == null && control) {
+                // Tauri shell mode with no saved session yet: serve ONLY the
+                // loopback control API so the shell can drive
+                // POST /account/login. The login persists account.json and
+                // answers restart_required; the shell then restarts this
+                // process and it comes up as a full account-mode receiver.
+                r.accountMode = true;
+                r.controlOnly = true;
+                r.startControlApi();
+                log("control-only mode: no saved account session in " + dataDir
+                        + "; waiting for login via the loopback control API");
+                new CountDownLatch(1).await();
+                return;
+            }
             if (st == null) {
                 System.err.println("account mode requested but no account state in "
                         + dataDir + " — run --login first");
@@ -259,7 +291,19 @@ public class BackupReceiver {
             }
             r.startSyncThread();
         }
+        if (control) r.startControlApi();
         r.serve();
+    }
+
+    /** Start the loopback control API (Tauri shell). Failures are logged, never fatal. */
+    void startControlApi() {
+        try {
+            controlApi = new ControlApi(this);
+            controlApi.start();
+        } catch (Exception e) {
+            log("control API failed to start: " + e);
+            controlApi = null;
+        }
     }
 
     /** In account+mesh mode the TUN address appears asynchronously; wait for it. */
@@ -1142,8 +1186,24 @@ public class BackupReceiver {
         try { return Integer.parseInt(s.trim()); } catch (Exception e) { return dflt; }
     }
 
+    // In-memory log ring for the control API's GET /logs (the Tauri shell).
+    static final int LOG_RING_MAX = 400;
+    static final ArrayDeque<String> LOG_RING = new ArrayDeque<>();
+
     static void log(String m) {
-        System.out.println("[" + LocalTime.now().withNano(0) + "] " + m);
+        String line = "[" + LocalTime.now().withNano(0) + "] " + m;
+        System.out.println(line);
+        synchronized (LOG_RING) {
+            LOG_RING.addLast(line);
+            while (LOG_RING.size() > LOG_RING_MAX) LOG_RING.removeFirst();
+        }
+    }
+
+    static List<String> logTail(int n) {
+        synchronized (LOG_RING) {
+            List<String> all = new ArrayList<>(LOG_RING);
+            return new ArrayList<>(all.subList(Math.max(0, all.size() - n), all.size()));
+        }
     }
 
     static final class Entry {
@@ -1435,7 +1495,7 @@ public class BackupReceiver {
             List<String[]> out = new ArrayList<>();
             try (PreparedStatement q = db.prepareStatement(
                     "SELECT ts, device_id, files_ok, bytes, result FROM sessions"
-                            + " ORDER BY id DESC LIMIT ?")) {
+                            + " ORDER BY rowid DESC LIMIT ?")) {
                 q.setInt(1, limit);
                 try (ResultSet rs = q.executeQuery()) {
                     while (rs.next()) {
@@ -1447,6 +1507,43 @@ public class BackupReceiver {
                 }
             }
             return out;
+        }
+
+        /** One page of a user's files, newest backup first (control API GET /records). */
+        synchronized List<FileRow> listFilesPage(String userId, int limit, int offset)
+                throws SQLException {
+            List<FileRow> out = new ArrayList<>();
+            try (PreparedStatement q = db.prepareStatement(
+                    "SELECT * FROM files WHERE user_id = ? "
+                            + "ORDER BY backed_at DESC, id DESC LIMIT ? OFFSET ?")) {
+                q.setString(1, userId);
+                q.setInt(2, limit);
+                q.setInt(3, offset);
+                try (ResultSet rs = q.executeQuery()) {
+                    while (rs.next()) out.add(toFileRow(rs));
+                }
+            }
+            return out;
+        }
+
+        synchronized int countFiles(String userId) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "SELECT COUNT(*) FROM files WHERE user_id = ?")) {
+                q.setString(1, userId);
+                try (ResultSet rs = q.executeQuery()) {
+                    return rs.next() ? rs.getInt(1) : 0;
+                }
+            }
+        }
+
+        synchronized FileRow findFileById(long id) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "SELECT * FROM files WHERE id = ?")) {
+                q.setLong(1, id);
+                try (ResultSet rs = q.executeQuery()) {
+                    return rs.next() ? toFileRow(rs) : null;
+                }
+            }
         }
 
         /** Total stored bytes for one user (PC UI quota display). */
@@ -1767,6 +1864,51 @@ final class AccountLink {
         return r.body;
     }
 
+    /** The stored session is dead (refresh rejected): password required again. */
+    static final class SessionDead extends Exception {
+        SessionDead(String m) { super(m); }
+    }
+
+    /**
+     * Mint a short-lived account access token from the stored refresh token
+     * (rotating it + re-saving, exactly like refreshSession). Some service
+     * calls — device revoke — accept only an account session, not the PC
+     * device token that approve/sync/provisioning run on.
+     */
+    static String accessViaRefresh(State st) throws Exception {
+        if (st.refreshToken == null || st.refreshToken.isEmpty()) {
+            throw new SessionDead("no refresh token stored");
+        }
+        ApiResult r = http("POST", st.server + "/api/auth/refresh", null,
+                "{\"refresh_token\":\"" + MiniJson.esc(st.refreshToken) + "\"}");
+        if (r.status == 401 || r.status == 403) {
+            throw new SessionDead("refresh rejected: HTTP " + r.status);
+        }
+        requireOk(r, "refresh");
+        String next = MiniJson.str(r.body, "refresh_token");
+        if (next != null && !next.isEmpty()) {
+            st.refreshToken = next;
+            try { st.save(); } catch (IOException ignore) { }
+        }
+        String access = MiniJson.str(r.body, "access_token");
+        if (access == null) throw new IOException("refresh returned no access_token");
+        return access;
+    }
+
+    /**
+     * POST /api/devices/{id}/revoke with an account session (see
+     * accessViaRefresh — the device token gets a 401 here) → response body.
+     */
+    static String revokeWithSession(State st, String deviceId) throws Exception {
+        String session = accessViaRefresh(st);
+        ApiResult r = http(st, "POST", "/api/devices/" + deviceId + "/revoke",
+                session, "");
+        if (!r.ok()) {
+            throw new IOException("revoke failed: HTTP " + r.status + " " + r.body);
+        }
+        return r.body;
+    }
+
     // ------------------------------------------------------------- flows
 
     /**
@@ -1918,10 +2060,12 @@ final class AccountLink {
  */
 final class MeshSidecar {
 
+    static final int RPC_PORT = 15891;
+
     private final Path dataDir;
     private final AccountLink.State st;
     private final String binOverride;
-    private final int rpcPort = 15891;
+    private final int rpcPort = RPC_PORT;
 
     private volatile boolean stop;
     private volatile Process proc;
@@ -2093,6 +2237,551 @@ final class MeshSidecar {
     }
 }
 
+/**
+ * ControlApi — the loopback control API for the Tauri desktop shell
+ * (--control). Binds 127.0.0.1 ONLY: the first free port in 28799..28808
+ * wins, and the chosen port + a random per-process control token are
+ * written to &lt;dataDir&gt;/control.json (mode 600). Every request must
+ * carry the token in the X-Control-Token header. The shell is the only
+ * intended client; the backup protocol socket is untouched.
+ *
+ * Login/logout ride the existing AccountLink flows (account.json is the
+ * persisted session — see docs/session-persistence.md). Both answer
+ * restart_required: the shell restarts the engine process so identity,
+ * mesh bind and sidecar all come up under the new state, exactly as a
+ * fresh launch would see it.
+ */
+final class ControlApi {
+
+    static final int BASE_PORT = 28799;
+    static final int PORT_TRIES = 10;
+
+    private final BackupReceiver r;
+    private HttpServer server;
+    private String token;
+    private int port = -1;
+
+    ControlApi(BackupReceiver r) {
+        this.r = r;
+    }
+
+    Path file() { return r.dataDir.resolve("control.json"); }
+
+    void start() throws IOException {
+        byte[] raw = new byte[32];
+        new SecureRandom().nextBytes(raw);
+        token = Hash.hex(raw);
+        IOException last = null;
+        for (int i = 0; i < PORT_TRIES && server == null; i++) {
+            try {
+                server = HttpServer.create(
+                        new InetSocketAddress("127.0.0.1", BASE_PORT + i), 0);
+                port = BASE_PORT + i;
+            } catch (BindException e) {
+                last = e;
+            }
+        }
+        if (server == null) throw last != null ? last : new IOException("no control port free");
+        server.createContext("/", this::dispatch);
+        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool(t -> {
+            Thread th = new Thread(t, "control-api");
+            th.setDaemon(true);
+            return th;
+        }));
+        server.start();
+        writeFile();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { Files.deleteIfExists(file()); } catch (Exception ignore) { }
+        }));
+        BackupReceiver.log("control API listening on 127.0.0.1:" + port
+                + " (token in " + file() + ")");
+    }
+
+    private void writeFile() throws IOException {
+        String json = "{\"port\":" + port
+                + ",\"token\":\"" + token + "\""
+                + ",\"pid\":" + ProcessHandle.current().pid()
+                + ",\"started_at_ms\":" + System.currentTimeMillis()
+                + ",\"data_dir\":\"" + MiniJson.esc(r.dataDir.toString()) + "\"}";
+        Files.createDirectories(r.dataDir);
+        Files.writeString(file(), json, StandardCharsets.UTF_8);
+        try {
+            Files.setPosixFilePermissions(file(),
+                    PosixFilePermissions.fromString("rw-------"));
+        } catch (Exception ignore) { /* non-POSIX fs */ }
+    }
+
+    // ------------------------------------------------------------- plumbing
+
+    private void dispatch(HttpExchange ex) {
+        try {
+            String method = ex.getRequestMethod();
+            String path = ex.getRequestURI().getPath();
+            if ("OPTIONS".equals(method)) {
+                ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                ex.getResponseHeaders().set("Access-Control-Allow-Headers",
+                        "X-Control-Token, Content-Type");
+                ex.sendResponseHeaders(204, -1);
+                return;
+            }
+            String presented = ex.getRequestHeaders().getFirst("X-Control-Token");
+            if (presented == null || !MessageDigest.isEqual(
+                    presented.getBytes(StandardCharsets.UTF_8),
+                    token.getBytes(StandardCharsets.UTF_8))) {
+                sendJson(ex, 401, "{\"ok\":false,\"error\":\"bad control token\"}");
+                return;
+            }
+            route(ex, method, path);
+        } catch (Exception e) {
+            try {
+                sendJson(ex, 500, "{\"ok\":false,\"error\":\""
+                        + MiniJson.esc(String.valueOf(e)) + "\"}");
+            } catch (Exception ignore) { }
+        } finally {
+            ex.close();
+        }
+    }
+
+    private void route(HttpExchange ex, String method, String path) throws Exception {
+        Map<String, String> q = query(ex.getRequestURI().getRawQuery());
+        if ("GET".equals(method) && path.equals("/status")) { status(ex); return; }
+        if ("GET".equals(method) && path.equals("/devices")) { devices(ex); return; }
+        if ("POST".equals(method) && path.startsWith("/devices/")
+                && path.endsWith("/approve")) {
+            String id = path.substring("/devices/".length(),
+                    path.length() - "/approve".length());
+            approve(ex, id);
+            return;
+        }
+        if ("POST".equals(method) && path.startsWith("/devices/")
+                && path.endsWith("/revoke")) {
+            String id = path.substring("/devices/".length(),
+                    path.length() - "/revoke".length());
+            revoke(ex, id);
+            return;
+        }
+        if ("GET".equals(method) && path.equals("/sessions")) {
+            sessions(ex, parseInt(q.get("limit"), 50));
+            return;
+        }
+        if ("GET".equals(method) && path.equals("/records")) {
+            records(ex, parseInt(q.get("limit"), 50), parseInt(q.get("offset"), 0));
+            return;
+        }
+        if ("GET".equals(method) && path.startsWith("/records/")) {
+            String rest = path.substring("/records/".length());
+            int slash = rest.indexOf('/');
+            if (slash > 0) {
+                long id = parseLong(rest.substring(0, slash), -1);
+                String what = rest.substring(slash + 1);
+                if (id >= 0 && what.equals("thumb")) { recordBytes(ex, id, true); return; }
+                if (id >= 0 && what.equals("preview")) { recordBytes(ex, id, false); return; }
+            }
+        }
+        if ("GET".equals(method) && path.equals("/logs")) {
+            logs(ex, parseInt(q.get("tail"), 200));
+            return;
+        }
+        if ("POST".equals(method) && path.equals("/account/login")) { login(ex); return; }
+        if ("POST".equals(method) && path.equals("/account/logout")) { logout(ex); return; }
+        if ("POST".equals(method) && path.equals("/sync")) { sync(ex); return; }
+        sendJson(ex, 404, "{\"ok\":false,\"error\":\"no such endpoint\"}");
+    }
+
+    private static Map<String, String> query(String raw) {
+        Map<String, String> out = new HashMap<>();
+        if (raw == null) return out;
+        for (String pair : raw.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq > 0) {
+                out.put(URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8),
+                        URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
+            }
+        }
+        return out;
+    }
+
+    private static int parseInt(String s, int dflt) {
+        try { return s == null ? dflt : Integer.parseInt(s.trim()); }
+        catch (Exception e) { return dflt; }
+    }
+
+    private static long parseLong(String s, long dflt) {
+        try { return s == null ? dflt : Long.parseLong(s.trim()); }
+        catch (Exception e) { return dflt; }
+    }
+
+    private void sendJson(HttpExchange ex, int status, String json) throws IOException {
+        byte[] b = json.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        ex.sendResponseHeaders(status, b.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(b); }
+    }
+
+    private void sendBytes(HttpExchange ex, byte[] b, String contentType,
+                           String extraKey, String extraVal) throws IOException {
+        ex.getResponseHeaders().set("Content-Type", contentType);
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        if (extraKey != null) ex.getResponseHeaders().set(extraKey, extraVal);
+        ex.sendResponseHeaders(200, b.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(b); }
+    }
+
+    private String body(HttpExchange ex) throws IOException {
+        return new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+    }
+
+    /** 409 when an endpoint needs an account session the engine doesn't have. */
+    private boolean needAccount(HttpExchange ex) throws IOException {
+        if (r.acct != null) return true;
+        sendJson(ex, 409, "{\"ok\":false,\"error\":\"no_account\","
+                + "\"detail\":\"no saved session; POST /account/login first\"}");
+        return false;
+    }
+
+    // ------------------------------------------------------------- endpoints
+
+    private void status(HttpExchange ex) throws Exception {
+        StringBuilder b = new StringBuilder("{\"ok\":true");
+        b.append(",\"receiver\":{\"serving\":").append(BackupReceiver.currentServer != null)
+         .append(",\"backup_port\":").append(r.port)
+         .append(",\"bind\":").append(r.bind == null ? "null"
+                 : "\"" + MiniJson.esc(r.bind) + "\"")
+         .append(",\"target_dir\":\"").append(MiniJson.esc(r.targetRoot.toString()))
+         .append("\",\"data_dir\":\"").append(MiniJson.esc(r.dataDir.toString()))
+         .append("\",\"account_mode\":").append(r.accountMode)
+         .append(",\"control_only\":").append(r.controlOnly).append('}');
+        // mesh
+        b.append(",\"mesh\":");
+        if (r.sidecar == null) {
+            b.append("{\"state\":\"off\"}");
+        } else {
+            b.append("{\"state\":\"").append(r.sidecar.isAlive() ? "up" : "down")
+             .append("\",\"secure_mode\":").append(r.sidecar.secureModeActive())
+             .append(",\"peers\":").append(peersJson()).append('}');
+        }
+        // account + license + storage
+        if (r.acct == null) {
+            b.append(",\"account\":null");
+        } else {
+            long exp = r.store.licenseExpiresAt(r.acct.userId);
+            String quota = r.store.getMeta("quota_bytes");
+            b.append(",\"account\":{\"account\":\"").append(MiniJson.esc(r.acct.account))
+             .append("\",\"user_id\":\"").append(MiniJson.esc(r.acct.userId))
+             .append("\",\"server\":\"").append(MiniJson.esc(r.acct.server))
+             .append("\",\"network\":\"").append(MiniJson.esc(r.acct.networkName))
+             .append("\",\"pc_ip\":\"").append(MiniJson.esc(r.acct.pcIp))
+             .append("\",\"pc_device_id\":\"").append(MiniJson.esc(r.acct.pcDeviceId))
+             .append("\"}")
+             .append(",\"license_expires_at\":").append(exp < 0 ? "null" : Long.toString(exp))
+             .append(",\"storage\":{\"used_bytes\":").append(r.store.filesBytesTotal(r.acct.userId))
+             .append(",\"quota_bytes\":").append(quota == null ? "null" : quota)
+             .append(",\"files\":").append(r.store.countFiles(r.acct.userId)).append('}')
+             .append(",\"last_sync_ok_ms\":").append(r.lastSyncOkMs);
+        }
+        b.append(",\"server_time_ms\":").append(System.currentTimeMillis()).append('}');
+        sendJson(ex, 200, b.toString());
+    }
+
+    /** Best-effort peer view from the sidecar's easytier-cli RPC portal. */
+    private String peersJson() {
+        if (!BackupReceiver.onPath("easytier-cli")) return "null";
+        Path tmp = null;
+        try {
+            tmp = Files.createTempFile("etpeerctl", ".txt");
+            Process p = new ProcessBuilder("easytier-cli",
+                    "--rpc-portal", "127.0.0.1:" + MeshSidecar.RPC_PORT, "peer")
+                    .redirectOutput(tmp.toFile())
+                    .redirectErrorStream(true)
+                    .start();
+            if (!p.waitFor(3, TimeUnit.SECONDS)) {
+                p.destroyForcibly();
+                return "null";
+            }
+            Pattern relay = Pattern.compile("relay\\((\\d+)\\)");
+            StringBuilder b = new StringBuilder("[");
+            boolean first = true;
+            for (String line : Files.readAllLines(tmp, StandardCharsets.UTF_8)) {
+                if (!line.contains("10.99.")) continue;
+                String ip = null;
+                for (String tok : line.split("\\s+")) {
+                    if (tok.startsWith("10.99.")) { ip = tok; break; }
+                }
+                if (ip == null) continue;
+                int cost;
+                Matcher m = relay.matcher(line);
+                if (m.find()) cost = Integer.parseInt(m.group(1));
+                else if (line.contains("p2p")) cost = 1;
+                else continue;
+                if (!first) b.append(',');
+                first = false;
+                b.append("{\"ipv4\":\"").append(ip).append("\",\"cost\":").append(cost)
+                 .append(",\"route\":\"").append(cost == 1 ? "p2p" : "relay").append("\"}");
+            }
+            return b.append(']').toString();
+        } catch (Exception e) {
+            return "null";
+        } finally {
+            if (tmp != null) try { Files.deleteIfExists(tmp); } catch (IOException ignore) { }
+        }
+    }
+
+    private void devices(HttpExchange ex) throws Exception {
+        if (!needAccount(ex)) return;
+        List<BackupReceiver.DeviceRow> rows = r.store.listDevices(r.acct.userId);
+        StringBuilder bound = new StringBuilder(), pending = new StringBuilder();
+        for (BackupReceiver.DeviceRow d : rows) {
+            String o = "{\"id\":\"" + MiniJson.esc(d.id)
+                    + "\",\"name\":\"" + MiniJson.esc(d.name == null ? "" : d.name)
+                    + "\",\"kind\":\"" + MiniJson.esc(d.kind == null ? "" : d.kind)
+                    + "\",\"approved\":" + d.approved
+                    + ",\"revoked\":" + d.revoked
+                    + ",\"is_this_pc\":" + d.id.equals(r.acct.pcDeviceId) + "}";
+            StringBuilder dst = (d.approved || d.revoked) ? bound : pending;
+            if (dst.length() > 0) dst.append(',');
+            dst.append(o);
+        }
+        sendJson(ex, 200, "{\"ok\":true,\"bound\":[" + bound + "],\"pending\":[" + pending + "]}");
+    }
+
+    private void approve(HttpExchange ex, String deviceId) throws Exception {
+        if (!needAccount(ex)) return;
+        try {
+            String res = AccountLink.approveWithDevice(r.acct, deviceId);
+            String syncNote = null;
+            try {
+                AccountLink.syncOnce(r.acct, r.store);
+                r.lastSyncOkMs = System.currentTimeMillis();
+            } catch (Exception e) {
+                syncNote = e.getMessage();
+            }
+            StringBuilder b = new StringBuilder("{\"ok\":true,\"result\":");
+            if (res != null && res.trim().startsWith("{")) b.append(res.trim());
+            else b.append('"').append(MiniJson.esc(res == null ? "" : res)).append('"');
+            if (syncNote != null) {
+                b.append(",\"sync_warning\":\"").append(MiniJson.esc(syncNote)).append('"');
+            }
+            sendJson(ex, 200, b.append('}').toString());
+        } catch (Exception e) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\""
+                    + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
+        }
+    }
+
+    private void revoke(HttpExchange ex, String deviceId) throws Exception {
+        if (!needAccount(ex)) return;
+        try {
+            String res = AccountLink.revokeWithSession(r.acct, deviceId);
+            try {
+                AccountLink.syncOnce(r.acct, r.store);
+                r.lastSyncOkMs = System.currentTimeMillis();
+            } catch (Exception ignore) { /* local view refreshes on next sync */ }
+            StringBuilder b = new StringBuilder("{\"ok\":true,\"result\":");
+            if (res != null && res.trim().startsWith("{")) b.append(res.trim());
+            else b.append('"').append(MiniJson.esc(res == null ? "" : res)).append('"');
+            sendJson(ex, 200, b.append('}').toString());
+        } catch (AccountLink.SessionDead e) {
+            sendJson(ex, 401, "{\"ok\":false,\"error\":\"session_expired\","
+                    + "\"detail\":\"" + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
+        } catch (Exception e) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\""
+                    + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
+        }
+    }
+
+    private void sessions(HttpExchange ex, int limit) throws Exception {
+        List<String[]> rows = r.store.listSessions(Math.max(1, Math.min(limit, 200)));
+        StringBuilder b = new StringBuilder("{\"ok\":true,\"sessions\":[");
+        boolean first = true;
+        for (String[] s : rows) {
+            if (!first) b.append(',');
+            first = false;
+            b.append("{\"ts\":").append(s[0])
+             .append(",\"device_id\":\"").append(MiniJson.esc(s[1]))
+             .append("\",\"files_ok\":").append(s[2])
+             .append(",\"bytes\":").append(s[3])
+             .append(",\"result\":\"").append(MiniJson.esc(s[4])).append("\"}");
+        }
+        sendJson(ex, 200, b.append("]}").toString());
+    }
+
+    private void records(HttpExchange ex, int limit, int offset) throws Exception {
+        if (!needAccount(ex)) return;
+        limit = Math.max(1, Math.min(limit, 200));
+        offset = Math.max(0, offset);
+        List<BackupReceiver.FileRow> rows =
+                r.store.listFilesPage(r.acct.userId, limit, offset);
+        int total = r.store.countFiles(r.acct.userId);
+        StringBuilder b = new StringBuilder("{\"ok\":true,\"total\":").append(total)
+                .append(",\"records\":[");
+        boolean first = true;
+        for (BackupReceiver.FileRow f : rows) {
+            if (!first) b.append(',');
+            first = false;
+            b.append("{\"id\":").append(f.id)
+             .append(",\"device_id\":\"").append(MiniJson.esc(f.deviceId))
+             .append("\",\"path\":\"").append(MiniJson.esc(f.relPath))
+             .append("\",\"size\":").append(f.size)
+             .append(",\"sha256\":\"").append(f.sha256)
+             .append("\",\"backed_at\":").append(f.backedAt)
+             .append(",\"integrity\":\"").append(MiniJson.esc(f.integrity))
+             .append("\",\"thumb\":").append(f.thumb != null)
+             .append(",\"kind\":\"").append(kindOf(f.relPath))
+             .append("\",\"mime\":\"").append(mimeOf(f.relPath)).append("\"}");
+        }
+        sendJson(ex, 200, b.append("]}").toString());
+    }
+
+    private void recordBytes(HttpExchange ex, long id, boolean thumbOnly) throws Exception {
+        BackupReceiver.FileRow f = r.store.findFileById(id);
+        if (f == null) {
+            sendJson(ex, 404, "{\"ok\":false,\"error\":\"no such record\"}");
+            return;
+        }
+        Path thumbPath = null;
+        if (f.thumb != null) {
+            Path name = Paths.get(f.thumb).getFileName();
+            if (name != null) thumbPath = r.dataDir.resolve("thumbs").resolve(name);
+        }
+        boolean hasThumb = thumbPath != null && Files.isRegularFile(thumbPath);
+        if (thumbOnly) {
+            if (!hasThumb) {
+                sendJson(ex, 404, "{\"ok\":false,\"error\":\"no thumbnail\"}");
+                return;
+            }
+            sendBytes(ex, Files.readAllBytes(thumbPath), "image/jpeg", null, null);
+            return;
+        }
+        // preview: full bytes for web-renderable images; poster frame for
+        // videos; the JPEG thumb stands in for HEIC (WebKit cannot render it).
+        String kind = kindOf(f.relPath);
+        String mime = mimeOf(f.relPath);
+        if (kind.equals("image") && !mime.equals("image/heic") && !mime.equals("image/heif")) {
+            Path stored = BackupReceiver.safeResolve(r.targetRoot.resolve("users")
+                    .resolve(f.userId).resolve("devices").resolve(f.deviceId), f.relPath);
+            if (stored == null || !Files.isRegularFile(stored)) {
+                sendJson(ex, 404, "{\"ok\":false,\"error\":\"stored file missing\"}");
+                return;
+            }
+            sendBytes(ex, Files.readAllBytes(stored), mime, null, null);
+            return;
+        }
+        if (hasThumb) {
+            sendBytes(ex, Files.readAllBytes(thumbPath), "image/jpeg",
+                    "X-Preview-Fallback", "thumb");
+            return;
+        }
+        sendJson(ex, 404, "{\"ok\":false,\"error\":\"no preview available\"}");
+    }
+
+    private void logs(HttpExchange ex, int tail) throws IOException {
+        List<String> lines = BackupReceiver.logTail(Math.max(1, Math.min(tail, 400)));
+        StringBuilder b = new StringBuilder("{\"ok\":true,\"lines\":[");
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) b.append(',');
+            b.append('"').append(MiniJson.esc(lines.get(i))).append('"');
+        }
+        sendJson(ex, 200, b.append("]}").toString());
+    }
+
+    private void login(HttpExchange ex) throws Exception {
+        String json = body(ex);
+        String server = MiniJson.str(json, "server");
+        String account = MiniJson.str(json, "account");
+        String password = MiniJson.str(json, "password");
+        if (server == null || server.isEmpty()) server = BackupReceiver.DEFAULT_SERVER;
+        if (account == null || password == null || account.isEmpty() || password.isEmpty()) {
+            sendJson(ex, 400, "{\"ok\":false,\"error\":\"account and password are required\"}");
+            return;
+        }
+        try {
+            r.loadOrCreateKeys();
+            AccountLink.State st = AccountLink.loginFlow(r.dataDir, r.store,
+                    server, account, password, r.pubkeyB64(), null);
+            r.acct = st;
+            r.accountMode = true;
+            BackupReceiver.log("control API: login ok for " + st.account
+                    + " (user " + st.userId + "); engine restart required to serve under it");
+            sendJson(ex, 200, "{\"ok\":true,\"restart_required\":true"
+                    + ",\"user_id\":\"" + MiniJson.esc(st.userId)
+                    + "\",\"account\":\"" + MiniJson.esc(st.account)
+                    + "\",\"network\":\"" + MiniJson.esc(st.networkName) + "\"}");
+        } catch (Exception e) {
+            String msg = String.valueOf(e.getMessage());
+            int code = msg.contains("401") ? 401 : msg.contains("403") ? 403 : 502;
+            sendJson(ex, code, "{\"ok\":false,\"error\":\"" + MiniJson.esc(msg) + "\"}");
+        }
+    }
+
+    private void logout(HttpExchange ex) throws IOException {
+        AccountLink.State st = r.acct;
+        if (st == null) st = AccountLink.load(r.dataDir);
+        if (st != null) AccountLink.logoutSession(st);
+        r.acct = null;
+        BackupReceiver.log("control API: logged out (saved session wiped)");
+        sendJson(ex, 200, "{\"ok\":true,\"restart_required\":true}");
+    }
+
+    private void sync(HttpExchange ex) throws Exception {
+        if (!needAccount(ex)) return;
+        try {
+            String summary = AccountLink.syncOnce(r.acct, r.store);
+            r.lastSyncOkMs = System.currentTimeMillis();
+            BackupReceiver.log("control API sync: " + summary);
+            sendJson(ex, 200, "{\"ok\":true,\"summary\":\""
+                    + MiniJson.esc(summary) + "\"}");
+        } catch (Exception e) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\""
+                    + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
+        }
+    }
+
+    // ------------------------------------------------------------- media types
+
+    static String kindOf(String path) {
+        String ext = extOf(path);
+        switch (ext) {
+            case "jpg": case "jpeg": case "png": case "gif": case "bmp":
+            case "webp": case "heic": case "heif":
+                return "image";
+            case "mp4": case "mov": case "mkv": case "avi": case "webm":
+            case "3gp": case "m4v":
+                return "video";
+            default:
+                return "other";
+        }
+    }
+
+    static String mimeOf(String path) {
+        switch (extOf(path)) {
+            case "jpg": case "jpeg": return "image/jpeg";
+            case "png": return "image/png";
+            case "gif": return "image/gif";
+            case "bmp": return "image/bmp";
+            case "webp": return "image/webp";
+            case "heic": return "image/heic";
+            case "heif": return "image/heif";
+            case "mp4": case "m4v": return "video/mp4";
+            case "mov": return "video/quicktime";
+            case "mkv": return "video/x-matroska";
+            case "webm": return "video/webm";
+            case "avi": return "video/x-msvideo";
+            case "3gp": return "video/3gpp";
+            default: return "application/octet-stream";
+        }
+    }
+
+    private static String extOf(String path) {
+        String name = path == null ? "" : path;
+        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (slash >= 0) name = name.substring(slash + 1);
+        int dot = name.lastIndexOf('.');
+        return dot < 0 ? "" : name.substring(dot + 1).toLowerCase(Locale.ROOT);
+    }
+}
+
 /** Line I/O on the raw socket stream (never buffered: lines and file bytes share the stream). */
 final class Wire {
     static String readLine(InputStream in) throws IOException {
@@ -2151,6 +2840,7 @@ final class Hash {
  */
 final class MiniJson {
     static String esc(String s) {
+        if (s == null) return "";
         StringBuilder b = new StringBuilder(s.length() + 8);
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);

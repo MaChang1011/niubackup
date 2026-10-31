@@ -20,9 +20,18 @@ because each carries its own copy of the Wire/Hash/MiniJson helpers)
 
 ```bash
 CP=lib/sqlite-jdbc-3.47.1.0.jar:lib/slf4j-api-2.0.16.jar
-javac -cp $CP -d out receiver/BackupReceiver.java
+javac -cp $CP -d out receiver/BackupReceiver.java receiver/NiuPcApp.java
 javac -d out sender/BackupSender.java
 ```
+
+⚠️ Do NOT throw all three files into one `javac` invocation:
+`BackupSender.java` is a standalone single-file tool carrying its own
+copies of the `Wire`/`Hash`/`MiniJson` helpers, so a combined compile
+fails with "duplicate class: Wire/Hash" (by design since M1 — that is
+also why the laptop build tree keeps the sender's classes in a separate
+output dir). A clean build = the two commands above, each from an empty
+output dir; both were re-verified from clean on 2026-10-31 in the repo
+and in the laptop tree (`~/niubackup-pc/v2`).
 
 ## Seed a user + device (prints the device token ONCE; only its hash is stored)
 
