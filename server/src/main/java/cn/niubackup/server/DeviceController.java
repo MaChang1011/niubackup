@@ -10,10 +10,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Device registration and approval. The device token is shown exactly once at
- * registration; only its SHA-256 hash is stored. Approval paths (design §3.2):
- * (a) the account session, or (b) an approved pc-kind device of the same user —
- * path (b) is how the user's PC approves their phone.
+ * Device registration. The device token is shown exactly once at
+ * registration; only its SHA-256 hash is stored.
+ *
+ * Login-is-network (design §3.2, decided 2026-10-31): a device is approved
+ * the moment it registers under an account — there is no manual approval
+ * step anymore, because joining the account's mesh network IS the trust
+ * boundary (one account = one network). The /approve endpoint is kept as a
+ * harmless no-op for older clients (receivers self-approved their PC at
+ * bootstrap); revocation stays the live control.
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -50,14 +55,15 @@ public class DeviceController {
         String token = Util.newToken();
         // RETURNING id instead of GeneratedKeyHolder (pgjdbc returns the whole
         // row for RETURN_GENERATED_KEYS, which breaks getKey()).
+        // approved=true at insert: registration IS approval (login-is-network).
         long deviceId = jdbc.queryForObject(
-                "INSERT INTO devices(user_id, kind, name, token_hash, pc_pubkey) VALUES (?,?,?,?,?) RETURNING id",
+                "INSERT INTO devices(user_id, kind, name, token_hash, pc_pubkey, approved) VALUES (?,?,?,?,?,true) RETURNING id",
                 Long.class, userId, kind, name == null ? "" : name,
                 Util.sha256Hex(token), "pc".equals(kind) ? pubkey : null);
         return ResponseEntity.status(HttpStatus.CREATED).body(Util.body(
                 "device_id", deviceId,
                 "device_token", token,
-                "approved", false,
+                "approved", true,
                 "note", "device_token is shown once; only its hash is stored"));
     }
 

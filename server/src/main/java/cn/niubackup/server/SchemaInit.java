@@ -12,6 +12,10 @@ import org.springframework.stereotype.Component;
  * contains NO file-level tables and no filename/content-hash columns anywhere —
  * the server stores accounts, devices, licenses, per-user mesh networks and
  * count-level session logs only. File records live on the user's PC (design §8).
+ * Sole exception, by design: pc_login_tickets.payload holds the one-shot
+ * credentials of a QR-login handoff between phone approval and PC claim —
+ * the ticket lives 2 minutes, its secret is stored hashed, and the payload
+ * is wiped the moment the PC claims it (or when the ticket expires).
  */
 @Component
 public class SchemaInit implements ApplicationRunner {
@@ -52,6 +56,18 @@ public class SchemaInit implements ApplicationRunner {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now())
         """,
         "CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id)",
+        """
+        CREATE TABLE IF NOT EXISTS pc_login_tickets(
+            id VARCHAR(64) PRIMARY KEY,
+            secret_hash CHAR(64) NOT NULL,
+            device_name VARCHAR(128) NOT NULL DEFAULT '',
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            user_id BIGINT REFERENCES users(id),
+            pc_device_id BIGINT,
+            payload TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            expires_at TIMESTAMPTZ NOT NULL)
+        """,
         """
         CREATE TABLE IF NOT EXISTS networks(
             user_id BIGINT PRIMARY KEY REFERENCES users(id),

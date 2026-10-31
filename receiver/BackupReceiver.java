@@ -75,9 +75,14 @@ import com.sun.net.httpserver.HttpServer;
  *    local cache — with the design's offline grace: a previously-synced,
  *    previously-validated device keeps working while the server is down.
  *    Unknown devices are verified online at HELLO time when reachable.
- *    --approve/--devices/--sync are operator commands over the stored PC
- *    device token (the PC-approves-phone path); a supervised easytier-core
- *    sidecar joins the issued nb- network (see MeshSidecar).
+ *    Since 2026-10-31 the service approves devices at registration
+ *    (login-is-network: same account = same mesh network, no manual
+ *    approval step), so account-mode peers appear in the synced allowlist
+ *    as approved the moment they register; revocation still propagates
+ *    through the same sync. --approve/--devices/--sync remain as operator
+ *    commands over the stored PC device token — approve is now a harmless
+ *    no-op against current services, kept for older ones; a supervised
+ *    easytier-core sidecar joins the issued nb- network (see MeshSidecar).
  *  - Concurrency (2026-10-31): sessions are handled on a bounded pool of
  *    worker threads, so fs sessions (records / library / playback) are
  *    served WHILE a backup runs — the old sequential accept→handle→close
@@ -2051,13 +2056,16 @@ public class BackupReceiver {
  *
  * Bootstrap is the only password moment: {@link #loginFlow} logs in with the
  * account credentials, registers (or reuses) this PC as a pc device — sending
- * the receipt-signing public key — approves it with the account session, and
- * persists everything later steps need into &lt;dataDir&gt;/account.json
- * (mode 600): user id, PC device id + token, refresh token, and the mesh
- * provisioning (per-user network name/secret + public node).
+ * the receipt-signing public key — and persists everything later steps need
+ * into &lt;dataDir&gt;/account.json (mode 600): user id, PC device id + token,
+ * refresh token, and the mesh provisioning (per-user network name/secret +
+ * public node). Registration is approval (login-is-network, 2026-10-31);
+ * the historical self-approve call in loginFlow is a legacy no-op.
+ * (QR login — the phone approving a ticket that makes the service register
+ * this PC — lands on the same device row and account.json shape.)
  *
  * After bootstrap everything runs on the PC device token: device list,
- * license, provisioning, and the approve call (the PC-approves-phone path).
+ * license, provisioning, and the (now no-op) approve call.
  * {@link #syncOnce} merges the service view into the receiver's local SQLite:
  * approved/revoked flags and the license land in the same tables the M4a
  * standalone mode uses, so HELLO validation is identical afterwards. Token
@@ -2385,8 +2393,10 @@ final class AccountLink {
     // ------------------------------------------------------------- flows
 
     /**
-     * Full bootstrap: password login → (reuse or register+approve the PC
-     * device) → provisioning → save account.json → one sync. Returns the state.
+     * Full bootstrap: password login → (reuse or register the PC device —
+     * the service approves at registration since login-is-network; the
+     * approve calls below are legacy no-ops kept for older services) →
+     * provisioning → save account.json → one sync. Returns the state.
      */
     static State loginFlow(Path dataDir, BackupReceiver.Store store, String server,
                            String account, String password, String pubkeyB64,

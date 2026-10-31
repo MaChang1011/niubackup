@@ -16,10 +16,10 @@ import java.util.Map;
  * Endpoints used by paired clients: mesh provisioning, license state and
  * validation, and count-level session log reporting.
  *
- * Provisioning deliberately works for a registered-but-not-yet-approved device
- * so the client can join its per-user network first; actual backup sessions
- * are gated by /api/license/validate, which requires approval. Disabled users
- * and revoked devices are refused everywhere.
+ * Devices are approved at registration (login-is-network, design §3.2), so
+ * provisioning and session validation hinge on identity, revocation and
+ * account state only. Disabled users and revoked devices are refused
+ * everywhere.
  */
 @RestController
 @RequestMapping("/api")
@@ -102,9 +102,8 @@ public class ClientApiController {
         if (Boolean.TRUE.equals(d.get("revoked"))) {
             return ResponseEntity.ok(Util.body("valid", false, "reason", "device_revoked"));
         }
-        if (!Boolean.TRUE.equals(d.get("approved"))) {
-            return ResponseEntity.ok(Util.body("valid", false, "reason", "not_approved"));
-        }
+        // No approval gate: devices are approved at registration
+        // (login-is-network, 2026-10-31), so not_approved no longer exists.
         long userId = ((Number) d.get("user_id")).longValue();
         if (!auth.userActive(userId)) {
             return ResponseEntity.ok(Util.body("valid", false, "reason", "user_disabled"));
@@ -128,9 +127,8 @@ public class ClientApiController {
         if (device == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Util.error("unauthorized"));
         }
-        if (!Boolean.TRUE.equals(device.get("approved"))) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Util.error("not_approved"));
-        }
+        // auth.device() already excludes revoked devices; registration is
+        // approval (login-is-network), so nothing else gates reporting.
         long userId = ((Number) device.get("user_id")).longValue();
         if (!auth.userActive(userId)) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Util.error("user_disabled"));
