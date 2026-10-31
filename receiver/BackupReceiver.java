@@ -262,8 +262,16 @@ public class BackupReceiver {
             }
             if (server != null) st.server = server;
             if (approveId != null) {
-                String res = AccountLink.approveWithDevice(st, approveId);
-                System.out.println("approve device " + approveId + ": " + res);
+                try {
+                    String res = AccountLink.approveWithDevice(st, approveId);
+                    System.out.println("approve device " + approveId + ": " + res);
+                } catch (Exception e) {
+                    // e.g. approving a revoked device: the service answers
+                    // 409 device_revoked (revocation is terminal). Report it
+                    // as a one-line operator error, not a stack trace.
+                    System.err.println("approve device " + approveId + " failed: " + e.getMessage());
+                    System.exit(1);
+                }
             }
             if (devicesCmd) {
                 System.out.println("server devices for user " + st.userId + ":");
