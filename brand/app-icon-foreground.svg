@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- NiuBackup app icon — adaptive-icon FOREGROUND layer (transparent).
+     Same geometry as brand/app-icon.svg, scaled to ~58% and centered so
+     the artwork stays inside the Android adaptive-icon safe zone on a
+     432x432 (108dp @ xxxhdpi) canvas. Render ic_launcher_foreground.png
+     at 108/162/216/324/432 px from this file. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 432 432" width="432" height="432">
+  <g transform="translate(48.9 42.3) scale(0.3264)">
+    <path fill="#FFFFFF" d="M 172 196 L 352 228 L 398 348 L 512 326 L 626 348 L 672 228 L 852 196 L 700 372 L 898 462 L 726 528 L 700 640 L 512 868 L 324 640 L 298 528 L 126 462 L 324 372 Z"/>
+    <path fill="#F07F13" d="M 512 352 L 672 508 L 580 508 L 580 706 L 444 706 L 444 508 L 352 508 Z"/>
+  </g>
+</svg>
