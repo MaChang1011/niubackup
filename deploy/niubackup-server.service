@@ -1,0 +1,15 @@
+[Unit]
+Description=NiuBackup account service (control plane)
+After=network.target postgresql.service easytier-node.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/niubackup
+EnvironmentFile=/opt/niubackup/server.env
+ExecStart=/opt/niubackup/jdk21/bin/java -jar /opt/niubackup/niubackup-server.jar
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

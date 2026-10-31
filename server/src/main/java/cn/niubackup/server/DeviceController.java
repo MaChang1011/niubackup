@@ -1,0 +1,122 @@
+package cn.niubackup.server;
+
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Device registration and approval. The device token is shown exactly once at
+ * registration; only its SHA-256 hash is stored. Approval paths (design §3.2):
+ * (a) the account session, or (b) an approved pc-kind device of the same user —
+ * path (b) is how the user's PC approves their phone.
+ */
+@RestController
+@RequestMapping("/api/devices")
+public class DeviceController {
+
+    private final JdbcTemplate jdbc;
+    private final AuthResolver auth;
+
+    public DeviceController(JdbcTemplate jdbc, AuthResolver auth) {
+        this.jdbc = jdbc;
+        this.auth = auth;
+    }
+
+    @PostMapping("/register")
+    public ResponseEntity<?> register(HttpServletRequest http, @RequestBody Map<String, Object> req) {
+        Long userId = auth.userId(http);
+        if (userId == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Util.error("unauthorized"));
+        }
+        String kind = Util.str(req, "kind");
+        String name = Util.str(req, "name");
+        String pubkey = Util.str(req, "pc_pubkey");
+        if (!"phone".equals(kind) && !"pc".equals(kind)) {
+            return ResponseEntity.badRequest().body(Util.error("invalid_kind"));
+        }
+        Map<String, Object> license = jdbc.queryForMap("SELECT * FROM licenses WHERE user_id=?", userId);
+        int cap = ((Number) license.get("phone".equals(kind) ? "max_phones" : "max_pcs")).intValue();
+        Integer count = jdbc.queryForObject(
+                "SELECT count(*) FROM devices WHERE user_id=? AND kind=? AND NOT revoked",
+                Integer.class, userId, kind);
+        if (count != null && count >= cap) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Util.error("device_limit"));
+        }
+        String token = Util.newToken();
+        // RETURNING id instead of GeneratedKeyHolder (pgjdbc returns the whole
+        // row for RETURN_GENERATED_KEYS, which breaks getKey()).
+        long deviceId = jdbc.queryForObject(
+                "INSERT INTO devices(user_id, kind, name, token_hash, pc_pubkey) VALUES (?,?,?,?,?) RETURNING id",
+                Long.class, userId, kind, name == null ? "" : name,
+                Util.sha256Hex(token), "pc".equals(kind) ? pubkey : null);
+        return ResponseEntity.status(HttpStatus.CREATED).body(Util.body(
+                "device_id", deviceId,
+                "device_token", token,
+                "approved", false,
+                "note", "device_token is shown once; only its hash is stored"));
+    }
+
+    @GetMapping
+    public ResponseEntity<?> list(HttpServletRequest http) {
+        Long userId = auth.callerUserId(http);
+        if (userId == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Util.error("unauthorized"));
+        }
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "SELECT id, kind, name, approved, revoked, (pc_pubkey IS NOT NULL) AS has_pubkey, last_seen_at, created_at " +
+                "FROM devices WHERE user_id=? ORDER BY id", userId);
+        return ResponseEntity.ok(Util.body("devices", rows));
+    }
+
+    @PostMapping("/{id}/approve")
+    public ResponseEntity<?> approve(HttpServletRequest http, @PathVariable("id") long deviceId) {
+        Map<String, Object> target = findDevice(deviceId);
+        if (target == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Util.error("device_not_found"));
+        }
+        long ownerId = ((Number) target.get("user_id")).longValue();
+
+        Long sessionUser = auth.userId(http);
+        boolean allowed = sessionUser != null && sessionUser == ownerId;
+        if (!allowed) {
+            Map<String, Object> caller = auth.device(http);
+            if (caller != null
+                    && "pc".equals(caller.get("kind"))
+                    && Boolean.TRUE.equals(caller.get("approved"))
+                    && ((Number) caller.get("user_id")).longValue() == ownerId) {
+                allowed = true;
+            }
+        }
+        if (!allowed) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Util.error("cannot_approve"));
+        }
+        if (Boolean.TRUE.equals(target.get("revoked"))) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Util.error("device_revoked"));
+        }
+        jdbc.update("UPDATE devices SET approved=true WHERE id=?", deviceId);
+        return ResponseEntity.ok(Util.body("device_id", deviceId, "approved", true));
+    }
+
+    @PostMapping("/{id}/revoke")
+    public ResponseEntity<?> revoke(HttpServletRequest http, @PathVariable("id") long deviceId) {
+        Long sessionUser = auth.userId(http);
+        if (sessionUser == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Util.error("unauthorized"));
+        }
+        int n = jdbc.update("UPDATE devices SET revoked=true WHERE id=? AND user_id=?", deviceId, sessionUser);
+        if (n == 0) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Util.error("device_not_found"));
+        }
+        return ResponseEntity.ok(Util.body("device_id", deviceId, "revoked", true));
+    }
+
+    private Map<String, Object> findDevice(long id) {
+        List<Map<String, Object>> rows = jdbc.queryForList("SELECT * FROM devices WHERE id=?", id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+}

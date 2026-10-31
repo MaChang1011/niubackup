@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Build settings used ON the cloud server (see docs/m4b-notes.md for why the
+  build happens there): the server's foreign egress goes through its local
+  mihomo proxy, and Maven Central is mirrored by Aliyun.
+-->
+<settings>
+  <proxies>
+    <proxy><id>mihomo-http</id><active>true</active><protocol>http</protocol><host>127.0.0.1</host><port>7890</port><nonProxyHosts>localhost|127.0.0.1</nonProxyHosts></proxy>
+    <proxy><id>mihomo-https</id><active>true</active><protocol>https</protocol><host>127.0.0.1</host><port>7890</port><nonProxyHosts>localhost|127.0.0.1</nonProxyHosts></proxy>
+  </proxies>
+  <mirrors>
+    <mirror><id>aliyun-public</id><mirrorOf>central</mirrorOf><name>aliyun</name><url>https://maven.aliyun.com/repository/public</url></mirror>
+  </mirrors>
+</settings>

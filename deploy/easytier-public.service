@@ -1,0 +1,12 @@
+[Unit]
+Description=EasyTier public node for NiuBackup (bare, discovery + nb-* relay whitelist)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/easytier-core --hostname et-public --listeners tcp://0.0.0.0:11011 udp://0.0.0.0:11011 --relay-network-whitelist nb-* --no-tun true --rpc-portal 127.0.0.1:15889
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

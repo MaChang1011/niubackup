@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>牛备 NiuBackup · 管理后台</title>
+<style>
+  body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 24px; color: #1c2733; background: #f6f8fa; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  .card { background: #fff; border: 1px solid #d8dee4; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  input, button { font-size: 14px; padding: 6px 10px; margin: 2px; }
+  button { cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid #e5e9ee; text-align: left; padding: 6px 8px; vertical-align: top; }
+  .muted { color: #66707a; } .err { color: #b42318; }
+  .badge { padding: 1px 6px; border-radius: 8px; background: #eef2f5; font-size: 12px; }
+  .hidden { display: none; }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; }
+  .stats div b { font-size: 20px; display: block; }
+</style>
+</head>
+<body>
+<h1>🐂 牛备 NiuBackup · 管理后台</h1>
+
+<div id="loginView" class="card">
+  <h2>管理员登录</h2>
+  <input id="username" placeholder="用户名" autocomplete="username">
+  <input id="password" type="password" placeholder="密码" autocomplete="current-password">
+  <button onclick="login()">登录</button>
+  <span id="loginErr" class="err"></span>
+</div>
+
+<div id="mainView" class="hidden">
+  <div class="card">
+    <div class="stats" id="stats"></div>
+    <p><button onclick="loadAll()">刷新</button>
+       <button onclick="logout()">退出登录</button>
+       <span class="muted" id="whoami"></span></p>
+  </div>
+
+  <div class="card">
+    <h2>用户</h2>
+    <input id="search" placeholder="按账号搜索" onkeydown="if(event.key==='Enter')loadUsers()">
+    <button onclick="loadUsers()">搜索</button>
+    <table>
+      <thead><tr><th>ID</th><th>账号</th><th>状态</th><th>授权到期</th><th>设备数</th><th>组网</th><th>操作</th></tr></thead>
+      <tbody id="userRows"></tbody>
+    </table>
+    <div id="devicePanel" class="hidden">
+      <h2>设备 · 用户 <span id="deviceUser"></span></h2>
+      <table>
+        <thead><tr><th>ID</th><th>类型</th><th>名称</th><th>已批准</th><th>已吊销</th><th>公钥</th><th>最后在线</th><th>操作</th></tr></thead>
+        <tbody id="deviceRows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>操作审计</h2>
+    <table>
+      <thead><tr><th>时间</th><th>管理员</th><th>动作</th><th>对象</th><th>详情</th></tr></thead>
+      <tbody id="auditRows"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('nb_admin_token') || '';
+let adminName = localStorage.getItem('nb_admin_name') || '';
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(opts.headers || {}) }
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+async function login() {
+  document.getElementById('loginErr').textContent = '';
+  try {
+    const d = await api('/api/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ username: username.value, password: password.value })
+    });
+    token = d.admin_token; adminName = d.username;
+    localStorage.setItem('nb_admin_token', token);
+    localStorage.setItem('nb_admin_name', adminName);
+    showMain();
+  } catch (e) {
+    document.getElementById('loginErr').textContent = '登录失败：' + e.message;
+  }
+}
+
+function logout() {
+  token = ''; adminName = '';
+  localStorage.removeItem('nb_admin_token'); localStorage.removeItem('nb_admin_name');
+  document.getElementById('mainView').classList.add('hidden');
+  document.getElementById('loginView').classList.remove('hidden');
+}
+
+function showMain() {
+  document.getElementById('loginView').classList.add('hidden');
+  document.getElementById('mainView').classList.remove('hidden');
+  document.getElementById('whoami').textContent = '管理员：' + adminName;
+  loadAll();
+}
+
+async function loadAll() { await loadOverview(); await loadUsers(); await loadAudit(); }
+
+async function loadOverview() {
+  const s = await api('/api/admin/overview');
+  document.getElementById('stats').innerHTML = [
+    ['用户总数', s.users_total], ['活跃用户', s.users_active],
+    ['设备', s.devices_total], ['手机', s.phones], ['PC', s.pcs],
+    ['今日会话', s.sessions_today], ['今日流量', fmtBytes(s.bytes_today)], ['累计流量', fmtBytes(s.bytes_total)]
+  ].map(([k, v]) => `<div><span class="muted">${k}</span><b>${v}</b></div>`).join('');
+}
+
+function fmtBytes(b) {
+  b = Number(b || 0);
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
+  return (b / 1073741824).toFixed(2) + ' GB';
+}
+
+async function loadUsers() {
+  const q = encodeURIComponent(document.getElementById('search').value || '');
+  const d = await api('/api/admin/users?search=' + q);
+  document.getElementById('userRows').innerHTML = d.users.map(u => `
+    <tr>
+      <td>${u.id}</td><td>${esc(u.account)}</td>
+      <td><span class="badge">${u.status}</span></td>
+      <td>${fmtTs(u.expires_at)}</td><td>${u.device_count}</td><td>${esc(u.network_name || '')}</td>
+      <td>
+        <button onclick="showDevices(${u.id})">设备</button>
+        <button onclick="renew(${u.id})">续期</button>
+        ${u.status === 'active'
+          ? `<button onclick="setStatus(${u.id},'disable')">停用</button>`
+          : `<button onclick="setStatus(${u.id},'enable')">恢复</button>`}
+      </td>
+    </tr>`).join('');
+}
+
+async function showDevices(userId) {
+  const d = await api('/api/admin/users/' + userId + '/devices');
+  document.getElementById('devicePanel').classList.remove('hidden');
+  document.getElementById('deviceUser').textContent = '#' + userId;
+  document.getElementById('deviceRows').innerHTML = d.devices.map(v => `
+    <tr>
+      <td>${v.id}</td><td>${v.kind}</td><td>${esc(v.name || '')}</td>
+      <td>${v.approved ? '是' : '否'}</td><td>${v.revoked ? '是' : '否'}</td>
+      <td>${v.has_pubkey ? '有' : '—'}</td><td>${fmtTs(v.last_seen_at)}</td>
+      <td>${v.revoked ? '' : `<button onclick="revokeDevice(${v.id}, ${userId})">吊销</button>`}</td>
+    </tr>`).join('');
+}
+
+async function renew(userId) {
+  const days = prompt('续期天数（从当前到期日或今天起算，取较晚者）', '30');
+  if (!days) return;
+  await api('/api/admin/users/' + userId + '/license', { method: 'POST', body: JSON.stringify({ days: Number(days) }) });
+  await loadAll();
+}
+
+async function setStatus(userId, action) {
+  if (!confirm('确认' + (action === 'disable' ? '停用' : '恢复') + '用户 #' + userId + '？')) return;
+  await api('/api/admin/users/' + userId + '/' + action, { method: 'POST', body: '{}' });
+  await loadAll();
+}
+
+async function revokeDevice(deviceId, userId) {
+  if (!confirm('确认吊销设备 #' + deviceId + '？')) return;
+  await api('/api/admin/devices/' + deviceId + '/revoke', { method: 'POST', body: '{}' });
+  await showDevices(userId); await loadAudit();
+}
+
+async function loadAudit() {
+  const d = await api('/api/admin/audit');
+  document.getElementById('auditRows').innerHTML = d.audit.map(a => `
+    <tr><td>${fmtTs(a.ts)}</td><td>${esc(a.admin_username)}</td><td>${esc(a.action)}</td>
+    <td>${esc(a.target)}</td><td>${esc(a.detail)}</td></tr>`).join('');
+}
+
+function fmtTs(t) { return t ? new Date(t).toLocaleString('zh-CN') : '—'; }
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+
+if (token) { showMain(); }
+</script>
+</body>
+</html>
