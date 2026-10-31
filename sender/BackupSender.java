@@ -903,6 +903,7 @@ final class Hash {
  */
 final class MiniJson {
     static String esc(String s) {
+        if (s == null) return "";
         StringBuilder b = new StringBuilder(s.length() + 8);
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);

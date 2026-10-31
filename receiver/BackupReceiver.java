@@ -2411,6 +2411,12 @@ final class AccountLink {
             throw new IOException("pc-login credentials incomplete");
         }
         st.pcIp = pcIpOverride != null ? pcIpOverride : DEFAULT_PC_IP;
+        // Provisioning fills these in AFTER this first save (the one-time
+        // credentials must land first); keep them non-null so save() never
+        // serializes a null, whatever MiniJson variant is on the classpath.
+        if (st.networkName == null) st.networkName = "";
+        if (st.networkSecret == null) st.networkSecret = "";
+        if (st.publicNode == null) st.publicNode = "";
         st.save();
         try {
             String[] prov = provisioning(st, st.pcDeviceToken);

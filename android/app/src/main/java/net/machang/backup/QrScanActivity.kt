@@ -48,6 +48,8 @@ class QrScanActivity : Activity() {
 
     private val main = Handler(Looper.getMainLooper())
     private var camera: Camera? = null
+    private var previewRunning = false
+    private var surfaceReady = false
     private var surfaceView: SurfaceView? = null
     private lateinit var statusText: TextView
     private lateinit var scanLayer: FrameLayout
@@ -78,9 +80,10 @@ class QrScanActivity : Activity() {
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_CAMERA &&
-            grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (requestCode != REQ_CAMERA) return
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            if (!handled.get()) ensureCamera()
+        } else {
             statusText.text = "没有相机权限，无法扫码。请在系统设置中允许牛备使用相机。"
         }
     }
@@ -89,7 +92,7 @@ class QrScanActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (!handled.get()) startCamera()
+        if (!handled.get()) ensureCamera()
     }
 
     override fun onPause() {
@@ -97,39 +100,61 @@ class QrScanActivity : Activity() {
         super.onPause()
     }
 
-    private fun startCamera() {
+    /**
+     * Surface-driven camera start. The preview may only be bound once the
+     * SurfaceView surface actually exists: onResume regularly wins the race
+     * against surfaceCreated, and binding then hands the camera a NULL
+     * surface ("app passed NULL surface" in logcat) - the preview stays
+     * black forever after, because the surfaceCreated retry used to bail
+     * out on camera != null. So: open lazily, bind only when the surface
+     * is valid, and re-bind on surfaceCreated if the camera is already
+     * open. Callable from onResume, surfaceCreated and the retry tap.
+     */
+    private fun ensureCamera() {
         val sv = surfaceView ?: return
-        if (camera != null) return
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             statusText.text = "需要相机权限才能扫码"
             return
         }
+        if (!surfaceReady || !sv.holder.surface.isValid) {
+            // Not yet - surfaceCreated calls us again when the surface lands.
+            return
+        }
         try {
-            val cam = Camera.open()
-            camera = cam
-            val params = cam.parameters
-            params.previewFormat = ImageFormat.NV21
-            // Prefer a ~720p preview: big enough for QR decode, cheap to copy.
-            val size = params.supportedPreviewSizes
-                ?.filter { it.width in 640..1600 }
-                ?.minByOrNull { kotlin.math.abs(it.width - 1280) }
-            if (size != null) params.setPreviewSize(size.width, size.height)
-            if (Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE in
-                (params.supportedFocusModes ?: emptyList())
-            ) {
-                params.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
+            var cam = camera
+            if (cam == null) {
+                cam = Camera.open()
+                camera = cam
+                val params = cam.parameters
+                params.previewFormat = ImageFormat.NV21
+                // Prefer a ~720p preview: big enough for QR decode, cheap to copy.
+                val size = params.supportedPreviewSizes
+                    ?.filter { it.width in 640..1600 }
+                    ?.minByOrNull { kotlin.math.abs(it.width - 1280) }
+                if (size != null) params.setPreviewSize(size.width, size.height)
+                if (Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE in
+                    (params.supportedFocusModes ?: emptyList())
+                ) {
+                    params.focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
+                }
+                cam.parameters = params
+                cam.setDisplayOrientation(90)
+                cam.setPreviewCallback { data, c -> onPreviewFrame(data, c) }
             }
-            cam.parameters = params
-            cam.setDisplayOrientation(90)
-            cam.setPreviewDisplay(sv.holder)
-            cam.setPreviewCallback { data, c -> onPreviewFrame(data, c) }
-            cam.startPreview()
+            if (!previewRunning) {
+                cam.setPreviewDisplay(sv.holder)
+                cam.startPreview()
+                previewRunning = true
+                statusText.text = ""
+            }
         } catch (t: Throwable) {
-            statusText.text = "相机打开失败：${t.message}"
+            stopCamera()
+            statusText.text = "相机打开失败：${t.message}。轻点屏幕重试。"
         }
     }
 
     private fun stopCamera() {
+        previewRunning = false
         try {
             camera?.setPreviewCallback(null)
             camera?.stopPreview()
@@ -444,6 +469,9 @@ class QrScanActivity : Activity() {
                 Gravity.BOTTOM
             )
         )
+        scanLayer.setOnClickListener {
+            if (!handled.get() && camera == null) ensureCamera()
+        }
         root.addView(
             scanLayer,
             FrameLayout.LayoutParams(
@@ -467,7 +495,8 @@ class QrScanActivity : Activity() {
         setContentView(root)
         surfaceView?.holder?.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
-                if (!handled.get()) startCamera()
+                surfaceReady = true
+                if (!handled.get()) ensureCamera()
             }
 
             override fun surfaceChanged(
@@ -476,6 +505,7 @@ class QrScanActivity : Activity() {
             }
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
+                surfaceReady = false
                 stopCamera()
             }
         })
