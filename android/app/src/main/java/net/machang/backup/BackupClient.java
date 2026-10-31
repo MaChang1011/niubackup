@@ -15,13 +15,19 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
 import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.IntSupplier;
 
 /**
  * BackupClient — Android port of the M1 BackupSender (same wire protocol,
@@ -34,6 +40,15 @@ import java.util.Map;
  * app's files dir, so repeat scans of an unchanged library are
  * metadata-only, and a first hash interrupted halfway resumes where it
  * stopped. The wire protocol is unchanged (v1).
+ *
+ * M4a (protocol v2): when user_id / device_id / device token are configured,
+ * the client speaks protocol v2 — HELLO carries the identity plus the
+ * EasyTier route cost to the PC (1 = p2p direct, &gt;=2 relay, -1 unknown;
+ * the receiver enforces the direct-only gate). After the session it stores
+ * the receiver's signed completion receipt (ECDSA P-256) into the app files
+ * dir as last-receipt.json and logs whether the signature verifies against
+ * the public key included in the receipt. Without v2 credentials it falls
+ * back to the legacy v1 HELLO (for the still-running v1 receiver).
  *
  * Pure JDK APIs, safe on Android (minSdk 26). Blocking: run on a worker thread.
  */
@@ -50,14 +65,33 @@ public class BackupClient {
 
     private final Logger logger;
     private final File cacheDir; // app files dir; null -> cache inside scanned root
+    private final String userId;       // v2 identity; null -> legacy v1
+    private final String deviceId;
+    private final String deviceToken;
+    private final IntSupplier routeCostSupplier; // EasyTier peer cost to the PC; -1 = unknown
 
     public BackupClient(Logger logger) {
         this(logger, null);
     }
 
     public BackupClient(Logger logger, File cacheDir) {
+        this(logger, cacheDir, null, null, null, () -> -1);
+    }
+
+    public BackupClient(Logger logger, File cacheDir, String userId, String deviceId,
+                        String deviceToken, IntSupplier routeCostSupplier) {
         this.logger = logger;
         this.cacheDir = cacheDir;
+        this.userId = userId;
+        this.deviceId = deviceId;
+        this.deviceToken = deviceToken;
+        this.routeCostSupplier = routeCostSupplier != null ? routeCostSupplier : () -> -1;
+    }
+
+    private boolean v2() {
+        return userId != null && !userId.isEmpty()
+                && deviceId != null && !deviceId.isEmpty()
+                && deviceToken != null && !deviceToken.isEmpty();
     }
 
     /** Runs one backup session for {@code rootDir}. Returns the number of failed files. */
@@ -85,11 +119,28 @@ public class BackupClient {
             InputStream in = s.getInputStream();
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
 
-            Wire.writeLine(out, "HELLO " + device + " " + PROTO);
-            String ok = Wire.readLine(in);
-            if (ok == null || !ok.startsWith("OK")) {
-                logger.log("握手被拒绝: " + ok);
-                return 1;
+            if (v2()) {
+                int routeCost = -1;
+                try {
+                    routeCost = routeCostSupplier.getAsInt();
+                } catch (Exception ignore) { /* best effort; -1 = unknown */ }
+                Wire.writeLine(out, "HELLO {\"version\":2,\"user_id\":\"" + MiniJson.esc(userId)
+                        + "\",\"device_id\":\"" + MiniJson.esc(deviceId)
+                        + "\",\"device_token\":\"" + MiniJson.esc(deviceToken)
+                        + "\",\"route_cost\":" + routeCost + ",\"mode\":\"backup\"}");
+                String resp = Wire.readLine(in);
+                if (resp == null || !resp.startsWith("HELLO_ACK")) {
+                    logger.log("v2 握手被拒绝: " + resp);
+                    return 1;
+                }
+                logger.log("协议 v2 握手成功（直连 cost=" + routeCost + "）");
+            } else {
+                Wire.writeLine(out, "HELLO " + device + " " + PROTO);
+                String ok = Wire.readLine(in);
+                if (ok == null || !ok.startsWith("OK")) {
+                    logger.log("握手被拒绝: " + ok);
+                    return 1;
+                }
             }
 
             for (Entry e : entries) {
@@ -135,12 +186,60 @@ public class BackupClient {
             Wire.writeLine(out, "BYE");
             String receipt = Wire.readLine(in);
             logger.log("回执: " + receipt);
+            if (v2() && receipt != null && receipt.startsWith("RECEIPT ")) {
+                handleSignedReceipt(receipt.substring("RECEIPT ".length()));
+            }
         } catch (IOException e) {
             logger.log("连接/传输失败: " + e.getMessage());
             return Math.max(failures, 1);
         }
         logger.log(failures == 0 ? "全部文件已就位 ✔" : failures + " 个文件失败");
         return failures;
+    }
+
+    /**
+     * The v2 RECEIPT carries a signed completion receipt: {receipt, signature,
+     * pubkey}. Verify the ECDSA P-256 signature against the included public
+     * key, persist the whole signed block to the app files dir
+     * (last-receipt.json) as the phone-side proof of backup, and log the
+     * verification result.
+     */
+    private void handleSignedReceipt(String receiptJson) {
+        String doc = MiniJson.str(receiptJson, "receipt");
+        String sig = MiniJson.str(receiptJson, "signature");
+        String pub = MiniJson.str(receiptJson, "pubkey");
+        if (doc == null || sig == null || pub == null) {
+            logger.log("回执不含签名块");
+            return;
+        }
+        boolean valid = verifyEcdsa(doc, sig, pub);
+        logger.log("回执签名验证: " + (valid ? "通过 ✔" : "失败 ✘"));
+        if (cacheDir != null) {
+            File f = new File(cacheDir, "last-receipt.json");
+            String stored = "{\"receipt\":" + doc + ",\"signature\":\"" + sig
+                    + "\",\"pubkey\":\"" + pub + "\"}";
+            try (BufferedWriter w = new BufferedWriter(new OutputStreamWriter(
+                    new FileOutputStream(f), StandardCharsets.UTF_8))) {
+                w.write(stored);
+                logger.log("签名回执已保存: " + f.getAbsolutePath());
+            } catch (IOException e) {
+                logger.log("回执保存失败: " + e.getMessage());
+            }
+        }
+    }
+
+    static boolean verifyEcdsa(String payload, String sigB64, String pubB64) {
+        try {
+            KeyFactory kf = KeyFactory.getInstance("EC");
+            PublicKey pub = kf.generatePublic(
+                    new X509EncodedKeySpec(Base64.getDecoder().decode(pubB64)));
+            Signature v = Signature.getInstance("SHA256withECDSA");
+            v.initVerify(pub);
+            v.update(payload.getBytes(StandardCharsets.UTF_8));
+            return v.verify(Base64.getDecoder().decode(sigB64));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     List<Entry> scan(File root) throws IOException {

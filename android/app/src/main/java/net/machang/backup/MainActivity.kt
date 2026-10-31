@@ -32,9 +32,15 @@ class MainActivity : Activity() {
         private const val REQ_PERMS = 1002
         private const val PREFS = "settings"
         private const val KEY_SECRET = "mesh_secret"
+        private const val KEY_USER_ID = "v2_user_id"
+        private const val KEY_DEVICE_ID = "v2_device_id"
+        private const val KEY_DEVICE_TOKEN = "v2_device_token"
     }
 
     private lateinit var secretInput: EditText
+    private lateinit var userIdInput: EditText
+    private lateinit var deviceIdInput: EditText
+    private lateinit var tokenInput: EditText
     private lateinit var vpnButton: Button
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
@@ -53,6 +59,9 @@ class MainActivity : Activity() {
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         secretInput.setText(prefs.getString(KEY_SECRET, ""))
+        userIdInput.setText(prefs.getString(KEY_USER_ID, ""))
+        deviceIdInput.setText(prefs.getString(KEY_DEVICE_ID, ""))
+        tokenInput.setText(prefs.getString(KEY_DEVICE_TOKEN, ""))
 
         vpnButton.setOnClickListener {
             if (meshRunning) {
@@ -81,9 +90,25 @@ class MainActivity : Activity() {
         }
 
         findViewById<Button>(BACKUP_BTN_ID).setOnClickListener {
+            val uid = userIdInput.text.toString().trim()
+            val did = deviceIdInput.text.toString().trim()
+            val tok = tokenInput.text.toString().trim()
+            prefs.edit()
+                .putString(KEY_USER_ID, uid)
+                .putString(KEY_DEVICE_ID, did)
+                .putString(KEY_DEVICE_TOKEN, tok)
+                .apply()
             thread(name = "backup") {
                 val dcim = File(Environment.getExternalStorageDirectory(), "DCIM")
-                val client = BackupClient(BackupClient.Logger { msg -> AppLog.log(msg) }, filesDir)
+                val logger = BackupClient.Logger { msg -> AppLog.log(msg) }
+                val client = if (uid.isNotEmpty() && did.isNotEmpty() && tok.isNotEmpty()) {
+                    BackupClient(logger, filesDir, uid, did, tok,
+                        java.util.function.IntSupplier {
+                            EasyTierBridge.peerRouteCost(BackupClient.DEFAULT_HOST)
+                        })
+                } else {
+                    BackupClient(logger, filesDir)
+                }
                 client.runBackup(dcim)
             }
             AppLog.log("开始备份 DCIM…")
@@ -170,6 +195,24 @@ class MainActivity : Activity() {
             )
         }
         root.addView(secretInput)
+
+        fun settingsField(hintText: String, password: Boolean = false): EditText {
+            return EditText(this).apply {
+                hint = hintText
+                inputType = InputType.TYPE_CLASS_TEXT or
+                    (if (password) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_VARIATION_NORMAL)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            }
+        }
+        userIdInput = settingsField("账号 user_id（协议 v2，三项填齐才启用）")
+        root.addView(userIdInput)
+        deviceIdInput = settingsField("设备 device_id（协议 v2）")
+        root.addView(deviceIdInput)
+        tokenInput = settingsField("设备令牌 device token（协议 v2）", password = true)
+        root.addView(tokenInput)
 
         vpnButton = Button(this).apply { text = "启动组网" }
         root.addView(vpnButton)

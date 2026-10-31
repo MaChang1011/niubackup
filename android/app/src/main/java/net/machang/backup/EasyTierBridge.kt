@@ -77,6 +77,26 @@ object EasyTierBridge {
     }
 
     /**
+     * Best-effort route cost to a peer (1 = p2p direct, >=2 = relay) for the
+     * §5.5 direct-only gate: scan the collectNetworkInfos JSON around the
+     * peer's IP for a "cost" number. -1 when anything is unavailable or the
+     * shape is unexpected — the receiver treats -1 as "unknown" and applies
+     * its own view of the tunnel.
+     */
+    fun peerRouteCost(ip: String): Int {
+        val infos = collectInfos()
+        if (infos.isBlank()) return -1
+        val idx = infos.indexOf(ip)
+        if (idx < 0) return -1
+        val window = infos.substring(
+            maxOf(0, idx - 200),
+            minOf(infos.length, idx + 600)
+        )
+        val m = Regex("\"cost\"\\s*:\\s*(\\d+)").find(window) ?: return -1
+        return m.groupValues[1].toIntOrNull() ?: -1
+    }
+
+    /**
      * Build the TOML config for machang-net. The secret comes from runtime settings only.
      *
      * The schema mirrors the proven ~/easytier/phone.toml exactly: the core's TOML

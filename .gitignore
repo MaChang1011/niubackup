@@ -1,3 +1,6 @@
+# third-party jars (fetched from Maven Central, see receiver/BUILD.md)
+lib/*.jar
+
 # build outputs
 out/
 **/out/
