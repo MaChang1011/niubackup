@@ -1,6 +1,7 @@
 package cn.niubackup.server;
 
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -19,6 +20,10 @@ import java.util.Map;
  * boundary (one account = one network). The /approve endpoint is kept as a
  * harmless no-op for older clients (receivers self-approved their PC at
  * bootstrap); revocation stays the live control.
+ *
+ * A registration carrying a persistent device_uuid upserts onto the
+ * device's existing row (see [DeviceUpsert]) — re-login never mints a new
+ * device number again.
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -44,6 +49,15 @@ public class DeviceController {
         if (!"phone".equals(kind) && !"pc".equals(kind)) {
             return ResponseEntity.badRequest().body(Util.error("invalid_kind"));
         }
+        // Stable device identity (design §3.2): with a device_uuid the
+        // registration is an upsert — same physical device, same row, fresh
+        // token — regardless of how often it logs in. Without one, the
+        // pre-uuid behavior below applies unchanged.
+        String uuid = DeviceUpsert.cleanUuid(Util.str(req, "device_uuid"));
+        if (uuid != null) {
+            ResponseEntity<?> reused = tryUpsert(userId, kind, name, pubkey, uuid);
+            if (reused != null) return reused;
+        }
         Map<String, Object> license = jdbc.queryForMap("SELECT * FROM licenses WHERE user_id=?", userId);
         int cap = ((Number) license.get("phone".equals(kind) ? "max_phones" : "max_pcs")).intValue();
         Integer count = jdbc.queryForObject(
@@ -56,15 +70,48 @@ public class DeviceController {
         // RETURNING id instead of GeneratedKeyHolder (pgjdbc returns the whole
         // row for RETURN_GENERATED_KEYS, which breaks getKey()).
         // approved=true at insert: registration IS approval (login-is-network).
-        long deviceId = jdbc.queryForObject(
-                "INSERT INTO devices(user_id, kind, name, token_hash, pc_pubkey, approved) VALUES (?,?,?,?,?,true) RETURNING id",
-                Long.class, userId, kind, name == null ? "" : name,
-                Util.sha256Hex(token), "pc".equals(kind) ? pubkey : null);
+        long deviceId;
+        try {
+            deviceId = jdbc.queryForObject(
+                    "INSERT INTO devices(user_id, kind, name, token_hash, pc_pubkey, approved, device_uuid) VALUES (?,?,?,?,?,true,?) RETURNING id",
+                    Long.class, userId, kind, name == null ? "" : name,
+                    Util.sha256Hex(token), "pc".equals(kind) ? pubkey : null, uuid);
+        } catch (DataIntegrityViolationException e) {
+            // A concurrent registration won the uuid — answer as its upsert.
+            if (uuid == null) throw e;
+            ResponseEntity<?> reused = tryUpsert(userId, kind, name, pubkey, uuid);
+            if (reused != null) return reused;
+            throw e;
+        }
         return ResponseEntity.status(HttpStatus.CREATED).body(Util.body(
                 "device_id", deviceId,
                 "device_token", token,
                 "approved", true,
                 "note", "device_token is shown once; only its hash is stored"));
+    }
+
+    /**
+     * The uuid upsert branch of register: a ResponseEntity when the uuid
+     * resolved to an existing row (or to a hard refusal), null when the
+     * caller should fall through to a fresh, cap-checked insert.
+     */
+    private ResponseEntity<?> tryUpsert(long userId, String kind, String name,
+                                        String pubkey, String uuid) {
+        DeviceUpsert.Result r;
+        try {
+            r = DeviceUpsert.tryReuse(jdbc, userId, kind, name, pubkey, uuid, "register");
+        } catch (DeviceUpsert.DeviceRevokedException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Util.body(
+                    "error", "device_revoked", "device_id", e.deviceId));
+        }
+        if (r == null) return null;
+        return ResponseEntity.ok(Util.body(
+                "device_id", r.deviceId,
+                "device_token", r.deviceToken,
+                "approved", true,
+                "reused", true,
+                "merged", r.merged,
+                "note", "same device re-registered; previous device_token is invalid"));
     }
 
     @GetMapping

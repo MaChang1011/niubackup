@@ -51,12 +51,16 @@ public class PcLoginController {
         if (deviceName != null && deviceName.length() > 128) {
             deviceName = deviceName.substring(0, 128);
         }
+        // The PC's persistent device identity rides along so approve() can
+        // upsert the same device row instead of minting a new number and
+        // revoking the old one (design §3.2). Absent on old clients.
+        String deviceUuid = DeviceUpsert.cleanUuid(Util.str(req, "device_uuid"));
         String ticketId = Util.newToken();
         String secret = Util.newToken();
         Instant expires = Instant.now().plusSeconds(TICKET_TTL_SECONDS);
-        jdbc.update("INSERT INTO pc_login_tickets(id, secret_hash, device_name, expires_at) VALUES (?,?,?,?)",
+        jdbc.update("INSERT INTO pc_login_tickets(id, secret_hash, device_name, device_uuid, expires_at) VALUES (?,?,?,?,?)",
                 ticketId, Util.sha256Hex(secret), deviceName == null ? "" : deviceName,
-                Timestamp.from(expires));
+                deviceUuid, Timestamp.from(expires));
         return ResponseEntity.status(HttpStatus.CREATED).body(Util.body(
                 "ticket_id", ticketId,
                 "secret", secret,
@@ -156,25 +160,50 @@ public class PcLoginController {
         }
 
         String account = jdbc.queryForObject("SELECT account FROM users WHERE id=?", String.class, userId);
-        Map<String, Object> license = jdbc.queryForMap("SELECT * FROM licenses WHERE user_id=?", userId);
-        int cap = ((Number) license.get("max_pcs")).intValue();
-        Integer count = jdbc.queryForObject(
-                "SELECT count(*) FROM devices WHERE user_id=? AND kind='pc' AND NOT revoked",
-                Integer.class, userId);
-        if (count != null && count >= cap) {
-            int n = jdbc.update("UPDATE devices SET revoked=true WHERE user_id=? AND kind='pc' AND NOT revoked",
-                    userId);
-            jdbc.update("INSERT INTO admin_audit(admin_username, action, target, detail) VALUES (?,?,?,?)",
-                    "system", "pc_slot_reclaim", "user:" + userId,
-                    "qr-login approve revoked " + n + " stale pc device(s) to free the pc slot");
-        }
-
-        String deviceToken = Util.newToken();
         String name = String.valueOf(t.get("device_name"));
         if (name.isBlank()) name = "niubackup-pc";
-        long deviceId = jdbc.queryForObject(
-                "INSERT INTO devices(user_id, kind, name, token_hash, approved) VALUES (?,'pc',?,?,true) RETURNING id",
-                Long.class, userId, name, Util.sha256Hex(deviceToken));
+
+        // Register this PC under the approver's account. With the ticket's
+        // device_uuid it is an upsert (design §3.2): the PC returns to its
+        // own row with a fresh token — no new number, no slot reclaim.
+        // Without one, the pre-uuid behavior applies: reclaim the single
+        // PC slot, then insert a fresh row.
+        String uuid = DeviceUpsert.cleanUuid((String) t.get("device_uuid"));
+        long deviceId;
+        String deviceToken;
+        DeviceUpsert.Result reused = null;
+        if (uuid != null) {
+            try {
+                reused = DeviceUpsert.tryReuse(jdbc, userId, "pc", name, null, uuid, "qr-approve");
+            } catch (DeviceUpsert.DeviceRevokedException e) {
+                // The account holder revoked this very PC; a re-login must
+                // not resurrect it. The ticket is left unapproved and dies
+                // on its own TTL.
+                return ResponseEntity.status(HttpStatus.CONFLICT).body(Util.body(
+                        "error", "device_revoked", "device_id", e.deviceId));
+            }
+        }
+        if (reused != null) {
+            deviceId = reused.deviceId;
+            deviceToken = reused.deviceToken;
+        } else {
+            Map<String, Object> license = jdbc.queryForMap("SELECT * FROM licenses WHERE user_id=?", userId);
+            int cap = ((Number) license.get("max_pcs")).intValue();
+            Integer count = jdbc.queryForObject(
+                    "SELECT count(*) FROM devices WHERE user_id=? AND kind='pc' AND NOT revoked",
+                    Integer.class, userId);
+            if (count != null && count >= cap) {
+                int n = jdbc.update("UPDATE devices SET revoked=true WHERE user_id=? AND kind='pc' AND NOT revoked",
+                        userId);
+                jdbc.update("INSERT INTO admin_audit(admin_username, action, target, detail) VALUES (?,?,?,?)",
+                        "system", "pc_slot_reclaim", "user:" + userId,
+                        "qr-login approve revoked " + n + " stale pc device(s) to free the pc slot");
+            }
+            deviceToken = Util.newToken();
+            deviceId = jdbc.queryForObject(
+                    "INSERT INTO devices(user_id, kind, name, token_hash, approved, device_uuid) VALUES (?,'pc',?,?,true,?) RETURNING id",
+                    Long.class, userId, name, Util.sha256Hex(deviceToken), uuid);
+        }
 
         String refresh = Util.newToken();
         jdbc.update("INSERT INTO auth_tokens(user_id, token_hash, kind, expires_at) VALUES (?,?,?,?)",

@@ -280,18 +280,37 @@ class AccountActivity : Activity() {
                 SecureStore.put(this, SecureStore.KEY_ACCOUNT, account)
                 SessionRestore.clearExpiredHint(this)
 
-                // Register THIS phone once; the token is shown exactly once,
-                // so it goes straight into Keystore-wrapped storage.
-                var deviceId = SecureStore.get(this, SecureStore.KEY_DEVICE_ID)?.toLongOrNull()
+                // Register THIS phone on every login, presenting the
+                // persistent device uuid (design §3.2): the service
+                // upserts, so we land back on the same device row with a
+                // fresh token — the phone's number no longer changes
+                // across logins (pre-uuid it did: #7, then #28). The fresh
+                // token goes straight into Keystore-wrapped storage. If
+                // the call fails (service hiccup) but a stored pair
+                // exists, keep using it rather than failing the login.
+                val devName = (Build.MANUFACTURER + " " + Build.MODEL).trim()
+                val prevId = SecureStore.get(this, SecureStore.KEY_DEVICE_ID)?.toLongOrNull()
+                var deviceId = prevId
                 var deviceToken = SecureStore.get(this, SecureStore.KEY_DEVICE_TOKEN)
-                if (deviceId == null || deviceToken == null) {
-                    val devName = (Build.MANUFACTURER + " " + Build.MODEL).trim()
-                    val (id, tok) = client.registerDevice(session, "phone", devName)
+                try {
+                    val (id, tok) = client.registerDevice(
+                        session, "phone", devName, DeviceIdentity.uuid(this)
+                    )
                     deviceId = id
                     deviceToken = tok
                     SecureStore.put(this, SecureStore.KEY_DEVICE_ID, id.toString())
                     SecureStore.put(this, SecureStore.KEY_DEVICE_TOKEN, tok)
-                    AppLog.log("本机已注册为设备 #$id")
+                    DeviceIdentity.setBound(this, true)
+                    AppLog.log(
+                        when {
+                            prevId == null -> "本机已注册为设备 #$id"
+                            prevId == id -> "本机设备 #$id（稳定身份已绑定，编号不变）"
+                            else -> "本机设备号已归并：#$prevId → #$id（同一台手机只保留一个编号）"
+                        }
+                    )
+                } catch (t: Throwable) {
+                    if (deviceId == null || deviceToken == null) throw t
+                    AppLog.log("设备注册暂失败，沿用已存设备 #$deviceId：${t.message}")
                 }
                 val devId: Long = deviceId
                     ?: throw IllegalStateException("device registration failed")

@@ -124,12 +124,20 @@ class AccountClient(private val baseUrl: String) {
         }
     }
 
-    /** Returns (device_id, device_token); the token is shown exactly once. */
-    fun registerDevice(session: Session, kind: String, name: String): Pair<Long, String> {
-        val r = request(
-            "POST", "/api/devices/register", session.accessToken,
-            JSONObject().put("kind", kind).put("name", name)
-        )
+    /**
+     * Returns (device_id, device_token); a fresh token is minted on every
+     * call. With [deviceUuid] (design §3.2) the registration is an upsert:
+     * the service returns THIS phone's existing device row (same id) and
+     * the new token replaces the stored one; without it a new row is
+     * created. A revoked device answering for the uuid surfaces as an
+     * [HttpStatusException] with serverError "device_revoked".
+     */
+    fun registerDevice(
+        session: Session, kind: String, name: String, deviceUuid: String? = null
+    ): Pair<Long, String> {
+        val body = JSONObject().put("kind", kind).put("name", name)
+        if (deviceUuid != null) body.put("device_uuid", deviceUuid)
+        val r = request("POST", "/api/devices/register", session.accessToken, body)
         return r.getLong("device_id") to r.getString("device_token")
     }
 

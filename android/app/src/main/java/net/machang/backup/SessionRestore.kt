@@ -97,11 +97,13 @@ object SessionRestore {
         if (SecureStore.get(ctx, SecureStore.KEY_ACCESS_TOKEN) != null &&
             System.currentTimeMillis() < expiresAt - 60_000
         ) {
+            healDeviceIdentity(ctx)
             return Outcome.ALIVE
         }
         return try {
             val session = AccountClient(PcConn.serverUrl(ctx)).refresh(refresh)
             storeSession(ctx, session)
+            healDeviceIdentity(ctx)
             Outcome.ALIVE
         } catch (e: HttpStatusException) {
             if (e.code == 401 || e.code == 403) {
@@ -117,6 +119,50 @@ object SessionRestore {
             }
         } catch (t: Throwable) {
             Outcome.UNKNOWN
+        }
+    }
+
+    /**
+     * One-time device-identity heal (design §3.2). The first cold start
+     * after the uuid rollout re-registers this phone WITH its persistent
+     * uuid while a session is alive: the service binds the uuid to the
+     * phone's existing device row and hands back that row's id plus a
+     * fresh token. This is what walks a phone whose stored id drifted
+     * during the pre-uuid era (registered as #28 on a re-login) back to
+     * its data-bearing row (#7) — no password, no new number. Best
+     * effort: any failure keeps the stored pair and retries on a later
+     * cold start; [DeviceIdentity.bound] stops the retry loop after the
+     * first success so the device token is not rotated on every start.
+     */
+    private fun healDeviceIdentity(ctx: Context) {
+        if (DeviceIdentity.isBound(ctx)) return
+        // Only after a real account login (dev/standalone mode has no
+        // server-side device row to bind to).
+        if (SecureStore.get(ctx, SecureStore.KEY_ACCOUNT) == null) return
+        val access = SecureStore.get(ctx, SecureStore.KEY_ACCESS_TOKEN) ?: return
+        val storedRefresh = SecureStore.get(ctx, SecureStore.KEY_REFRESH_TOKEN) ?: return
+        val expiresAt = SecureStore.get(ctx, SecureStore.KEY_ACCESS_EXPIRES_AT)
+            ?.toLongOrNull() ?: 0L
+        try {
+            val devName = (android.os.Build.MANUFACTURER + " " +
+                android.os.Build.MODEL).trim()
+            val (id, tok) = AccountClient(PcConn.serverUrl(ctx)).registerDevice(
+                AccountClient.Session(access, storedRefresh, expiresAt),
+                "phone", devName, DeviceIdentity.uuid(ctx)
+            )
+            val prev = SecureStore.get(ctx, SecureStore.KEY_DEVICE_ID)
+            SecureStore.put(ctx, SecureStore.KEY_DEVICE_ID, id.toString())
+            SecureStore.put(ctx, SecureStore.KEY_DEVICE_TOKEN, tok)
+            DeviceIdentity.setBound(ctx, true)
+            AppLog.log(
+                if (prev != null && prev != id.toString()) {
+                    "设备身份已归并：#$prev → #$id（稳定身份绑定完成）"
+                } else {
+                    "设备稳定身份绑定完成：#$id"
+                }
+            )
+        } catch (t: Throwable) {
+            AppLog.log("设备身份绑定暂失败，下次启动重试：${t.message}")
         }
     }
 }

@@ -2137,6 +2137,36 @@ final class AccountLink {
         return s;
     }
 
+    /**
+     * This PC's persistent device identity (design §3.2): a random UUID
+     * minted once into &lt;dataDir&gt;/device-identity.json (mode 600) and
+     * NEVER deleted afterwards — in particular logoutSession removes only
+     * account.json, so identity and session stay separate. Every device
+     * registration (password login, QR ticket) presents this uuid and the
+     * service upserts onto the same device row: re-login keeps the PC's
+     * device number instead of minting a new one and revoking the old.
+     * The identity dies only with the data dir itself (reinstall / wipe).
+     */
+    static String deviceUuid(Path dataDir) throws IOException {
+        Path f = dataDir.resolve("device-identity.json");
+        if (Files.isRegularFile(f)) {
+            try {
+                String uuid = MiniJson.str(Files.readString(f, StandardCharsets.UTF_8),
+                        "device_uuid");
+                if (uuid != null && !uuid.isBlank()) return uuid.trim();
+            } catch (Exception ignore) { /* regenerate below */ }
+        }
+        String uuid = UUID.randomUUID().toString();
+        Files.createDirectories(dataDir);
+        Files.writeString(f, "{\"device_uuid\":\"" + uuid
+                + "\",\"created_at_ms\":" + System.currentTimeMillis() + "}",
+                StandardCharsets.UTF_8);
+        try {
+            Files.setPosixFilePermissions(f, PosixFilePermissions.fromString("rw-------"));
+        } catch (Exception ignore) { /* non-POSIX fs */ }
+        return uuid;
+    }
+
     // ------------------------------------------------------------- HTTP core
 
     static final class ApiResult {
@@ -2231,6 +2261,9 @@ final class AccountLink {
      * presenting the refresh token kills the stored session (the access
      * half is short-lived and the PC never keeps one). After this returns,
      * this PC holds no account credential material until the next login.
+     * The device identity (device-identity.json) is NOT touched: it is
+     * not a credential, and keeping it is what lets the next login return
+     * to the same server device row.
      */
     static void logoutSession(State st) {
         if (st == null) return;
@@ -2353,15 +2386,19 @@ final class AccountLink {
     // ------------------------------------------------------- QR pc-login
 
     /**
-     * POST /api/pc-login/tickets {device_name} → {ticket_id, secret,
-     * expires_at} (design v1.4 扫码登录）. The ticket is a one-time login
-     * offer: the desktop renders {t, s, srv} as a QR code and the account
-     * holder approves it from the phone. expires_at comes back raw — the
-     * control API normalizes it for the frontend countdown.
+     * POST /api/pc-login/tickets {device_name, device_uuid} → {ticket_id,
+     * secret, expires_at} (design v1.4 扫码登录）. The ticket is a one-time
+     * login offer: the desktop renders {t, s, srv} as a QR code and the
+     * account holder approves it from the phone. The device_uuid rides in
+     * the ticket (never in the QR payload) so the approve upserts this
+     * PC's existing device row. expires_at comes back raw — the control
+     * API normalizes it for the frontend countdown.
      */
-    static String[] createPcLoginTicket(String server, String deviceName) throws Exception {
+    static String[] createPcLoginTicket(String server, String deviceName,
+                                        String deviceUuid) throws Exception {
         ApiResult r = http("POST", normalize(server) + "/api/pc-login/tickets", null,
-                "{\"device_name\":\"" + MiniJson.esc(deviceName) + "\"}");
+                "{\"device_name\":\"" + MiniJson.esc(deviceName)
+                        + "\",\"device_uuid\":\"" + MiniJson.esc(deviceUuid) + "\"}");
         requireOk(r, "pc-login ticket create");
         return new String[]{MiniJson.str(r.body, "ticket_id"),
                 MiniJson.str(r.body, "secret"), MiniJson.str(r.body, "expires_at")};
@@ -2537,7 +2574,8 @@ final class AccountLink {
                 hostname = "niubackup-pc";
             }
             String regBody = "{\"kind\":\"pc\",\"name\":\"" + MiniJson.esc(hostname)
-                    + "\",\"pc_pubkey\":\"" + MiniJson.esc(pubkeyB64) + "\"}";
+                    + "\",\"pc_pubkey\":\"" + MiniJson.esc(pubkeyB64)
+                    + "\",\"device_uuid\":\"" + MiniJson.esc(deviceUuid(dataDir)) + "\"}";
             ApiResult r = http(st, "POST", "/api/devices/register", session, regBody);
             if (r.status == 409 && r.body.contains("device_limit")) {
                 // Reinstall case: a previous registration of this user still
@@ -3322,7 +3360,8 @@ final class ControlApi {
             hostname = "niubackup-pc";
         }
         try {
-            String[] t = AccountLink.createPcLoginTicket(server, hostname);
+            String[] t = AccountLink.createPcLoginTicket(server, hostname,
+                    AccountLink.deviceUuid(r.dataDir));
             if (t[0] == null || t[1] == null) {
                 sendJson(ex, 502, "{\"ok\":false,\"error\":\"ticket response incomplete\"}");
                 return;

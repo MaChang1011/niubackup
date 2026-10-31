@@ -56,6 +56,12 @@ public class SchemaInit implements ApplicationRunner {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now())
         """,
         "CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id)",
+        // Stable device identity (design §3.2): devices carry a persistent
+        // device_uuid, unique per account when present, so re-login upserts
+        // onto the same row instead of minting a new device number.
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_uuid VARCHAR(64)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_uuid " +
+                "ON devices(user_id, device_uuid) WHERE device_uuid IS NOT NULL",
         """
         CREATE TABLE IF NOT EXISTS pc_login_tickets(
             id VARCHAR(64) PRIMARY KEY,
@@ -68,6 +74,9 @@ public class SchemaInit implements ApplicationRunner {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             expires_at TIMESTAMPTZ NOT NULL)
         """,
+        // The PC stamps its persistent device_uuid into the ticket so the
+        // phone's approve upserts the same device row (design §3.2).
+        "ALTER TABLE pc_login_tickets ADD COLUMN IF NOT EXISTS device_uuid VARCHAR(64)",
         """
         CREATE TABLE IF NOT EXISTS networks(
             user_id BIGINT PRIMARY KEY REFERENCES users(id),
