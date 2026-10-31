@@ -212,7 +212,7 @@ public class BackupSender {
                 copyN(fis, out, bytes);
             }
             out.flush();
-            String res = Wire.readLine(in);
+            String res = readVerdict(in);
             if (res != null && res.startsWith("DONE")) {
                 System.out.println("  sent " + e.path + " (" + bytes + " bytes from offset " + offset + ")");
             } else {
@@ -222,11 +222,7 @@ public class BackupSender {
         }
 
         Wire.writeLine(out, "BYE");
-        String receipt = Wire.readLine(in);
-        System.out.println("receipt: " + receipt);
-        if (v2 && receipt != null && receipt.startsWith("RECEIPT ")) {
-            if (!handleSignedReceipt(receipt.substring(8))) failures++;
-        }
+        if (v2 && readReceiptsAfterBye(in)) failures++;
         System.out.println(failures == 0 ? "all files in place" : failures + " file(s) failed");
         return failures == 0 ? 0 : 1;
     }
@@ -237,11 +233,51 @@ public class BackupSender {
         String line;
         while ((line = Wire.readLine(in)) != null) {
             if (line.equals("READY")) break;
+            if (line.startsWith("RECEIPT ")) {
+                // Per-file receipts ride along with the decisions (skip
+                // evidence): verify + store like any signed receipt.
+                try {
+                    handleSignedReceipt(line.substring(8));
+                } catch (Exception e) {
+                    System.out.println("  per-file receipt error: " + e);
+                }
+                continue;
+            }
             String p = MiniJson.str(line, "path");
             long off = MiniJson.num(line, "offset", -1);
             if (p != null && off >= 0) wanted.put(p, off);
         }
         return wanted;
+    }
+
+    /** Per-file verdict read: process interleaved per-file RECEIPT lines
+     *  and return the first DONE/FAIL line. */
+    static String readVerdict(InputStream in) throws Exception {
+        String line;
+        while ((line = Wire.readLine(in)) != null) {
+            if (line.startsWith("RECEIPT ")) {
+                handleSignedReceipt(line.substring(8));
+                continue;
+            }
+            return line;
+        }
+        return null;
+    }
+
+    /** Post-BYE: process every RECEIPT line (trailing per-file receipts,
+     *  then the whole-session receipt) until the receiver closes.
+     *  Returns true when any receipt failed verification. */
+    static boolean readReceiptsAfterBye(InputStream in) throws Exception {
+        boolean invalid = false;
+        String line;
+        while ((line = Wire.readLine(in)) != null) {
+            if (!line.startsWith("RECEIPT ")) {
+                System.out.println("receipt: " + line);
+                break;
+            }
+            if (!handleSignedReceipt(line.substring(8))) invalid = true;
+        }
+        return invalid;
     }
 
     // ------------------------------------------------------- batch mode (v2)
@@ -279,8 +315,9 @@ public class BackupSender {
      * Batch session (v2 + receiver advertised "batch":1): enumerate once,
      * then loop — hash up to the batch limit, send that batch's manifest
      * (BATCH-END), read its decisions, send its files — until the library
-     * is exhausted; BYE closes the session and the receiver answers with
-     * ONE signed receipt over the whole session. A wanted file that cannot
+     * is exhausted; the receiver signs per-file receipts as files verify,
+     * and BYE closes the session with a whole-session signed receipt too.
+     * A wanted file that cannot
      * be opened when its turn comes is reported as FILE-ERROR instead of
      * the FILE header (it may have vanished between scan and send) and
      * counts failed without aborting the session. With streamHash (the
@@ -379,7 +416,7 @@ public class BackupSender {
                     }
                 }
                 out.flush();
-                String res = Wire.readLine(in);
+                String res = readVerdict(in);
                 if (res != null && res.startsWith("DONE")) {
                     String rsha = streamHash ? MiniJson.str(res, "sha256") : null;
                     if (streamHash && (rsha == null || !rsha.equals(clientSha))) {
@@ -408,11 +445,7 @@ public class BackupSender {
         st.finish();
 
         Wire.writeLine(out, "BYE");
-        String receipt = Wire.readLine(in);
-        System.out.println("receipt: " + receipt);
-        if (receipt != null && receipt.startsWith("RECEIPT ")) {
-            if (!handleSignedReceipt(receipt.substring(8))) failures++;
-        }
+        if (readReceiptsAfterBye(in)) failures++;
         System.out.println(failures == 0 ? "all files in place" : failures + " file(s) failed");
         return failures == 0 ? 0 : 1;
     }

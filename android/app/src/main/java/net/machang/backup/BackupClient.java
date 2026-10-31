@@ -20,6 +20,7 @@ import java.security.MessageDigest;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -292,6 +293,7 @@ public class BackupClient {
                 s.setSoTimeout(120_000);
                 InputStream in = s.getInputStream();
                 OutputStream out = new BufferedOutputStream(s.getOutputStream());
+                drainIn = in;
                 Wire.writeLine(out, "HELLO " + device + " " + PROTO);
                 String ok = Wire.readLine(in);
                 if (ok == null || !ok.startsWith("OK")) {
@@ -344,6 +346,7 @@ public class BackupClient {
             s.setSoTimeout(120_000);
             InputStream in = s.getInputStream();
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
+            drainIn = in;
             int routeCost = -1;
             try {
                 routeCost = routeCostSupplier.getAsInt();
@@ -377,11 +380,7 @@ public class BackupClient {
                     Wire.writeLine(out, "MANIFEST-END");
                     readDecisions(in);
                     Wire.writeLine(out, "BYE");
-                    String receipt = Wire.readLine(in);
-                    logger.log("回执: " + receipt);
-                    if (receipt != null && receipt.startsWith("RECEIPT ")) {
-                        handleSignedReceipt(receipt.substring("RECEIPT ".length()));
-                    }
+                    readReceiptsAfterBye(in);
                     logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
                     return 0;
                 }
@@ -431,17 +430,144 @@ public class BackupClient {
         }
     }
 
+    // ---- session line input: buffered lines + opportunistic receipt drain
+    // Session reads after the HELLO_ACK go through nextLine(), which owns
+    // a small byte buffer: the payload copy loops non-blockingly top it up
+    // (drainReceipts) so per-file receipts released by the receiver while
+    // a transfer is in flight are verified + stored immediately instead of
+    // waiting for the next verdict read — a process death mid-transfer
+    // then cannot strand an already-issued receipt in the socket buffer.
+    private final ByteArrayOutputStream linePending = new ByteArrayOutputStream();
+    private final ArrayDeque<String> readyLines = new ArrayDeque<>();
+    private InputStream drainIn; // the running session's socket input
+
+    /** Move every complete line in linePending into readyLines (in order). */
+    private void extractLines() {
+        byte[] all = linePending.toByteArray();
+        int start = 0;
+        for (int i = 0; i < all.length; i++) {
+            if (all[i] == '\n') {
+                int len = i - start;
+                if (len > 0 && all[start + len - 1] == '\r') len--;
+                readyLines.add(new String(all, start, len, StandardCharsets.UTF_8));
+                start = i + 1;
+            }
+        }
+        linePending.reset();
+        if (start < all.length) linePending.write(all, start, all.length - start);
+    }
+
+    /** Next session line (queued lines first), or null at EOF — the same
+     *  contract as Wire.readLine, including a final unterminated line. */
+    private String nextLine(InputStream in) throws IOException {
+        extractLines();
+        if (!readyLines.isEmpty()) return readyLines.poll();
+        byte[] chunk = new byte[8192];
+        int n;
+        while ((n = in.read(chunk)) != -1) {
+            linePending.write(chunk, 0, n);
+            extractLines();
+            if (!readyLines.isEmpty()) return readyLines.poll();
+        }
+        if (linePending.size() > 0) {
+            byte[] rest = linePending.toByteArray();
+            linePending.reset();
+            int len = rest.length;
+            if (len > 0 && rest[len - 1] == '\r') len--;
+            return new String(rest, 0, len, StandardCharsets.UTF_8);
+        }
+        return null;
+    }
+
+    /**
+     * Non-blocking drain used by the payload copy loops: pull whatever
+     * has already arrived into the line buffer and verify + store any
+     * complete RECEIPT lines on the spot. Any other complete line (none
+     * is expected mid-transfer) stays queued for nextLine(), in order.
+     */
+    private void drainReceipts() {
+        InputStream in = drainIn;
+        if (in == null) return;
+        try {
+            byte[] chunk = new byte[8192];
+            int avail;
+            while ((avail = in.available()) > 0) {
+                int n = in.read(chunk, 0, Math.min(avail, chunk.length));
+                if (n <= 0) break;
+                linePending.write(chunk, 0, n);
+            }
+            extractLines();
+            java.util.Iterator<String> it = readyLines.iterator();
+            while (it.hasNext()) {
+                String l = it.next();
+                if (l.startsWith("RECEIPT ")) {
+                    it.remove();
+                    if (v2()) handleSignedReceipt(l.substring("RECEIPT ".length()));
+                }
+            }
+        } catch (IOException ignore) {
+            // Non-fatal: the verdict read after the transfer surfaces any
+            // real connection failure.
+        }
+    }
+
     /** Decision lines up to READY: {path -> resume offset} for the files to send. */
     private Map<String, Long> readDecisions(InputStream in) throws IOException {
         Map<String, Long> wanted = new LinkedHashMap<>();
         String line;
-        while ((line = Wire.readLine(in)) != null) {
+        while ((line = nextLine(in)) != null) {
             if (line.equals("READY")) break;
+            if (line.startsWith("RECEIPT ")) {
+                // Per-file receipts ride along with the decisions (evidence
+                // for skipped / already-complete files): verify + store
+                // them exactly like a session receipt.
+                if (v2()) handleSignedReceipt(line.substring("RECEIPT ".length()));
+                continue;
+            }
             String p = MiniJson.str(line, "path");
             long off = MiniJson.num(line, "offset", -1);
             if (p != null && off >= 0) wanted.put(p, off);
         }
         return wanted;
+    }
+
+    /**
+     * The per-file verdict read (DONE / FAIL): per-file RECEIPT lines may
+     * precede or follow the verdict (a transferred file's receipt, or the
+     * previous stream file's receipt released when its cross-check window
+     * closed) — verify + store each one and keep reading for the verdict.
+     */
+    private String readVerdict(InputStream in) throws IOException {
+        String line;
+        while ((line = nextLine(in)) != null) {
+            if (line.startsWith("RECEIPT ")) {
+                if (v2()) handleSignedReceipt(line.substring("RECEIPT ".length()));
+                continue;
+            }
+            return line;
+        }
+        return null;
+    }
+
+    /**
+     * Post-BYE receipt drain: the receiver may send several RECEIPT lines
+     * here — trailing per-file receipts first, the whole-session receipt
+     * last — before it closes. Each signed one is verified + stored (v2);
+     * any other line is logged and ends the drain. Returns true when at
+     * least one RECEIPT line arrived.
+     */
+    private boolean readReceiptsAfterBye(InputStream in) throws IOException {
+        boolean any = false;
+        String line;
+        while ((line = nextLine(in)) != null) {
+            if (!line.startsWith("RECEIPT ")) {
+                logger.log("回执: " + line);
+                break;
+            }
+            any = true;
+            if (v2()) handleSignedReceipt(line.substring("RECEIPT ".length()));
+        }
+        return any;
     }
 
     /**
@@ -487,7 +613,7 @@ public class BackupClient {
                     copyN(fis, out, bytes, progress, sentBytes, totalBytes, e.path);
                 }
                 out.flush();
-                String res = Wire.readLine(in);
+                String res = readVerdict(in);
                 if (res != null && res.startsWith("DONE")) {
                     okCount++;
                     sinkBacked(e, e.sha);
@@ -502,14 +628,9 @@ public class BackupClient {
             lastBytesSent = sentBytes[0];
 
             Wire.writeLine(out, "BYE");
-            String receipt = Wire.readLine(in);
-            logger.log("回执: " + receipt);
-            if (v2() && receipt != null && receipt.startsWith("RECEIPT ")) {
-                handleSignedReceipt(receipt.substring("RECEIPT ".length()));
-            } else if (v2()) {
-                logger.log("回执未取得：BYE 后未收到签名回执（收到: "
-                        + (receipt == null ? "连接已断开" : receipt)
-                        + "），本轮文件在手机侧无回执凭证");
+            boolean gotReceipt = readReceiptsAfterBye(in);
+            if (v2() && !gotReceipt) {
+                logger.log("回执未取得：BYE 后未收到签名回执，本轮文件在手机侧无回执凭证");
             }
             sinkFlush();
         } catch (IOException e) {
@@ -556,8 +677,10 @@ public class BackupClient {
      * Batch session (v2 + the receiver advertised "batch":1): hash up to
      * the batch limit, offer that batch (BATCH-END), transfer its files,
      * and continue — the first files land while the rest of the library
-     * is still hashing. BYE closes the session; the receiver answers
-     * with ONE signed receipt over the whole session. A wanted file that
+     * is still hashing. The receiver signs a per-file receipt the moment
+     * each file verifies (transferred, skipped, or completed from a
+     * leftover .part), and BYE closes the session with a whole-session
+     * signed receipt as well. A wanted file that
      * cannot be opened when its turn comes is reported as FILE-ERROR
      * instead of the FILE header (it may have vanished between scan and
      * send); it counts failed and the session continues. The progress
@@ -672,7 +795,7 @@ public class BackupClient {
                         }
                     }
                     out.flush();
-                    String res = Wire.readLine(in);
+                    String res = readVerdict(in);
                     if (res != null && res.startsWith("DONE")) {
                         String rsha = streamHash ? MiniJson.str(res, "sha256") : null;
                         if (streamHash && (rsha == null || !rsha.equals(clientSha))) {
@@ -711,17 +834,12 @@ public class BackupClient {
             logScanSummary(rootDir, offered);
 
             Wire.writeLine(out, "BYE");
-            String receipt = Wire.readLine(in);
-            logger.log("回执: " + receipt);
-            if (receipt != null && receipt.startsWith("RECEIPT ")) {
-                handleSignedReceipt(receipt.substring("RECEIPT ".length()));
-            } else {
-                // Without the signed receipt nothing on this phone can vouch
+            boolean gotReceipt = readReceiptsAfterBye(in);
+            if (!gotReceipt) {
+                // Without signed receipts nothing on this phone can vouch
                 // for the session's files (§6.4 stays empty) — say so loudly
                 // in the (now persisted) log so the break is findable later.
-                logger.log("回执未取得：BYE 后未收到签名回执（收到: "
-                        + (receipt == null ? "连接已断开" : receipt)
-                        + "），本轮文件在手机侧无回执凭证");
+                logger.log("回执未取得：BYE 后未收到签名回执，本轮文件在手机侧无回执凭证");
             }
             sinkFlush();
             if (offered == 0) {
@@ -975,9 +1093,12 @@ public class BackupClient {
         }
     }
 
-    /** copyN variant reporting cumulative progress (M4c badges). */
-    static void copyN(InputStream in, OutputStream out, long n, ProgressListener progress,
-                      long[] sentBytes, long totalBytes, String currentPath) throws IOException {
+    /** copyN variant reporting cumulative progress (M4c badges). Instance
+     *  method (not static) so each chunk can drainReceipts(): receipts the
+     *  receiver releases mid-transfer are stored without waiting for the
+     *  verdict read at the end of the file. */
+    void copyN(InputStream in, OutputStream out, long n, ProgressListener progress,
+               long[] sentBytes, long totalBytes, String currentPath) throws IOException {
         byte[] buf = new byte[64 * 1024];
         long left = n;
         while (left > 0) {
@@ -989,6 +1110,7 @@ public class BackupClient {
             if (progress != null) {
                 progress.onProgress(sentBytes[0], totalBytes, currentPath);
             }
+            drainReceipts();
         }
     }
 
@@ -1006,10 +1128,11 @@ public class BackupClient {
         }
     }
 
-    /** Stream-hash: copyN-with-progress that also feeds every sent byte into md. */
-    static void copyNHash(InputStream in, OutputStream out, long n, MessageDigest md,
-                          ProgressListener progress, long[] sentBytes, long totalBytes,
-                          String currentPath) throws IOException {
+    /** Stream-hash: copyN-with-progress that also feeds every sent byte
+     *  into md. Instance method for drainReceipts(), like copyN above. */
+    void copyNHash(InputStream in, OutputStream out, long n, MessageDigest md,
+                   ProgressListener progress, long[] sentBytes, long totalBytes,
+                   String currentPath) throws IOException {
         byte[] buf = new byte[64 * 1024];
         long left = n;
         while (left > 0) {
@@ -1022,6 +1145,7 @@ public class BackupClient {
             if (progress != null) {
                 progress.onProgress(sentBytes[0], totalBytes, currentPath);
             }
+            drainReceipts();
         }
     }
 

@@ -47,8 +47,10 @@ import com.sun.net.httpserver.HttpServer;
  *  - Resume (§5.3): .part offset resume as v1, plus a .part.meta sidecar
  *    (source size+mtime); if the source changed since the partial transfer,
  *    the stale .part is discarded so versions are never spliced.
- *  - Signed completion receipts: after each session the receiver signs a
- *    receipt (user_id, device_id, ts, verified files[] with sha256) with its
+ *  - Signed completion receipts: the receiver signs a receipt (user_id,
+ *    device_id, ts, verified files[] with sha256) with its
+ *    ECDSA key — per file, the moment that file verifies (see
+ *    buildFileReceiptDoc), plus a whole-session receipt after BYE.
  *    ECDSA P-256 keypair (SHA256withECDSA; keys persisted under the data dir)
  *    and returns {receipt, signature, pubkey} inside the RECEIPT message.
  *  - File-service mode (HELLO mode="fs"): LIST / READ (base64 ranged chunk,
@@ -868,6 +870,11 @@ public class BackupReceiver {
         // is still open (the client may answer HASH-MISMATCH as the first
         // line of the next round instead of inside the transfer loop).
         Entry pendingMismatch = null;
+        // Per-file receipts: the same stream entry's signed receipt is held
+        // back while its cross-check window is open (a HASH-MISMATCH would
+        // delete the copy, and no receipt may vouch for a deleted file) and
+        // flushed the moment the window closes without a matching verdict.
+        Entry pendingReceipt = null;
         while (true) {
             // ---- read one manifest round ----
             List<Entry> round = new ArrayList<>();
@@ -877,21 +884,32 @@ public class BackupReceiver {
             while ((line = Wire.readLine(in)) != null) {
                 boolean first = firstLine;
                 firstLine = false;
+                if (first && pendingMismatch != null) {
+                    boolean mismatchHit = false;
+                    if (line.startsWith("HASH-MISMATCH ")) {
+                        String fpath = MiniJson.str(line.substring("HASH-MISMATCH ".length()), "path");
+                        if (fpath != null && fpath.equals(pendingMismatch.path)) {
+                            applyHashMismatch(auth, pendingMismatch, ok, failed);
+                            mismatchHit = true;
+                        } else {
+                            log("ignoring HASH-MISMATCH for unexpected path: " + line);
+                        }
+                    }
+                    if (mismatchHit) {
+                        pendingMismatch = null;
+                        pendingReceipt = null; // rejected file: its receipt dies with the copy
+                        continue;
+                    }
+                    // Any other first line closes the window cleanly: the
+                    // stream file stands, so its per-file receipt goes out.
+                    flushFileReceipt(out, auth, pendingReceipt);
+                    pendingReceipt = null;
+                    pendingMismatch = null;
+                }
                 if (line.equals("BATCH-END") || line.equals("MANIFEST-END") || line.equals("BYE")) {
                     terminator = line;
                     break;
                 }
-                if (first && pendingMismatch != null && line.startsWith("HASH-MISMATCH ")) {
-                    String fpath = MiniJson.str(line.substring("HASH-MISMATCH ".length()), "path");
-                    if (fpath != null && fpath.equals(pendingMismatch.path)) {
-                        applyHashMismatch(auth, pendingMismatch, ok, failed);
-                    } else {
-                        log("ignoring HASH-MISMATCH for unexpected path: " + line);
-                    }
-                    pendingMismatch = null;
-                    continue;
-                }
-                if (first) pendingMismatch = null; // any other first line closes the window
                 Entry e = new Entry();
                 e.path = MiniJson.str(line, "path");
                 e.size = MiniJson.num(line, "size", -1);
@@ -905,12 +923,20 @@ public class BackupReceiver {
             RoundResult rr = runManifestRound(in, out, deviceDir, auth, round, batchRound,
                     ok, skipped, failed);
             pendingMismatch = rr.pendingMismatch;
+            pendingReceipt = rr.pendingReceipt;
             sessionBytes += rr.bytes;
             allEntries.addAll(round);
             if (terminator == null || "MANIFEST-END".equals(terminator) || rr.senderGone) break;
             // BATCH-END: the sender either starts another round or sends BYE.
         }
 
+        // The last stream file's cross-check window may still be open here
+        // (session ended by BYE/EOF/vanish without a further line): the
+        // client never reported a mismatch, so the file stands and its
+        // per-file receipt precedes the session receipt.
+        flushFileReceipt(out, auth, pendingReceipt);
+        pendingReceipt = null;
+        pendingMismatch = null;
         if (!byeConsumed) Wire.readLine(in); // BYE (best effort)
         String receipt = receiptJson(ok, skipped, failed);
         if (auth != null) {
@@ -937,6 +963,10 @@ public class BackupReceiver {
          *  HASH-MISMATCH window is still open at round end (the verdict may
          *  arrive as the first line of the next round / before BYE). */
         Entry pendingMismatch;
+        /** The same entry's per-file receipt, held back while its
+         *  cross-check window is open and flushed by the session loop (or
+         *  dropped when the verdict is HASH-MISMATCH). */
+        Entry pendingReceipt;
     }
 
     /**
@@ -981,13 +1011,20 @@ public class BackupReceiver {
                             ? (row.size == e.size && row.mtime == e.mtime)
                             : (row.size == e.size && row.sha256.equals(e.sha)))) {
                     skipped.add(e.path);
+                    // Per-file receipt for the skip: the record already
+                    // vouches for this exact content, so the phone gets its
+                    // deletion-gate evidence even if the session dies later.
+                    sendFileReceipt(out, auth, e.path, e.size, row.sha256);
                     continue;
                 }
             }
             if (!e.stream && Files.isRegularFile(dest) && Files.size(dest) == e.size
                     && Hash.sha256(dest).equals(e.sha)) {
                 skipped.add(e.path);
-                if (auth != null) recordVerified(auth, e, dest);
+                if (auth != null) {
+                    recordVerified(auth, e, dest);
+                    sendFileReceipt(out, auth, e.path, e.size, e.sha);
+                }
                 continue;
             }
             long offset = 0;
@@ -1008,7 +1045,10 @@ public class BackupReceiver {
                         e.sha = Hash.sha256(e.part);
                         promote(e);
                         ok.add(e.path);
-                        if (auth != null) recordVerified(auth, e, dest);
+                        if (auth != null) {
+                            recordVerified(auth, e, dest);
+                            sendFileReceipt(out, auth, e.path, e.size, e.sha);
+                        }
                         log("completed from leftover .part (stream-hash, receiver-hashed): "
                                 + e.path);
                         continue;
@@ -1016,7 +1056,10 @@ public class BackupReceiver {
                     if (Hash.sha256(e.part).equals(e.sha)) {
                         promote(e);
                         ok.add(e.path);
-                        if (auth != null) recordVerified(auth, e, dest);
+                        if (auth != null) {
+                            recordVerified(auth, e, dest);
+                            sendFileReceipt(out, auth, e.path, e.size, e.sha);
+                        }
                         log("completed from leftover .part: " + e.path);
                         continue;
                     }
@@ -1039,6 +1082,7 @@ public class BackupReceiver {
 
         // ---- transfer, stop-and-wait per file ----
         Entry lastStreamDone = null; // stream entry whose cross-check window is open
+        Entry pendingReceipt = null; // that entry's per-file receipt, held for the window
         for (int i = 0; i < toSend.size(); i++) {
             String hdr = Wire.readLine(in);
             if (hdr == null) {
@@ -1055,8 +1099,11 @@ public class BackupReceiver {
                 String fpath = MiniJson.str(fjson, "path");
                 if (fpath != null && fpath.equals(lastStreamDone.path)) {
                     applyHashMismatch(auth, lastStreamDone, ok, failed);
+                    pendingReceipt = null; // rejected: no receipt for a deleted copy
                 } else {
                     log("ignoring HASH-MISMATCH for unexpected path: " + hdr);
+                    flushFileReceipt(out, auth, pendingReceipt); // window closed cleanly
+                    pendingReceipt = null;
                 }
                 lastStreamDone = null;
                 hdr = Wire.readLine(in);
@@ -1066,8 +1113,13 @@ public class BackupReceiver {
                     rr.senderGone = true;
                     break;
                 }
+            } else if (lastStreamDone != null) {
+                // Any other line closes the cross-check window: the stream
+                // file stands, so its held per-file receipt goes out now.
+                flushFileReceipt(out, auth, pendingReceipt);
+                pendingReceipt = null;
+                lastStreamDone = null;
             }
-            lastStreamDone = null; // any other line closes the window
             if (batchRound && hdr.startsWith("FILE-ERROR ")) {
                 // The sender cannot open this file (deleted/unreadable since
                 // the scan). No bytes follow and no reply is expected — the
@@ -1128,12 +1180,19 @@ public class BackupReceiver {
                 log("received " + e.path + " (" + e.size + " bytes, resumed at " + e.offset
                         + ", stream-hash sha256=" + assembled + ")");
                 lastStreamDone = e;
+                // The per-file receipt is HELD until the cross-check window
+                // closes: a HASH-MISMATCH verdict deletes this copy, and no
+                // receipt may vouch for a deleted file.
+                pendingReceipt = e;
             } else if (Hash.sha256(e.part).equals(e.sha)) {
                 promote(e);
                 Files.deleteIfExists(e.meta);
                 ok.add(e.path);
                 if (auth != null) recordVerified(auth, e, e.dest);
                 Wire.writeLine(out, "DONE {\"path\":\"" + MiniJson.esc(e.path) + "\"}");
+                // Receiver-side verification against the manifest hash is
+                // final (no client cross-check in hashed mode): sign now.
+                sendFileReceipt(out, auth, e.path, e.size, e.sha);
                 log("received " + e.path + " (" + e.size + " bytes, resumed at " + e.offset + ")");
             } else {
                 Files.deleteIfExists(e.part);
@@ -1145,6 +1204,7 @@ public class BackupReceiver {
             }
         }
         rr.pendingMismatch = lastStreamDone;
+        rr.pendingReceipt = pendingReceipt;
         return rr;
     }
 
@@ -1210,6 +1270,49 @@ public class BackupReceiver {
              .append(",\"sha256\":\"").append(e.sha).append("\"}");
         }
         return b.append("]}").toString();
+    }
+
+    /**
+     * Per-file receipts (2026-10-31, replacing session-only issuance as the
+     * primary evidence): the same signed document shape as the session
+     * receipt, narrowed to ONE file, emitted the moment that file's backup
+     * is beyond dispute — a transfer whose hash verified (DONE), a skip
+     * whose files-table record matched, or a leftover .part this receiver
+     * just verified. A session that dies mid-way therefore still leaves
+     * phone-side proof for every file it completed, which is what the
+     * §6.4 free-up-space gate consumes; the BYE session receipt is still
+     * sent as well (whole-session summary, older clients' semantics).
+     * Stream-hash transfers are the one exception: their receipt is held
+     * until the client's HASH-MISMATCH cross-check window closes, because
+     * a mismatch deletes the stored copy.
+     */
+    String buildFileReceiptDoc(Auth auth, String path, long size, String sha256) {
+        return "{\"user_id\":\"" + MiniJson.esc(auth.userId)
+                + "\",\"device_id\":\"" + MiniJson.esc(auth.deviceId)
+                + "\",\"ts\":" + System.currentTimeMillis()
+                + ",\"files\":[{\"path\":\"" + MiniJson.esc(path)
+                + "\",\"size\":" + size
+                + ",\"sha256\":\"" + sha256 + "\"}]}";
+    }
+
+    /** Emit one per-file signed RECEIPT line. No-op for v1 (auth == null). */
+    void sendFileReceipt(OutputStream out, Auth auth, String path, long size, String sha256) {
+        if (auth == null || path == null || sha256 == null) return;
+        try {
+            String doc = buildFileReceiptDoc(auth, path, size, sha256);
+            Wire.writeLine(out, "RECEIPT {\"signed\":{\"receipt\":\"" + MiniJson.esc(doc)
+                    + "\",\"signature\":\"" + sign(doc)
+                    + "\",\"pubkey\":\"" + pubkeyB64() + "\"}}");
+        } catch (Exception ex) {
+            // Evidence, not payload: never let a receipt failure break the
+            // transfer; the session receipt can still cover this file.
+            log("per-file receipt send failed for " + path + ": " + ex);
+        }
+    }
+
+    /** Flush a held per-file receipt (null-safe; used when a window closes). */
+    void flushFileReceipt(OutputStream out, Auth auth, Entry e) {
+        if (e != null) sendFileReceipt(out, auth, e.path, e.size, e.sha);
     }
 
     /** True = meta matches manifest, False = stale, null = no meta (v1 leftovers). */
