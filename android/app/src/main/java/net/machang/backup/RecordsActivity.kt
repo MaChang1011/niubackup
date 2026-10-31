@@ -133,7 +133,23 @@ class RecordsActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         )
-        col.addView(card)
+        // Layout contract: the card takes the column's REMAINING height
+        // (weight), exactly like the library page's grid wrap. With
+        // cardBlock's default wrap-content params the inner ListView
+        // (0dp + weight) claims the column's full height for itself and
+        // the pager below is laid out past the bottom edge — present in
+        // the hierarchy but never on screen (field report 2026-10-31:
+        // "记录页面看不到下一页"). Margins replicate cardBlock's.
+        col.addView(
+            card,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            ).apply {
+                leftMargin = Ui.dp(this@RecordsActivity, 16)
+                rightMargin = Ui.dp(this@RecordsActivity, 16)
+                topMargin = Ui.dp(this@RecordsActivity, Ui.PAGE_TOP)
+            }
+        )
 
         // ---- pager (design v1.3: 上一页 / 页码 / 下一页 under the card)
         val pager = LinearLayout(this).apply {
