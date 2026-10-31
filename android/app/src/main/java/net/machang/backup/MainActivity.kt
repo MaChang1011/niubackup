@@ -111,6 +111,13 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    /** Tab switches are instant in both directions (see [Ui.navBar]). */
+    override fun finish() {
+        super.finish()
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_VPN) {
@@ -392,7 +399,7 @@ class MainActivity : Activity() {
     }
 
     private fun buildUi() {
-        val page = Ui.page(this, Ui.Page.HOME)
+        val page = Ui.page(this, Ui.Page.HOME, "备份")
         val scroll = ScrollView(this)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(col)
@@ -401,7 +408,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
         meshPill = Ui.pill(this, "组网未连接", Ui.StatusKind.PC)
-        col.addView(Ui.header(this, "备份", right = meshPill))
+        page.headerRight.addView(meshPill)
 
         // ---- 账户与配对 card (kv rows + mesh control)
         col.addView(Ui.cardBlock(this) {

@@ -73,6 +73,7 @@ class LibraryActivity : Activity() {
     }
 
     private val main = Handler(Looper.getMainLooper())
+    private lateinit var appBar: View
     private lateinit var statusView: TextView
     private lateinit var countView: TextView
     private lateinit var chipsRow: LinearLayout
@@ -100,8 +101,9 @@ class LibraryActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val page = Ui.page(this, Ui.Page.LIBRARY)
+        val page = Ui.page(this, Ui.Page.LIBRARY, "文件库")
         val col = page.content
+        appBar = page.headerBar
 
         // ---- selection-mode bar (replaces the header in place, mockup)
         selBar = LinearLayout(this).apply {
@@ -140,9 +142,9 @@ class LibraryActivity : Activity() {
             })
         }
         col.addView(selBar)
-        col.addView(Ui.header(this, "文件库", right = Ui.xsButton(this, "刷新").apply {
+        page.headerRight.addView(Ui.xsButton(this, "刷新").apply {
             setOnClickListener { refresh() }
-        }))
+        })
 
         // ---- filter chips + count
         val chipsOuter = LinearLayout(this).apply {
@@ -248,6 +250,13 @@ class LibraryActivity : Activity() {
     override fun onDestroy() {
         poller?.let { main.removeCallbacks(it) }
         super.onDestroy()
+    }
+
+    /** Tab switches are instant in both directions (see [Ui.navBar]). */
+    override fun finish() {
+        super.finish()
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
     }
 
     // -------------------------------------------------------------- filters
@@ -384,6 +393,10 @@ class LibraryActivity : Activity() {
     private fun updateSelectionUi() {
         val selecting = selected.isNotEmpty()
         selBar.visibility = if (selecting) View.VISIBLE else View.GONE
+        // Selection mode takes over the fixed app bar's place (mockup).
+        if (::appBar.isInitialized) {
+            appBar.visibility = if (selecting) View.GONE else View.VISIBLE
+        }
         safetyCard.visibility = if (selecting) View.VISIBLE else View.GONE
         if (!selecting) return
         val chosen = items.filter { it.path in selected }

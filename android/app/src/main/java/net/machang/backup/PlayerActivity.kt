@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -11,6 +12,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -91,6 +93,24 @@ class PlayerActivity : Activity() {
         ))
         top.addView(Ui.badge(this, "已备份", Ui.StatusKind.OK))
         root.addView(top)
+
+        // Edge-to-edge placement (inset-aware, chosen over transient
+        // immersive flags so the transport chrome stays put): the dark
+        // stage still bleeds behind the system bars, but the top bar
+        // clears the status bar and the bottom actions clear the
+        // gesture bar. API 30+; below that the framework fits the
+        // window and the base paddings apply.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                top.setPadding(
+                    Ui.dp(this, 14), Ui.dp(this, 10) + bars.top,
+                    Ui.dp(this, 14), Ui.dp(this, 10)
+                )
+                root.setPadding(0, 0, 0, bars.bottom)
+                insets
+            }
+        }
 
         // ---- 16:9 stage (PlayerView, custom transport below)
         val playerView = PlayerView(this).apply {

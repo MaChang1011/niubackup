@@ -137,3 +137,61 @@ session; password only after explicit logout or server-side invalidation).
 - Engine/protocol/session classes untouched (BackupClient, FsClient,
   FsDataSource, PcConn, AccountClient, SessionRestore, SecureStore,
   BackupVpnService, AutoBackupWorker).
+
+## Addendum (2026-10-31) — four-defect fix round (header / tab transitions / secure-mode config / insets)
+
+1. **Fixed app bar** (user: "手机app的头部不在"): `Ui.page` now builds a
+   FIXED app bar above the page content — brand tile + 牛备 wordmark +
+   page title + a right slot for the page's status element （备份 mesh
+   pill, 记录 connection pill, 文件库 刷新 action, 我的 none). Before,
+   each page's title row was the first child of its scrolling column
+   (Main/Account) or a plain in-flow row, so no persistent branded
+   header existed. 文件库 selection mode hides the app bar while its
+   selection bar is up (mockup behavior kept). The old `Ui.header`
+   helper is removed; the four pages were its only callers.
+2. **Instant tab switches** (user: "切换页面是滑动效果，太难看了"):
+   bottom-nav hops add FLAG_ACTIVITY_NO_ANIMATION and call
+   overridePendingTransition(0, 0); all four tab activities override
+   finish() with the same zero transition (back-press path); the photo
+   preview's 记录 action (into RecordsActivity) hops the same way.
+   singleTop + REORDER_TO_FRONT semantics unchanged.
+3. **Secure-mode config spelling** (the user's "异常" screenshot):
+   buildProductConfig emitted `[flags] secure_mode = true` — accepted
+   by the PC's easytier-core 2.6.4 sidecar, but the bundled 2.7.0 JNI
+   core rejects it at TOML parse ("unknown field `secure_mode`"), so
+   the mesh instance never started. In 2.7.0 secure mode is a top-level
+   `[secure_mode]` section, `enabled = true` (source tree ~/src/EasyTier:
+   easytier-core/src/config/toml.rs `Config.secure_mode:
+   Option<SecureModeConfig>`; easytier-proto/proto/common.proto
+   `SecureModeConfig { enabled, local_private_key, local_public_key }`).
+   normalize_secure_mode_config generates the node X25519 keypair when
+   none is configured, and with network_secret set the node stays in
+   shared-secret mode (not credential mode) — the same secure mode the
+   2.6.4 sidecar runs (the live receiver's serve log shows no
+   secure-mode fallback), so phone ↔ PC interop is unchanged.
+   Validated headlessly on the laptop with a temporary integration
+   test (since removed) feeding both spellings to the real loader —
+   TomlConfigLoader::new_from_str, the entry the FFI parseConfig uses
+   (easytier-contrib/easytier-ffi/src/instance_api.rs): the old
+   spelling is rejected with the field named; the new spelling parses
+   with secure mode enabled and the keypair generated (2 passed).
+   Two environment notes for host builds in that tree: its
+   .cargo/config.toml pins -fuse-ld=mold but mold is not installed
+   (override RUSTFLAGS=-C link-arg=-fuse-ld=bfd) and build scripts
+   need PROTOC=~/tools/bin/protoc.
+4. **Log cap**: core/engine errors go through the new
+   AppLog.logEngineError — full text to logcat, first 6 lines +
+   truncation marker in the app UI. Used by both BackupVpnService
+   engine-error paths (startInstance, setTunFd); AppLog.log unchanged.
+5. **Edge-to-edge insets** (user screenshot: 上次备份 card under the
+   clock): targetSdk 35 draws behind the system bars. Tab scaffold
+   (API 30+): setDecorFitsSystemWindows(false), app bar padded by the
+   status-bar inset (the BRAND_800 band extends through the status
+   area, white status icons), nav bar padded by the navigation-bar
+   inset. Player/photo preview keep their bleeding dark backgrounds
+   but their chrome is inset-aware (chosen over transient immersive
+   flags): player top bar + root bottom; preview top bar (replacing a
+   hardcoded 36dp guess) + bottom action bar.
+- Verified: ./gradlew assembleDebug BUILD SUCCESSFUL on the laptop;
+  app-debug.apk 21,805,901 bytes; the new TOML string is present in
+  the packaged dex. NOT installed this round.

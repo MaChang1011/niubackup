@@ -15,6 +15,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -164,15 +165,38 @@ object Ui {
 
     // ------------------------------------------------------------ scaffold
 
-    class PageRoot(val root: LinearLayout, val content: LinearLayout)
+    class PageRoot(
+        val root: LinearLayout,
+        val headerBar: View,
+        val headerRight: LinearLayout,
+        val content: LinearLayout
+    )
 
-    /** Page root: [PageRoot.content] fills the space above the bottom nav bar. */
-    fun page(act: Activity, current: Page): PageRoot {
-        statusBar(act, BRAND_800)
+    /**
+     * Page scaffold: a FIXED app bar (see [appBar]) above
+     * [PageRoot.content], the bottom nav bar below it. The app bar is part
+     * of the scaffold, never of the scrolling body, so it cannot scroll
+     * away (MainActivity/AccountActivity bodies scroll under it).
+     *
+     * Edge-to-edge (targetSdk 35 draws behind the system bars): on API 30+
+     * the scaffold opts out of decor-fitting and pads the app bar by the
+     * status-bar inset — the BRAND_800 band extends through the status
+     * area with white icons, so the header looks intentional — and pads
+     * the nav bar by the navigation-bar inset so it clears the gesture
+     * bar. Below API 30 the framework still fits the window itself and
+     * the BRAND_800 status bar color carries the same look.
+     */
+    fun page(act: Activity, current: Page, title: String): PageRoot {
+        statusBar(act, BRAND_800, lightIcons = true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            act.window.setDecorFitsSystemWindows(false)
+        }
         val root = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(SCREEN_BG)
         }
+        val (bar, right) = appBar(act, title)
+        root.addView(bar)
         val content = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         root.addView(
             content,
@@ -180,9 +204,61 @@ object Ui {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
             )
         )
-        root.addView(navBar(act, current))
+        val nav = navBar(act, current)
+        root.addView(nav)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                bar.setPadding(
+                    dp(act, 16), dp(act, 8) + bars.top,
+                    dp(act, 16), dp(act, 10)
+                )
+                nav.setPadding(0, 0, 0, bars.bottom)
+                insets
+            }
+        }
         act.setContentView(root)
-        return PageRoot(root, content)
+        return PageRoot(root, bar, right, content)
+    }
+
+    /**
+     * The fixed app bar (approved mockup header): brand tile + 牛备
+     * wordmark on the left, the page title next to it, and an empty right
+     * slot ([PageRoot.headerRight]) for the page's status pill / action.
+     * BRAND_800 so it flows seamlessly from the same-colored status area.
+     */
+    fun appBar(act: Activity, title: String): Pair<LinearLayout, LinearLayout> {
+        val bar = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(BRAND_800)
+            setPadding(dp(act, 16), dp(act, 8), dp(act, 16), dp(act, 10))
+            elevation = dp(act, 2).toFloat()
+        }
+        bar.addView(brandTile(act, 28))
+        bar.addView(TextView(act).apply {
+            text = "牛备"
+            textSize = 16f
+            typeface = font(900)
+            setTextColor(Color.WHITE)
+            setPadding(dp(act, 8), 0, 0, 0)
+        })
+        bar.addView(
+            TextView(act).apply {
+                text = title
+                textSize = 15f
+                typeface = font(600)
+                setTextColor(BRAND_100)
+                setPadding(dp(act, 10), 0, 0, 0)
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val right = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        bar.addView(right)
+        return bar to right
     }
 
     fun navBar(act: Activity, current: Page): View {
@@ -207,10 +283,18 @@ object Ui {
                 isClickable = true
                 if (!selected) {
                     setOnClickListener {
+                        // Tab hops are instant: no slide/fade in either
+                        // direction (FLAG_ACTIVITY_NO_ANIMATION +
+                        // overridePendingTransition on the caller; the
+                        // matching finish() overrides live in the four
+                        // tab activities for the back-press path).
                         act.startActivity(
                             Intent(act, page.activity)
                                 .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                                .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
                         )
+                        @Suppress("DEPRECATION")
+                        act.overridePendingTransition(0, 0)
                     }
                 }
             }
@@ -244,43 +328,6 @@ object Ui {
     }
 
     // -------------------------------------------------------------- pieces
-
-    /**
-     * Page header: title 19/900 left, optional right-side view (status pill),
-     * optional subtitle under the title.
-     */
-    fun header(
-        act: Activity, title: String, subtitle: String? = null, right: View? = null
-    ): LinearLayout {
-        val col = LinearLayout(act).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(act, 16), dp(act, 14), dp(act, 16), dp(act, 2))
-        }
-        val row = LinearLayout(act).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        row.addView(
-            TextView(act).apply {
-                text = title
-                textSize = 19f
-                setTextColor(INK)
-                typeface = font(900)
-            },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        )
-        if (right != null) row.addView(right)
-        col.addView(row)
-        if (subtitle != null) {
-            col.addView(TextView(act).apply {
-                text = subtitle
-                textSize = 12f
-                setTextColor(SLATE)
-                setPadding(0, dp(act, 3), 0, 0)
-            })
-        }
-        return col
-    }
 
     /**
      * A white card (radius 16, mockup shadow, 14dp inner padding) with 16dp

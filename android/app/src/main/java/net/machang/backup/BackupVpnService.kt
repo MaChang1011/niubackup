@@ -126,7 +126,9 @@ class BackupVpnService : VpnService() {
         // SecurityException.
         val err = EasyTierBridge.startInstance(config)
         if (err.isNotEmpty()) {
-            AppLog.log(err)
+            // Core errors can be multi-hundred-line dumps (TOML parse
+            // reports): UI shows the capped form, logcat keeps it all.
+            AppLog.logEngineError(err)
             running = false
             demoteAndStop()
             return
@@ -159,7 +161,7 @@ class BackupVpnService : VpnService() {
         promoteToForeground()
         val fdErr = EasyTierBridge.setTunFd(instanceName, pfd.fd)
         if (fdErr.isNotEmpty()) {
-            AppLog.log(fdErr)
+            AppLog.logEngineError(fdErr)
         } else {
             AppLog.log("TUN fd 已交给 EasyTier (fd=${pfd.fd})，组网通道建立")
         }

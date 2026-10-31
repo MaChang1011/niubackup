@@ -78,6 +78,13 @@ class AccountActivity : Activity() {
         super.onPause()
     }
 
+    /** Tab switches are instant in both directions (see [Ui.navBar]). */
+    override fun finish() {
+        super.finish()
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
+    }
+
     private fun persistSettings() {
         if (!::serverInput.isInitialized) return
         prefs().edit()
@@ -282,7 +289,7 @@ class AccountActivity : Activity() {
     // ------------------------------------------------------------------ UI
 
     private fun buildUi() {
-        val page = Ui.page(this, Ui.Page.ACCOUNT)
+        val page = Ui.page(this, Ui.Page.ACCOUNT, "我的")
         val scroll = android.widget.ScrollView(this)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(col)
@@ -292,8 +299,6 @@ class AccountActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         )
-        col.addView(Ui.header(this, "我的"))
-
         // ---- profile card (mockup): avatar + account + pills
         col.addView(Ui.cardBlock(this) {
             val row = LinearLayout(this@AccountActivity).apply {

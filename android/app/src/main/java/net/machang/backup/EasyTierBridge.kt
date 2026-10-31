@@ -133,8 +133,25 @@ object EasyTierBridge {
      * M4c product config (design §8): the per-user network issued by the
      * account service (nb-*), joined through the shared product public node.
      * Same proven TOML schema as [buildConfig], plus secure mode — mesh
-     * traffic is encrypted and node-authenticated end to end; verified to
-     * interoperate with easytier-core 2.6.4 in the M4c headless E2E.
+     * traffic is encrypted and node-authenticated end to end.
+     *
+     * Secure-mode SPELLING (fixed 2026-10-31 — the [flags] form below was
+     * the "启动组网" failure in the user's screenshot): on the bundled
+     * 2.7.0 core, `secure_mode` is NOT a flags field. The 2.6.4 PC sidecar
+     * accepts `[flags] secure_mode = true`, but 2.7.0 moved secure mode
+     * into a top-level `[secure_mode]` section (source tree ~/src/EasyTier:
+     * easytier-core/src/config/toml.rs — `Config.secure_mode:
+     * Option<SecureModeConfig>`, normalized at load with the context
+     * "failed to normalize [secure_mode] config"; easytier-proto/proto/
+     * common.proto — `SecureModeConfig { enabled, local_private_key,
+     * local_public_key }`, keys base64 X25519). The flags spelling is a
+     * hard parse error there ("unknown field `secure_mode`"), so the
+     * instance never started. `enabled = true` alone is complete: config
+     * normalization (normalize_secure_mode_config, easytier-core/src/
+     * config/mod.rs) generates this node's X25519 keypair when none is
+     * given, and with network_secret set above the node stays in
+     * shared-secret mode (not credential mode) — the same secure mode
+     * the 2.6.4 sidecar runs, so phone ↔ PC interop is unchanged.
      */
     fun buildProductConfig(
         networkName: String,
@@ -156,8 +173,8 @@ object EasyTierBridge {
             [[peer]]
             uri = "${esc(publicNodeUri)}"
 
-            [flags]
-            secure_mode = true
+            [secure_mode]
+            enabled = true
         """.trimIndent()
     }
 }

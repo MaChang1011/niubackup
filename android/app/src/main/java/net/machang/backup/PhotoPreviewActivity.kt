@@ -10,6 +10,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.PointF
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
@@ -20,6 +21,7 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -157,7 +159,7 @@ class PhotoPreviewActivity : Activity() {
                 )
             )
             setPadding(
-                Ui.dp(this@PhotoPreviewActivity, 14), Ui.dp(this@PhotoPreviewActivity, 36),
+                Ui.dp(this@PhotoPreviewActivity, 14), Ui.dp(this@PhotoPreviewActivity, 12),
                 Ui.dp(this@PhotoPreviewActivity, 14), Ui.dp(this@PhotoPreviewActivity, 18)
             )
         }
@@ -242,15 +244,40 @@ class PhotoPreviewActivity : Activity() {
         actionsBar.addView(actionCell("↓", "下载回来", Ui.VIEW_TEXT) { onDownloadBack() })
         actionsBar.addView(actionCell("✕", "释放空间", Color.rgb(0xF5, 0xA5, 0x4B)) { onFreeUpSpace() })
         actionsBar.addView(actionCell("☰", "记录", Ui.VIEW_TEXT) {
+            // Into a tab page: same instant, animation-free hop as the
+            // bottom nav (see Ui.navBar).
             startActivity(
                 Intent(this, RecordsActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                    .addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
             )
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
         })
         root.addView(actionsBar, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM
         ))
+
+        // Edge-to-edge placement (inset-aware, chosen over transient
+        // immersive flags so the chrome stays put): the photo and the
+        // top scrim still bleed behind the system bars, but the top
+        // bar's controls sit below the status bar and the action bar
+        // clears the gesture bar. API 30+; below that the framework
+        // fits the window and the base paddings apply.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                topBar.setPadding(
+                    Ui.dp(this, 14), Ui.dp(this, 12) + bars.top,
+                    Ui.dp(this, 14), Ui.dp(this, 18)
+                )
+                actionsBar.setPadding(
+                    0, Ui.dp(this, 10), 0, Ui.dp(this, 16) + bars.bottom
+                )
+                insets
+            }
+        }
     }
 
     private fun circleGlyph(glyph: String, onClick: () -> Unit): TextView =

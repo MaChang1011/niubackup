@@ -61,10 +61,10 @@ class RecordsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val page = Ui.page(this, Ui.Page.RECORDS)
+        val page = Ui.page(this, Ui.Page.RECORDS, "备份记录")
         val col = page.content
         connPill = Ui.pill(this, "连接中…", Ui.StatusKind.NONE)
-        col.addView(Ui.header(this, "备份记录", right = connPill))
+        page.headerRight.addView(connPill)
 
         // Freshness strip (brand-50 card, always visible on this page).
         val strip = LinearLayout(this).apply {
@@ -126,6 +126,13 @@ class RecordsActivity : Activity() {
     override fun onPause() {
         wasPaused = true
         super.onPause()
+    }
+
+    /** Tab switches are instant in both directions (see [Ui.navBar]). */
+    override fun finish() {
+        super.finish()
+        @Suppress("DEPRECATION")
+        overridePendingTransition(0, 0)
     }
 
     private fun loadRecords() {
