@@ -20,28 +20,43 @@
   </div>
 </div>
 
-<!-- ============ login (design: compact centered card) ============ -->
+<!-- ============ login (design v1.4: QR-first tabbed card) ============ -->
 <div id="loginView" class="login-wrap" hidden>
-  <form id="loginCard" class="login-card" autocomplete="off">
+  <div class="login-card">
     <div class="mark mark-md" aria-hidden="true"></div>
     <h1>登录牛备</h1>
-    <p class="login-sub">备份数据只存在你自己的电脑上；<br>账号服务只负责登录、授权与组网。</p>
-    <label class="fld">
-      <span>服务地址</span>
-      <input id="loginServer" type="text" spellcheck="false">
-    </label>
-    <label class="fld">
-      <span>账号</span>
-      <input id="loginAccount" type="text" spellcheck="false" placeholder="邮箱 / 账号名">
-    </label>
-    <label class="fld">
-      <span>密码</span>
-      <input id="loginPassword" type="password" placeholder="仅本次登录使用，不保存">
-    </label>
-    <div class="login-err" id="loginErr"></div>
-    <button id="loginBtn" class="btn btn-accent btn-block" type="submit">登录</button>
-    <p class="login-note">登录状态会保存在这台电脑上，下次打开直接进入；<br>只有退出登录或服务端吊销时才需要重新输入密码。</p>
-  </form>
+    <p class="login-sub">备份数据只存在你自己的电脑上；<br>账号服务只负责登录与组网。</p>
+    <div class="login-tabs" role="tablist">
+      <button type="button" id="tabQr" class="login-tab active">扫码登录</button>
+      <button type="button" id="tabPwd" class="login-tab">密码登录</button>
+    </div>
+    <!-- 扫码登录（默认页签）: one-time QR, 2 分钟有效、过期自动刷新 -->
+    <div id="qrPane">
+      <div class="qr-box" id="qrBox"><span class="qr-hint">二维码生成中…</span></div>
+      <div class="qr-status" id="qrStatus">正在申请二维码…</div>
+      <div class="qr-count" id="qrCount"></div>
+      <button type="button" class="btn btn-ghost btn-sm" id="qrRefresh" hidden>刷新二维码</button>
+      <p class="login-note">手机打开牛备 →「我的」→「扫码登录电脑」扫一扫，在手机上确认即可。<br>二维码只含一次性票据，不含账号与密码。</p>
+    </div>
+    <!-- 密码登录（第二页签） -->
+    <form id="loginCard" autocomplete="off" hidden>
+      <label class="fld">
+        <span>服务地址</span>
+        <input id="loginServer" type="text" spellcheck="false">
+      </label>
+      <label class="fld">
+        <span>账号</span>
+        <input id="loginAccount" type="text" spellcheck="false" placeholder="邮箱 / 账号名">
+      </label>
+      <label class="fld">
+        <span>密码</span>
+        <input id="loginPassword" type="password" placeholder="仅本次登录使用，不保存">
+      </label>
+      <div class="login-err" id="loginErr"></div>
+      <button id="loginBtn" class="btn btn-accent btn-block" type="submit">登录</button>
+      <p class="login-note">登录状态会保存在这台电脑上，下次打开直接进入；<br>只有退出登录或服务端吊销时才需要重新输入密码。</p>
+    </form>
+  </div>
 </div>
 
 <!-- ============ app shell ============ -->
@@ -56,13 +71,14 @@
     </div>
     <nav class="nav" id="nav">
       <button class="nav-item active" data-page="overview"><span class="nav-ico">▦</span>概览</button>
-      <button class="nav-item" data-page="devices"><span class="nav-ico">▤</span>设备<span class="nav-badge" id="pendingBadge" hidden></span></button>
+      <button class="nav-item" data-page="devices"><span class="nav-ico">▤</span>设备</button>
       <button class="nav-item" data-page="storage"><span class="nav-ico">▣</span>存储</button>
       <button class="nav-item" data-page="records"><span class="nav-ico">▧</span>备份记录</button>
       <button class="nav-item" data-page="logs"><span class="nav-ico">≣</span>日志</button>
       <button class="nav-item" data-page="settings"><span class="nav-ico">⚙</span>设置</button>
     </nav>
     <div class="side-foot">
+      <div class="license-pill">开源免费 · 永久可用</div>
       <div class="side-account" id="sideAccount">—</div>
       <button class="btn btn-side" id="logoutBtn">退出登录</button>
     </div>
@@ -72,9 +88,9 @@
     <!-- 概览 -->
     <section class="page" id="page-overview">
       <div class="page-head"><h2>概览</h2></div>
-      <div class="banner" id="pendingBanner" hidden>
-        <span>📱 有 <b id="pendingCount">0</b> 台设备等待批准，批准后才能开始备份。</span>
-        <button class="btn btn-accent btn-sm" id="bannerGo">去处理</button>
+      <div class="banner" id="autoJoinBanner">
+        <span>📱 新手机用同一账号登录后会自动加入同一网络，现在即可发起备份，无需批准。</span>
+        <button class="btn btn-ghost btn-sm" id="bannerClose">知道了</button>
       </div>
       <div class="cards">
         <div class="card">
@@ -88,7 +104,7 @@
           <div class="card-sub" id="ovMeshSub">—</div>
         </div>
         <div class="card">
-          <div class="card-title">账户与授权</div>
+          <div class="card-title">账户</div>
           <div class="card-main" id="ovAccount">—</div>
           <div class="card-sub" id="ovAccountSub">—</div>
         </div>
@@ -110,13 +126,9 @@
         <h2>设备</h2>
         <button class="btn btn-ghost btn-sm" id="devRefresh">刷新</button>
       </div>
-      <div id="devPendingWrap">
-        <h3 class="sec-title">待批准</h3>
-        <div id="devPending"></div>
-      </div>
-      <h3 class="sec-title">已绑定设备</h3>
+      <p class="sec-note">账号即网络：同一账号登录的设备自动加入你的专属网络，无需批准。此页为只读清单。</p>
       <table class="tbl" id="devTable">
-        <thead><tr><th>设备</th><th>类型</th><th>编号</th><th>状态</th><th></th></tr></thead>
+        <thead><tr><th>设备</th><th>类型</th><th>编号</th><th>状态</th></tr></thead>
         <tbody></tbody>
       </table>
     </section>
@@ -132,7 +144,7 @@
           <button class="btn btn-primary btn-sm" id="stOpenTarget">打开存储目录</button>
           <button class="btn btn-ghost btn-sm" id="stOpenData">打开数据目录</button>
         </div>
-        <p class="hint">配额来自你的授权（license）；文件内容只保存在这台电脑上，账号服务不保存任何文件名或文件内容。</p>
+        <p class="hint">牛备开源免费 · 永久可用，没有授权期限。文件内容只保存在这台电脑上，账号服务不保存任何文件名或文件内容。</p>
       </div>
     </section>
 
@@ -149,7 +161,15 @@
           <div class="empty">从左侧选择一条记录查看预览</div>
         </div>
       </div>
-      <button class="btn btn-ghost btn-sm" id="recMore" hidden>加载更多</button>
+      <div class="pager" id="recPager">
+        <button class="btn btn-ghost btn-sm" id="recPrev">上一页</button>
+        <span class="pager-label" id="recPageLabel">第 1 / 1 页</span>
+        <button class="btn btn-ghost btn-sm" id="recNext">下一页</button>
+        <span class="pager-jump">跳到
+          <input id="recJump" type="number" min="1" value="1"> 页
+          <button class="btn btn-ghost btn-sm" id="recGo">跳转</button>
+        </span>
+      </div>
     </section>
 
     <!-- 日志 -->
@@ -199,6 +219,8 @@
 </div>
 
 <div id="toast" class="toast" hidden></div>
+<!-- QR rendering: qrcode-generator 1.4.4 (Kazuhiko Arase, MIT), vendored -->
+<script src="qrcode.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

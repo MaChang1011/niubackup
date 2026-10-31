@@ -51,4 +51,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    // v1.4 扫码登录： ZXing core only (decode) — the scan screen drives
+    // the camera itself; no embedded/ML Kit dependency.
+    implementation("com.google.zxing:core:3.5.3")
 }

@@ -47,6 +47,12 @@ import kotlin.concurrent.thread
  * reloads on every resume; overlapping loads are generation-guarded so
  * only the newest fetch reaches the UI. Since the receiver serves fs
  * sessions concurrently with backups, LIVE works even mid-backup.
+ *
+ * Pagination (design v1.3): 20 records per page with a bottom pager;
+ * only the current page's rows are built and only its thumbnails are
+ * prefetched. (The photo preview opened from a row still swipes the
+ * full loaded record list — it is already in memory and costs nothing
+ * to render lazily per swipe.)
  */
 class RecordsActivity : Activity() {
 
@@ -60,9 +66,18 @@ class RecordsActivity : Activity() {
     private lateinit var connPill: LinearLayout
     private lateinit var stripText: TextView
     private lateinit var listView: ListView
+    private lateinit var prevPageBtn: android.widget.Button
+    private lateinit var nextPageBtn: android.widget.Button
+    private lateinit var pageLabel: TextView
     private var records: List<FsClient.Record> = emptyList()
     private var rows: List<Row> = emptyList()
     private var receiptPaths: Set<String> = emptySet()
+
+    /** Paging state (design v1.3: 20/page, explicit pager). The record
+     *  list itself arrives whole over fs LIST — paging bounds what is
+     *  RENDERED (rows + thumbnail prefetch), not what is fetched. */
+    private var pageIndex = 0
+    private var lastStaleAt: Long? = null
     private val io = Executors.newFixedThreadPool(3)
     private val memCache = object : LruCache<String, Bitmap>(24 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
@@ -119,8 +134,52 @@ class RecordsActivity : Activity() {
             )
         )
         col.addView(card)
+
+        // ---- pager (design v1.3: 上一页 / 页码 / 下一页 under the card)
+        val pager = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(
+                Ui.dp(this@RecordsActivity, 16), Ui.dp(this@RecordsActivity, 4),
+                Ui.dp(this@RecordsActivity, 16), Ui.dp(this@RecordsActivity, 8)
+            )
+        }
+        prevPageBtn = Ui.ghostButton(this, "上一页").apply {
+            setOnClickListener { turnPage(-1) }
+        }
+        pager.addView(prevPageBtn)
+        pageLabel = TextView(this).apply {
+            text = "第 1 / 1 页"
+            textSize = 12f
+            setTextColor(Ui.SLATE)
+            gravity = Gravity.CENTER
+        }
+        pager.addView(pageLabel, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+        ))
+        nextPageBtn = Ui.ghostButton(this, "下一页").apply {
+            setOnClickListener { turnPage(1) }
+        }
+        pager.addView(nextPageBtn)
+        col.addView(pager)
         createdOnce = true
         loadRecords()
+    }
+
+    private fun totalPages(): Int =
+        if (records.isEmpty()) 1 else (records.size + PAGE_SIZE - 1) / PAGE_SIZE
+
+    private fun turnPage(delta: Int) {
+        val target = (pageIndex + delta).coerceIn(0, totalPages() - 1)
+        if (target == pageIndex) return
+        pageIndex = target
+        renderPage()
+    }
+
+    private fun renderPager() {
+        pageLabel.text = "第 ${pageIndex + 1} / ${totalPages()} 页"
+        prevPageBtn.isEnabled = pageIndex > 0
+        nextPageBtn.isEnabled = pageIndex < totalPages() - 1
     }
 
     private var createdOnce = false
@@ -185,6 +244,7 @@ class RecordsActivity : Activity() {
                         rows = listOf(Row.Hint("暂无备份记录 · 连上电脑后回到本页会自动刷新"))
                         receiptPaths = receipts
                         (listView.adapter as BaseAdapter).notifyDataSetChanged()
+                        renderPager()
                         Ui.setPill(connPill, "电脑离线", Ui.StatusKind.PC)
                         stripText.text = "电脑不可达，且暂无缓存记录。先组网并完成一次备份。"
                     }
@@ -196,6 +256,23 @@ class RecordsActivity : Activity() {
     private fun show(list: List<FsClient.Record>, staleAt: Long?, receipts: Set<String>) {
         records = list
         receiptPaths = receipts
+        lastStaleAt = staleAt
+        pageIndex = 0
+        renderPage()
+    }
+
+    /** Render the current page of [records] (20/page). Day-group headers
+     *  repeat at a page boundary — buildRows runs per page slice, so a
+     *  group never starts headerless mid-page (design v1.3). */
+    private fun renderPage() {
+        val list = records
+        val staleAt = lastStaleAt
+        val pages = totalPages()
+        if (pageIndex > pages - 1) pageIndex = pages - 1
+        if (pageIndex < 0) pageIndex = 0
+        val start = pageIndex * PAGE_SIZE
+        val slice = if (start >= list.size) emptyList()
+            else list.subList(start, minOf(list.size, start + PAGE_SIZE))
         // Empty is a state of its own — an explicit hint row, never a
         // blank card that looks like a loading failure.
         rows = if (list.isEmpty()) {
@@ -206,7 +283,7 @@ class RecordsActivity : Activity() {
                 )
             )
         } else {
-            buildRows(list)
+            buildRows(slice)
         }
         if (staleAt == null) {
             Ui.setPill(connPill, "直连中", Ui.StatusKind.OK)
@@ -221,7 +298,9 @@ class RecordsActivity : Activity() {
             stripText.text = "记录截至 ${fmtTime(staleAt)} · 电脑暂时不可达 · 共 ${list.size} 个文件"
         }
         (listView.adapter as BaseAdapter).notifyDataSetChanged()
-        for (r in list) if (r.thumb) prefetchThumb(r)
+        renderPager()
+        // Prefetch only the visible page's thumbnails (design v1.3).
+        for (r in slice) if (r.thumb) prefetchThumb(r)
     }
 
     private fun buildRows(list: List<FsClient.Record>): List<Row> {
@@ -511,5 +590,10 @@ class RecordsActivity : Activity() {
         bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
         bytes < 1024L * 1024 * 1024 -> "%.1f MB".format(bytes / 1024.0 / 1024)
         else -> "%.2f GB".format(bytes / 1024.0 / 1024 / 1024)
+    }
+
+    companion object {
+        /** Design v1.3: records render 20 per page (5,412 ≈ 271 pages). */
+        const val PAGE_SIZE = 20
     }
 }

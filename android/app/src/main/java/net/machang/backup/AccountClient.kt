@@ -170,6 +170,42 @@ class AccountClient(private val baseUrl: String) {
         return r.optBoolean("valid") to r.optString("reason", "")
     }
 
+    // ----------------------------------------------------- QR pc-login
+
+    /** What the phone shows on the 扫码登录确认 card. Fields beyond
+     *  [status] are parsed defensively — the ticket GET is specified for
+     *  the PC's poll, and the confirm card uses whatever the service
+     *  includes (device_name / account / network_name / created_at). */
+    data class PcLoginTicket(
+        val status: String,
+        val deviceName: String?,
+        val account: String?,
+        val networkName: String?,
+        val createdAt: String?
+    )
+
+    /** GET /api/pc-login/tickets/{id}?secret= (no bearer — the secret
+     *  from the QR code authorizes reading this one ticket). */
+    fun pcLoginTicket(ticketId: String, secret: String): PcLoginTicket {
+        val enc = java.net.URLEncoder.encode(secret, "UTF-8")
+        val r = request("GET", "/api/pc-login/tickets/$ticketId?secret=$enc", null, null)
+        fun s(k: String): String? = r.optString(k, "").ifEmpty { null }
+        return PcLoginTicket(
+            r.optString("status", ""), s("device_name"), s("account"),
+            s("network_name"), s("created_at")
+        )
+    }
+
+    /** POST /api/pc-login/tickets/{id}/approve {secret} with the account
+     *  session bearer — the approval IS the login (design v1.4: 扫码登录
+     *  本身就是账号持有者的确认，电脑随后以同账号自动入网）. */
+    fun approvePcLogin(ticketId: String, secret: String, bearer: String) {
+        request(
+            "POST", "/api/pc-login/tickets/$ticketId/approve", bearer,
+            JSONObject().put("secret", secret)
+        )
+    }
+
     /** Count-level session report (design §8 — no filenames, no hashes). */
     fun postSessionLog(deviceToken: String, files: Int, bytes: Long, result: String) {
         request(

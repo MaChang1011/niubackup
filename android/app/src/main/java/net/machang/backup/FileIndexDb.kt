@@ -69,31 +69,95 @@ class FileIndexDb private constructor(context: Context) :
 
     // ------------------------------------------------------------ reading
 
+    private val rowColumns =
+        arrayOf("path", "size", "mtime", "sha256", "status", "receipt_verified", "pc_integrity")
+
+    private fun rowFrom(c: android.database.Cursor): Row = Row(
+        path = c.getString(0),
+        size = c.getLong(1),
+        mtime = c.getLong(2),
+        sha256 = if (c.isNull(3)) null else c.getString(3),
+        status = c.getInt(4),
+        receiptVerified = c.getInt(5) != 0,
+        pcIntegrity = if (c.isNull(6)) null else c.getString(6)
+    )
+
     /** All rows keyed by path (path order). Empty on any failure. */
     fun loadAll(): Map<String, Row> {
         val out = LinkedHashMap<String, Row>()
         try {
             val db = readableDatabase
             db.query(
-                "file_index",
-                arrayOf("path", "size", "mtime", "sha256", "status", "receipt_verified", "pc_integrity"),
-                null, null, null, null, "path"
+                "file_index", rowColumns, null, null, null, null, "path"
             )?.use { c ->
                 while (c.moveToNext()) {
-                    val row = Row(
-                        path = c.getString(0),
-                        size = c.getLong(1),
-                        mtime = c.getLong(2),
-                        sha256 = if (c.isNull(3)) null else c.getString(3),
-                        status = c.getInt(4),
-                        receiptVerified = c.getInt(5) != 0,
-                        pcIntegrity = if (c.isNull(6)) null else c.getString(6)
-                    )
+                    val row = rowFrom(c)
                     out[row.path] = row
                 }
             }
         } catch (t: Throwable) {
             // Degrade to "no index": callers fall back to receipts/fs only.
+        }
+        return out
+    }
+
+    /** Kind filter for paged reads — mirrors MediaStoreHelper's extension
+     *  lists (keep in sync: isImageName / isVideoName). */
+    enum class Kind { ALL, IMAGE, VIDEO }
+
+    private fun kindWhere(kind: Kind): String? = when (kind) {
+        Kind.ALL -> null
+        Kind.IMAGE -> extWhere(IMAGE_EXTS)
+        Kind.VIDEO -> extWhere(VIDEO_EXTS)
+    }
+
+    private fun extWhere(exts: List<String>): String =
+        exts.joinToString(" OR ") { "LOWER(path) LIKE '%.$it'" }
+
+    /** Row count for a kind filter (pager totals). 0 on any failure. */
+    fun count(kind: Kind): Int {
+        return try {
+            val db = readableDatabase
+            db.rawQuery(
+                "SELECT COUNT(*) FROM file_index" +
+                    (kindWhere(kind)?.let { " WHERE $it" } ?: ""),
+                null
+            )?.use { c -> if (c.moveToFirst()) c.getInt(0) else 0 } ?: 0
+        } catch (t: Throwable) {
+            0
+        }
+    }
+
+    /**
+     * One page of rows in path order (LIMIT/OFFSET) — the library grid
+     * renders only the current page (design v1.3: 48/page), so opening
+     * the page never materializes the full ~6,300-row merge into views.
+     */
+    fun loadPage(kind: Kind, limit: Int, offset: Int): List<Row> {
+        val out = ArrayList<Row>()
+        try {
+            val db = readableDatabase
+            db.query(
+                "file_index", rowColumns, kindWhere(kind), null, null, null,
+                "path", "$offset,$limit"
+            )?.use { c ->
+                while (c.moveToNext()) out += rowFrom(c)
+            }
+        } catch (t: Throwable) {
+            // Degrade to an empty page.
+        }
+        return out
+    }
+
+    /** Just the path set (pc-only derivation in the library merge). */
+    fun loadAllPaths(): Set<String> {
+        val out = HashSet<String>()
+        try {
+            val db = readableDatabase
+            db.query("file_index", arrayOf("path"), null, null, null, null, null)
+                ?.use { c -> while (c.moveToNext()) out += c.getString(0) }
+        } catch (t: Throwable) {
+            // Degrade to "no local paths".
         }
         return out
     }
@@ -338,6 +402,12 @@ class FileIndexDb private constructor(context: Context) :
 
         const val STATUS_NOT_BACKED = 0
         const val STATUS_BACKED = 1
+
+        // Extension lists mirroring MediaStoreHelper.isImageName/isVideoName.
+        private val IMAGE_EXTS =
+            listOf("jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp")
+        private val VIDEO_EXTS =
+            listOf("mp4", "mov", "mkv", "webm", "3gp", "avi")
 
         @Volatile
         private var instance: FileIndexDb? = null

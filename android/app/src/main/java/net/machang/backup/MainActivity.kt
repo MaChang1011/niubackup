@@ -8,7 +8,6 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.net.VpnService
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -32,9 +31,11 @@ import java.util.function.IntSupplier
 import kotlin.concurrent.thread
 
 /**
- * 备份 (Home) page, laid out per the approved design mockup (v1.1):
- * header title + persistent mesh status pill → 账户与配对 card (kv rows +
- * mesh control) → 立即备份 big button, which transforms IN PLACE into the
+ * 备份 (Home) page, laid out per the approved design mockup (v1.1,
+ * updated v1.2–v1.5): header title + persistent mesh status pill →
+ * 账户与组网 card (status rows only — the mesh is fully automatic since
+ * v1.2, started by [MeshAuto] at launch / login / backup time) →
+ * 立即备份 big button, which transforms IN PLACE into the
  * progress card while a session runs (no page jump, no modal) → 上次备份
  * card (summary + auto-backup toggle + live conditions dots) → 日志 card
  * (latest human-readable lines only).
@@ -54,10 +55,8 @@ class MainActivity : Activity() {
 
     private lateinit var meshPill: LinearLayout
     private lateinit var accountValue: TextView
-    private lateinit var pairingSlot: LinearLayout
+    private lateinit var meshStateValue: TextView
     private lateinit var targetValue: TextView
-    private lateinit var meshLine: TextView
-    private lateinit var vpnButton: Button
     private lateinit var backupButton: Button
     private lateinit var progressCard: LinearLayout
     private lateinit var progressBadgeSlot: LinearLayout
@@ -78,9 +77,6 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var poller: Runnable? = null
 
-    @Volatile
-    private var meshRunning = false
-
     private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -89,7 +85,7 @@ class MainActivity : Activity() {
         AppLog.listener = { _ -> runOnUiThread { renderLog() } }
         renderLog()
         requestStoragePermissions()
-        AppLog.log("应用就绪。登录账号后组网会自动使用你的专属网络；也可填密钥用自用网络。")
+        AppLog.log("应用就绪。组网全自动：登录账号后会自动加入你的专属网络。")
         // Saved-session restore (once per process): rotate the stored
         // refresh token when the access token has lapsed; a definitive
         // server rejection flips the status card to 登录已过期. Offline
@@ -100,6 +96,11 @@ class MainActivity : Activity() {
             }
             runOnUiThread { if (!isFinishing) refreshStatusCard() }
         }
+        // 组网全自动 (design v1.2): app launch pulls the mesh up on its
+        // own — no manual 启动组网 anywhere. The first time, Android's
+        // VPN consent dialog appears (system-forced); after that the
+        // mesh just comes up. No-op when not logged in yet.
+        MeshAuto.ensure(this, REQ_VPN)
     }
 
     override fun onResume() {
@@ -129,8 +130,10 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_VPN) {
             if (resultCode == RESULT_OK) {
-                startMesh()
+                MeshAuto.start(this)
+                AppLog.log("组网启动中…")
             } else {
+                MeshState.markFailed("未授予 VPN 权限")
                 AppLog.log("VPN 权限被拒绝，组网未启动")
             }
         }
@@ -141,42 +144,13 @@ class MainActivity : Activity() {
     private fun refreshStatusCard() {
         val account = SecureStore.get(this, SecureStore.KEY_ACCOUNT)
         targetValue.text = "${PcConn.pcHost(this)} · 电脑备份目录"
-        if (account == null) {
-            accountValue.text = if (SessionRestore.expiredHintPending(this)) {
-                "登录已过期 — 去「我的」页重新登录"
-            } else {
-                "未登录 — 去「我的」页注册或登录"
-            }
-            setPairingBadge("配对: —", Ui.StatusKind.NONE)
-            return
+        accountValue.text = account ?: if (SessionRestore.expiredHintPending(this)) {
+            "登录已过期 — 去「我的」页重新登录"
+        } else {
+            "未登录 — 去「我的」页注册或登录"
         }
-        accountValue.text = account
-        setPairingBadge("配对: 查询中…", Ui.StatusKind.NONE)
-        val devId = SecureStore.get(this, SecureStore.KEY_DEVICE_ID)?.toLongOrNull()
-        val token = SecureStore.get(this, SecureStore.KEY_DEVICE_TOKEN)
-        if (devId == null || token == null) {
-            setPairingBadge("配对: —", Ui.StatusKind.NONE)
-            return
-        }
-        thread(name = "home-pairing") {
-            val (text, kind) = try {
-                val (valid, reason) = AccountClient(PcConn.serverUrl(this)).validate(devId, token)
-                if (valid) {
-                    "已批准" to Ui.StatusKind.OK
-                } else {
-                    (reason + if (reason == "not_approved") "（等待电脑端批准）" else "") to
-                        Ui.StatusKind.WAIT
-                }
-            } catch (t: Throwable) {
-                "未知（账户服务不可达）" to Ui.StatusKind.NONE
-            }
-            runOnUiThread { if (!isFinishing) setPairingBadge(text, kind) }
-        }
-    }
-
-    private fun setPairingBadge(text: String, kind: Ui.StatusKind) {
-        pairingSlot.removeAllViews()
-        pairingSlot.addView(Ui.badge(this, text, kind))
+        // 组网状态 is rendered by the conditions poller (it owns the
+        // route-cost check); see refreshConditionsAsync.
     }
 
     private fun refreshSessionLine() {
@@ -254,10 +228,31 @@ class MainActivity : Activity() {
                 setDot("WiFi", wifi)
                 setDot("空闲", idle)
                 setDot("直连", direct)
+                // Status pill + 组网状态 row read the shared MeshState:
+                // the mesh is automatic now, the UI only reports it.
+                val phase = MeshState.phase
                 when {
-                    direct -> Ui.setPill(meshPill, "组网已连接 · 直连", Ui.StatusKind.OK)
-                    meshRunning -> Ui.setPill(meshPill, "等待直连", Ui.StatusKind.WAIT)
-                    else -> Ui.setPill(meshPill, "组网未连接", Ui.StatusKind.PC)
+                    direct -> {
+                        Ui.setPill(meshPill, "网络已连接 · 直连", Ui.StatusKind.OK)
+                        meshStateValue.text = "已同网 · 同账号 · 直连"
+                    }
+                    phase == MeshState.Phase.FAILED -> {
+                        Ui.setPill(meshPill, "组网失败", Ui.StatusKind.PC)
+                        meshStateValue.text =
+                            "失败：${MeshState.failureReason ?: "未知原因"}"
+                    }
+                    phase == MeshState.Phase.STARTING -> {
+                        Ui.setPill(meshPill, "组网中", Ui.StatusKind.WAIT)
+                        meshStateValue.text = "组网中…"
+                    }
+                    phase == MeshState.Phase.UP -> {
+                        Ui.setPill(meshPill, "等待直连", Ui.StatusKind.WAIT)
+                        meshStateValue.text = "已同网 · 同账号 · 等待直连"
+                    }
+                    else -> {
+                        Ui.setPill(meshPill, "组网未连接", Ui.StatusKind.PC)
+                        meshStateValue.text = "未连接"
+                    }
                 }
             }
         }
@@ -296,52 +291,26 @@ class MainActivity : Activity() {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && pm.isDeviceIdleMode
     }
 
-    // ----------------------------------------------------------------- mesh
-
-    private fun onMeshButton() {
-        if (meshRunning) {
-            startService(
-                Intent(this, BackupVpnService::class.java)
-                    .setAction(BackupVpnService.ACTION_STOP)
-            )
-            meshRunning = false
-            vpnButton.text = "启动组网"
-            meshLine.text = "未运行"
-            Ui.setPill(meshPill, "组网未连接", Ui.StatusKind.PC)
-            AppLog.log("已请求停止组网")
-            return
-        }
-        if (PcConn.meshStartIntent(this) == null) {
-            AppLog.log("没有可用组网配置：先登录账号，或填写自用组网密钥")
-            return
-        }
-        val prepare = VpnService.prepare(this)
-        if (prepare != null) {
-            AppLog.log("请求 VPN 权限…")
-            @Suppress("DEPRECATION")
-            startActivityForResult(prepare, REQ_VPN)
-        } else {
-            startMesh()
-        }
-    }
-
-    private fun startMesh() {
-        PcConn.startMesh(this)
-        meshRunning = true
-        vpnButton.text = "停止组网"
-        meshLine.text = "启动中…"
-        Ui.setPill(meshPill, "等待直连", Ui.StatusKind.WAIT)
-        AppLog.log("组网启动中…")
-    }
-
     // --------------------------------------------------------------- backup
 
     private fun onManualBackup() {
         val identity = PcConn.identity(this)
         val host = PcConn.pcHost(this)
         val port = PcConn.pcPort(this)
+        // 发起备份前自动拉起组网 (design v1.2): if the mesh is down this
+        // kicks it (or shows the one-time VPN consent); the session below
+        // then waits briefly for the peer before connecting.
+        MeshAuto.ensure(this, REQ_VPN)
         AppLog.log("开始备份 DCIM → $host:$port…")
         thread(name = "backup") {
+            if (EasyTierBridge.peerRouteCost(host) < 0 && PcConn.meshStartIntent(this) != null) {
+                AppLog.log("组网建立中，等待电脑上线…")
+                var waited = 0
+                while (EasyTierBridge.peerRouteCost(host) < 0 && waited < 60_000) {
+                    Thread.sleep(3_000)
+                    waited += 3_000
+                }
+            }
             val dcim = File(Environment.getExternalStorageDirectory(), "DCIM")
             val logger = BackupClient.Logger { msg -> AppLog.log(msg) }
             val client = if (identity != null) {
@@ -456,45 +425,19 @@ class MainActivity : Activity() {
         meshPill = Ui.pill(this, "组网未连接", Ui.StatusKind.PC)
         page.headerRight.addView(meshPill)
 
-        // ---- 账户与配对 card (kv rows + mesh control)
+        // ---- 账户与组网 card (design v1.4/v1.5): status rows only —
+        // the mesh is fully automatic, there is no mesh button anymore.
         col.addView(Ui.cardBlock(this) {
             accountValue = Ui.kvValue(this@MainActivity, "")
             addView(Ui.kvRow(this@MainActivity, "账号", accountValue))
-            pairingSlot = LinearLayout(this@MainActivity).apply {
-                gravity = Gravity.END
-            }
-            addView(Ui.kvRow(this@MainActivity, "配对状态", pairingSlot))
+            meshStateValue = Ui.kvValue(this@MainActivity, "未连接")
+            addView(Ui.kvRow(this@MainActivity, "组网状态", meshStateValue))
             targetValue = Ui.kvValue(this@MainActivity, "")
             addView(Ui.kvRow(this@MainActivity, "备份目标", targetValue))
-            addView(Ui.hairline(this@MainActivity))
-            val meshRow = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val meshCol = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-            }
-            meshCol.addView(TextView(this@MainActivity).apply {
-                text = "产品组网"
-                textSize = 13.5f
-                setTextColor(Ui.INK)
-                typeface = Ui.font(700)
-            })
-            meshLine = Ui.subText(this@MainActivity, "未运行")
-            meshCol.addView(meshLine)
-            meshRow.addView(
-                meshCol,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            vpnButton = Ui.ghostButton(this@MainActivity, "启动组网").apply {
-                setOnClickListener { onMeshButton() }
-            }
-            meshRow.addView(vpnButton)
-            addView(meshRow)
             addView(
                 Ui.subText(
                     this@MainActivity,
-                    "组网连上后才能备份、下载和播放；备份只走直连，不走中继。"
+                    "组网全自动：打开 App 即组网，备份只走直连、不走中继。"
                 ),
                 Ui.spaced(Ui.matchWrap(), 6, this@MainActivity)
             )

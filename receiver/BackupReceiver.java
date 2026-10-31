@@ -2350,6 +2350,85 @@ final class AccountLink {
         SessionDead(String m) { super(m); }
     }
 
+    // ------------------------------------------------------- QR pc-login
+
+    /**
+     * POST /api/pc-login/tickets {device_name} → {ticket_id, secret,
+     * expires_at} (design v1.4 扫码登录）. The ticket is a one-time login
+     * offer: the desktop renders {t, s, srv} as a QR code and the account
+     * holder approves it from the phone. expires_at comes back raw — the
+     * control API normalizes it for the frontend countdown.
+     */
+    static String[] createPcLoginTicket(String server, String deviceName) throws Exception {
+        ApiResult r = http("POST", normalize(server) + "/api/pc-login/tickets", null,
+                "{\"device_name\":\"" + MiniJson.esc(deviceName) + "\"}");
+        requireOk(r, "pc-login ticket create");
+        return new String[]{MiniJson.str(r.body, "ticket_id"),
+                MiniJson.str(r.body, "secret"), MiniJson.str(r.body, "expires_at")};
+    }
+
+    /** GET /api/pc-login/tickets/{id}?secret= — raw passthrough (the
+     *  caller interprets status / HTTP 404|410 = expired). */
+    static ApiResult pcLoginTicketStatus(String server, String ticketId, String secret)
+            throws IOException, InterruptedException {
+        String url = normalize(server) + "/api/pc-login/tickets/"
+                + URLEncoder.encode(ticketId, StandardCharsets.UTF_8)
+                + "?secret=" + URLEncoder.encode(secret, StandardCharsets.UTF_8);
+        return http("GET", url, null, null);
+    }
+
+    /** A JSON field that may be encoded as a string or a bare number. */
+    static String strOrNum(String json, String key) {
+        String s = MiniJson.str(json, key);
+        if (s != null) return s;
+        long n = MiniJson.num(json, key, Long.MIN_VALUE);
+        return n == Long.MIN_VALUE ? null : Long.toString(n);
+    }
+
+    /**
+     * QR-login bootstrap: the phone approved a pc-login ticket and the
+     * service registered THIS PC, handing back one-time credentials
+     * {account, user_id, pc_device_id, device_token, refresh_token}.
+     * Lands on exactly the account.json shape [loginFlow] produces, so
+     * session persistence, sync and the mesh sidecar behave identically.
+     *
+     * The credentials are ONE-TIME (the ticket dies at approval), so the
+     * state is saved BEFORE anything that can fail; provisioning + sync
+     * are then best-effort — the periodic sync repairs them if the
+     * service hiccups, because syncOnce itself re-fetches provisioning.
+     */
+    static State qrLoginFlow(Path dataDir, BackupReceiver.Store store, String server,
+                             String credsJson, String pcIpOverride) throws Exception {
+        State st = new State();
+        st.dataDir = dataDir;
+        st.server = normalize(server);
+        st.account = MiniJson.str(credsJson, "account");
+        st.userId = strOrNum(credsJson, "user_id");
+        st.pcDeviceId = strOrNum(credsJson, "pc_device_id");
+        st.pcDeviceToken = MiniJson.str(credsJson, "device_token");
+        st.refreshToken = MiniJson.str(credsJson, "refresh_token");
+        if (st.pcDeviceToken == null || st.userId == null || st.pcDeviceId == null) {
+            throw new IOException("pc-login credentials incomplete");
+        }
+        st.pcIp = pcIpOverride != null ? pcIpOverride : DEFAULT_PC_IP;
+        st.save();
+        try {
+            String[] prov = provisioning(st, st.pcDeviceToken);
+            st.publicNode = prov[0];
+            st.networkName = prov[1];
+            st.networkSecret = prov[2];
+            st.save();
+        } catch (Exception e) {
+            BackupReceiver.log("qr login: provisioning deferred (" + e.getMessage() + ")");
+        }
+        try {
+            AccountLink.syncOnce(st, store);
+        } catch (Exception e) {
+            BackupReceiver.log("qr login: initial sync deferred (" + e.getMessage() + ")");
+        }
+        return st;
+    }
+
     /**
      * Mint a short-lived account access token from the stored refresh token
      * (rotating it + re-saving, exactly like refreshSession). Some service
@@ -2874,6 +2953,12 @@ final class ControlApi {
             return;
         }
         if ("POST".equals(method) && path.equals("/account/login")) { login(ex); return; }
+        if ("POST".equals(method) && path.equals("/account/qr-ticket")) { qrTicketCreate(ex); return; }
+        if ("GET".equals(method) && path.startsWith("/account/qr-ticket/")) {
+            qrTicketPoll(ex, path.substring("/account/qr-ticket/".length()),
+                    q.get("secret"));
+            return;
+        }
         if ("POST".equals(method) && path.equals("/account/logout")) { logout(ex); return; }
         if ("POST".equals(method) && path.equals("/sync")) { sync(ex); return; }
         sendJson(ex, 404, "{\"ok\":false,\"error\":\"no such endpoint\"}");
@@ -3202,6 +3287,155 @@ final class ControlApi {
             String msg = String.valueOf(e.getMessage());
             int code = msg.contains("401") ? 401 : msg.contains("403") ? 403 : 502;
             sendJson(ex, code, "{\"ok\":false,\"error\":\"" + MiniJson.esc(msg) + "\"}");
+        }
+    }
+
+    /** Server the in-flight QR ticket was created against (the poll must
+     *  hit the same service; the QR payload carries it for the phone). */
+    private volatile String qrTicketServer;
+
+    /**
+     * 扫码登录 step 1 (design v1.4): create a one-time pc-login ticket at
+     * the account service and hand the shell everything it renders —
+     * the QR payload is ONLY {t, s, srv} (no credential material), the
+     * countdown runs off expires_at_ms.
+     */
+    private void qrTicketCreate(HttpExchange ex) throws Exception {
+        if (r.acct != null) {
+            sendJson(ex, 409, "{\"ok\":false,\"error\":\"already_logged_in\"}");
+            return;
+        }
+        String json = body(ex);
+        String server = MiniJson.str(json, "server");
+        if (server == null || server.isEmpty()) server = BackupReceiver.DEFAULT_SERVER;
+        server = AccountLink.normalize(server);
+        String hostname;
+        try {
+            hostname = InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            hostname = "niubackup-pc";
+        }
+        try {
+            String[] t = AccountLink.createPcLoginTicket(server, hostname);
+            if (t[0] == null || t[1] == null) {
+                sendJson(ex, 502, "{\"ok\":false,\"error\":\"ticket response incomplete\"}");
+                return;
+            }
+            qrTicketServer = server;
+            long expMs = normalizeExpires(t[2]);
+            String payload = "{\"t\":\"" + MiniJson.esc(t[0])
+                    + "\",\"s\":\"" + MiniJson.esc(t[1])
+                    + "\",\"srv\":\"" + MiniJson.esc(server) + "\"}";
+            sendJson(ex, 200, "{\"ok\":true,\"ticket_id\":\"" + MiniJson.esc(t[0])
+                    + "\",\"secret\":\"" + MiniJson.esc(t[1])
+                    + "\",\"expires_at_ms\":" + expMs
+                    + ",\"server\":\"" + MiniJson.esc(server)
+                    + "\",\"qr_payload\":\"" + MiniJson.esc(payload) + "\"}");
+        } catch (Exception e) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\""
+                    + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
+        }
+    }
+
+    /** expires_at arrives as epoch ms, epoch s, or an ISO-8601 string. */
+    private static long normalizeExpires(String raw) {
+        if (raw != null && !raw.isEmpty()) {
+            try {
+                long n = Long.parseLong(raw.trim());
+                return n < 10_000_000_000L ? n * 1000 : n;
+            } catch (NumberFormatException ignore) { }
+            try {
+                return Instant.parse(raw.trim()).toEpochMilli();
+            } catch (Exception ignore) { }
+        }
+        // Contract lifetime is 2 minutes; fall back to exactly that.
+        return System.currentTimeMillis() + 120_000;
+    }
+
+    /** The object literal containing "device_token" (top-level or nested). */
+    private static String credsObject(String bodyJson) {
+        int i = bodyJson.indexOf("\"device_token\"");
+        if (i < 0) return null;
+        int start = bodyJson.lastIndexOf('{', i);
+        if (start < 0) return null;
+        int depth = 0;
+        boolean inStr = false, esc = false;
+        for (int j = start; j < bodyJson.length(); j++) {
+            char c = bodyJson.charAt(j);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') depth++;
+            if (c == '}') {
+                depth--;
+                if (depth == 0) return bodyJson.substring(start, j + 1);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 扫码登录 step 2: poll the ticket. Non-approved states pass through
+     * ({status}); on approved the engine immediately runs the QR login
+     * flow — persisting account.json via the same shape as password
+     * login — and answers restart_required so the shell restarts the
+     * engine under the new identity.
+     */
+    private void qrTicketPoll(HttpExchange ex, String ticketId, String secret) throws Exception {
+        if (secret == null || secret.isEmpty()) {
+            sendJson(ex, 400, "{\"ok\":false,\"error\":\"secret required\"}");
+            return;
+        }
+        String server = qrTicketServer != null ? qrTicketServer
+                : (r.acct != null ? r.acct.server : BackupReceiver.DEFAULT_SERVER);
+        AccountLink.ApiResult res;
+        try {
+            res = AccountLink.pcLoginTicketStatus(server, ticketId, secret);
+        } catch (Exception e) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\""
+                    + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
+            return;
+        }
+        if (res.status == 404 || res.status == 410) {
+            sendJson(ex, 200, "{\"ok\":true,\"status\":\"expired\"}");
+            return;
+        }
+        if (!res.ok()) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\"ticket poll HTTP "
+                    + res.status + "\"}");
+            return;
+        }
+        String st = MiniJson.str(res.body, "status");
+        if (st == null) st = "pending";
+        if (!"approved".equals(st)) {
+            sendJson(ex, 200, "{\"ok\":true,\"status\":\"" + MiniJson.esc(st) + "\"}");
+            return;
+        }
+        String creds = credsObject(res.body);
+        if (creds == null) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\"approved but no credentials\"}");
+            return;
+        }
+        try {
+            r.loadOrCreateKeys();
+            AccountLink.State state = AccountLink.qrLoginFlow(
+                    r.dataDir, r.store, server, creds, null);
+            r.acct = state;
+            r.accountMode = true;
+            qrTicketServer = null;
+            BackupReceiver.log("control API: QR login ok for " + state.account
+                    + " (user " + state.userId + "); engine restart required");
+            sendJson(ex, 200, "{\"ok\":true,\"status\":\"approved\",\"restart_required\":true"
+                    + ",\"user_id\":\"" + MiniJson.esc(state.userId)
+                    + "\",\"account\":\"" + MiniJson.esc(state.account)
+                    + "\",\"network\":\"" + MiniJson.esc(state.networkName) + "\"}");
+        } catch (Exception e) {
+            sendJson(ex, 502, "{\"ok\":false,\"error\":\""
+                    + MiniJson.esc(String.valueOf(e.getMessage())) + "\"}");
         }
     }
 

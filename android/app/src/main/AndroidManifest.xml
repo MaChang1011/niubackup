@@ -25,6 +25,9 @@
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
+    <!-- QR scan login (design v1.4): camera only while the scan screen is open -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -48,6 +51,9 @@
             android:name=".AccountActivity"
             android:exported="false"
             android:launchMode="singleTop" />
+        <activity
+            android:name=".QrScanActivity"
+            android:exported="false" />
         <activity
             android:name=".PlayerActivity"
             android:exported="false" />

@@ -77,6 +77,7 @@ class BackupVpnService : VpnService() {
                 // error paths below: they promote first, then fail gracefully
                 // with a log line and stopSelf — never a crash.
                 promoteBoot()
+                MeshState.markStarting()
                 val fullConfig = intent?.getStringExtra(EXTRA_CONFIG)
                 if (!fullConfig.isNullOrBlank()) {
                     if (!running) {
@@ -130,6 +131,7 @@ class BackupVpnService : VpnService() {
             // reports): UI shows the capped form, logcat keeps it all.
             AppLog.logEngineError(err)
             running = false
+            MeshState.markFailed("组网核心启动失败")
             demoteAndStop()
             return
         }
@@ -146,6 +148,7 @@ class BackupVpnService : VpnService() {
         } catch (t: Throwable) {
             AppLog.log("建立 TUN 失败: ${t.message}")
             running = false
+            MeshState.markFailed("建立 TUN 失败")
             EasyTierBridge.stopInstance()
             demoteAndStop()
             return
@@ -153,6 +156,7 @@ class BackupVpnService : VpnService() {
         if (pfd == null) {
             AppLog.log("建立 TUN 失败: establish() 返回 null")
             running = false
+            MeshState.markFailed("建立 TUN 失败")
             EasyTierBridge.stopInstance()
             demoteAndStop()
             return
@@ -162,8 +166,10 @@ class BackupVpnService : VpnService() {
         val fdErr = EasyTierBridge.setTunFd(instanceName, pfd.fd)
         if (fdErr.isNotEmpty()) {
             AppLog.logEngineError(fdErr)
+            MeshState.markFailed("组网通道建立失败")
         } else {
             AppLog.log("TUN fd 已交给 EasyTier (fd=${pfd.fd})，组网通道建立")
+            MeshState.markUp()
         }
         val infos = EasyTierBridge.collectInfos()
         if (infos.isNotBlank()) {
@@ -180,11 +186,17 @@ class BackupVpnService : VpnService() {
         }
         tun = null
         EasyTierBridge.stopInstance()
+        MeshState.markOff()
         AppLog.log("组网已停止")
     }
 
     override fun onRevoke() {
+        // Another VPN app (e.g. FlClash) took the single Android VPN
+        // slot. Record WHY, so the status pill can say so instead of
+        // the mesh silently vanishing (design: 冲突时状态显示失败原因）.
         stopMesh()
+        MeshState.markFailed("VPN 已被其他应用占用（如 FlClash），请先关闭它再打开牛备")
+        AppLog.log("VPN 被系统撤销：另一个 VPN 应用接管了通道")
         stopSelf()
         super.onRevoke()
     }

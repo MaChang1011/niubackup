@@ -91,13 +91,28 @@ class LibraryActivity : Activity() {
     private lateinit var safetyCard: LinearLayout
     private lateinit var safetyText: TextView
     private lateinit var gridView: GridView
-    private var items: List<Item> = emptyList()
+    private lateinit var prevPageBtn: Button
+    private lateinit var nextPageBtn: Button
+    private lateinit var pageLabel: TextView
+
+    /** The current page's items — the ONLY items the grid renders
+     *  (design v1.3 pagination: 48/page). */
+    private var pageItems: List<Item> = emptyList()
+    private var pageIndex = 0
+    private var totalCount = 0
 
     /** Latest snapshot of the local file index (see [FileIndexDb]). */
     @Volatile
     private var indexRows: Map<String, FileIndexDb.Row> = emptyMap()
     private var receipts: Map<String, ReceiptStore.ReceiptFile> = emptyMap()
+    private var lastLiveMap: Map<String, FsClient.Record> = emptyMap()
     private val selected = HashSet<String>()
+
+    /** Item snapshots for everything in [selected], kept across pages:
+     *  the selection set is global by path (design v1.3: 分页不清空选择）,
+     *  and the selection bar / free-up flow read counts from here, not
+     *  from the currently rendered page. */
+    private val selectionInfo = HashMap<String, Item>()
     private val downloadPct = HashMap<String, Int>()
     private val durations = HashMap<String, Long>()
     private var liveOk: Boolean = false
@@ -133,6 +148,7 @@ class LibraryActivity : Activity() {
                 isClickable = true
                 setOnClickListener {
                     selected.clear()
+                    selectionInfo.clear()
                     (gridView.adapter as BaseAdapter).notifyDataSetChanged()
                     updateSelectionUi()
                 }
@@ -201,6 +217,7 @@ class LibraryActivity : Activity() {
                 val item = visibleItems()[pos]
                 if (item.status == Status.BACKED) {
                     selected += item.path
+                    selectionInfo[item.path] = item
                     (adapter as BaseAdapter).notifyDataSetChanged()
                     updateSelectionUi()
                     true
@@ -242,6 +259,35 @@ class LibraryActivity : Activity() {
             gridWrap,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
+
+        // ---- pager (design v1.3: bottom-persistent 上一页 / 页码 / 下一页，
+        // explicit pages — never infinite scroll)
+        val pager = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 4),
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 4)
+            )
+        }
+        prevPageBtn = Ui.ghostButton(this, "上一页").apply {
+            setOnClickListener { turnPage(-1) }
+        }
+        pager.addView(prevPageBtn)
+        pageLabel = TextView(this).apply {
+            text = "第 1 / 1 页"
+            textSize = 12f
+            setTextColor(Ui.SLATE)
+            gravity = Gravity.CENTER
+        }
+        pager.addView(pageLabel, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+        ))
+        nextPageBtn = Ui.ghostButton(this, "下一页").apply {
+            setOnClickListener { turnPage(1) }
+        }
+        pager.addView(nextPageBtn)
+        col.addView(pager)
 
         // ---- 释放安全 card (mandatory before delete; mockup)
         safetyCard = Ui.cardBlock(this) {
@@ -308,10 +354,13 @@ class LibraryActivity : Activity() {
         for (f in Filter.values()) {
             val chip = Ui.filterChip(this, f.label, f == filterMode)
             chip.setOnClickListener {
-                filterMode = f
-                buildChips()
-                (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-                updateCount()
+                if (filterMode != f) {
+                    filterMode = f
+                    // Design rule: a filter change returns to page 1.
+                    pageIndex = 0
+                    buildChips()
+                    refresh()
+                }
             }
             chipsRow.addView(chip, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -319,17 +368,36 @@ class LibraryActivity : Activity() {
         }
     }
 
-    private fun visibleItems(): List<Item> = when (filterMode) {
-        Filter.ALL -> items
-        Filter.PHOTO -> items.filter { MediaStoreHelper.isImageName(nameOf(it)) }
-        Filter.VIDEO -> items.filter { MediaStoreHelper.isVideoName(nameOf(it)) }
-        Filter.NOT_BACKED -> items.filter { it.status == Status.NOT_BACKED }
-    }
+    /** The grid's data source: the current page only (design v1.3). */
+    private fun visibleItems(): List<Item> = pageItems
 
     private fun nameOf(item: Item): String = item.path.substringAfterLast('/')
 
     private fun updateCount() {
-        countView.text = "${visibleItems().size} 项"
+        countView.text = "$totalCount 项"
+    }
+
+    private fun totalPages(): Int =
+        if (totalCount <= 0) 1 else (totalCount + PAGE_SIZE - 1) / PAGE_SIZE
+
+    private fun renderPager() {
+        pageLabel.text = "第 ${pageIndex + 1} / ${totalPages()} 页"
+        prevPageBtn.isEnabled = pageIndex > 0
+        nextPageBtn.isEnabled = pageIndex < totalPages() - 1
+    }
+
+    private fun turnPage(delta: Int) {
+        val target = (pageIndex + delta).coerceIn(0, totalPages() - 1)
+        if (target == pageIndex) return
+        pageIndex = target
+        // Recompute just this page from the cached sources (index SQL
+        // page + last receipts/live snapshots) — no rescan, no refetch.
+        thread(name = "library-page") {
+            val data = computePage(FileIndexDb.get(this), receipts, lastLiveMap)
+            main.post {
+                applyPage(data)
+            }
+        }
     }
 
     // ---------------------------------------------------------------- data
@@ -364,16 +432,12 @@ class LibraryActivity : Activity() {
             var rerun = false
             try {
                 val db = FileIndexDb.get(this)
-                val rows0 = db.loadAll()
                 val receipts0 = ReceiptStore.loadMerged(filesDir)
-                val first = buildItems(rows0, receipts0, emptyMap())
+                val first = computePage(db, receipts0, emptyMap())
                 main.post {
-                    indexRows = rows0
                     receipts = receipts0
-                    items = first
-                    emptyView.visibility = if (first.isEmpty()) View.VISIBLE else View.GONE
-                    (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-                    updateCount()
+                    lastLiveMap = emptyMap()
+                    applyPage(first)
                 }
                 refreshDiff(db)
             } finally {
@@ -385,6 +449,79 @@ class LibraryActivity : Activity() {
                 if (rerun) refresh()
             }
         }
+    }
+
+    private class PageData(val total: Int, val items: List<Item>)
+
+    /**
+     * Compute the current page for the active filter (design v1.3).
+     *
+     * 全部/照片/视频 page through the index in SQL (COUNT + LIMIT/OFFSET,
+     * path order — the same order the old full merge produced), merging
+     * backup state for just those rows; 仅PC有 items sort after all
+     * locals and fill the tail pages. 未备份 is the one exception: its
+     * backed-ness is a three-source merge (index + receipts + live
+     * LIST), so its candidate list is merged in memory and the page
+     * window is cut from it — rendering is still page-bounded (48).
+     */
+    private fun computePage(
+        db: FileIndexDb,
+        receiptsMap: Map<String, ReceiptStore.ReceiptFile>,
+        liveMap: Map<String, FsClient.Record>
+    ): PageData {
+        if (filterMode == Filter.NOT_BACKED) {
+            val merged = buildItems(db.loadAll(), receiptsMap, liveMap)
+            val nb = merged.filter { it.status == Status.NOT_BACKED }
+            return PageData(nb.size, pageSlice(nb))
+        }
+        val kind = when (filterMode) {
+            Filter.PHOTO -> FileIndexDb.Kind.IMAGE
+            Filter.VIDEO -> FileIndexDb.Kind.VIDEO
+            else -> FileIndexDb.Kind.ALL
+        }
+        val localTotal = db.count(kind)
+        val localPaths = db.loadAllPaths()
+        val pcOnly = buildPcOnlyItems(receiptsMap, liveMap, localPaths)
+        val total = localTotal + pcOnly.size
+        val pages = if (total <= 0) 1 else (total + PAGE_SIZE - 1) / PAGE_SIZE
+        if (pageIndex > pages - 1) pageIndex = pages - 1
+        if (pageIndex < 0) pageIndex = 0
+        val start = pageIndex * PAGE_SIZE
+        val out = ArrayList<Item>(PAGE_SIZE)
+        if (start < localTotal) {
+            val rows = db.loadPage(kind, PAGE_SIZE, start)
+            val byPath = LinkedHashMap<String, FileIndexDb.Row>()
+            for (r in rows) byPath[r.path] = r
+            out += buildLocalItems(byPath, receiptsMap, liveMap)
+        }
+        if (out.size < PAGE_SIZE) {
+            val pcStart = maxOf(0, start - localTotal)
+            if (pcStart < pcOnly.size) {
+                out += pcOnly.subList(
+                    pcStart, minOf(pcOnly.size, pcStart + (PAGE_SIZE - out.size))
+                )
+            }
+        }
+        return PageData(total, out)
+    }
+
+    private fun pageSlice(list: List<Item>): List<Item> {
+        val pages = if (list.isEmpty()) 1 else (list.size + PAGE_SIZE - 1) / PAGE_SIZE
+        if (pageIndex > pages - 1) pageIndex = pages - 1
+        if (pageIndex < 0) pageIndex = 0
+        val start = pageIndex * PAGE_SIZE
+        if (start >= list.size) return emptyList()
+        return list.subList(start, minOf(list.size, start + PAGE_SIZE))
+    }
+
+    /** Render one computed page (main thread). */
+    private fun applyPage(data: PageData) {
+        totalCount = data.total
+        pageItems = data.items
+        emptyView.visibility = if (data.total == 0) View.VISIBLE else View.GONE
+        (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+        updateCount()
+        renderPager()
     }
 
     /** Phase 2 of [refresh]: metadata diff + live merge + final render. */
@@ -442,20 +579,20 @@ class LibraryActivity : Activity() {
             db.applyPcRecords(live)
         }
         val rows = db.loadAll()
-        val merged = buildItems(rows, mergedReceipts, liveMap)
+        val page = computePage(db, mergedReceipts, liveMap)
         main.post {
-            items = merged
             receipts = mergedReceipts
             indexRows = rows
             liveOk = live != null
             liveByPath = liveMap
-            selected.retainAll(merged.filter { it.status == Status.BACKED }.map { it.path })
-            // The status line reports only the connection state; the
-            // empty case is the centered overlay over the grid area.
-            emptyView.visibility = if (merged.isEmpty()) View.VISIBLE else View.GONE
+            lastLiveMap = liveMap
+            // Selection survives paging (global by path); prune only
+            // entries whose file vanished from every source.
+            val alive = rows.keys + mergedReceipts.keys + liveMap.keys
+            selected.retainAll(alive)
+            selectionInfo.keys.retainAll(alive)
             statusView.text = if (liveOk) "电脑记录为实时" else "电脑离线（按回执判断）"
-            (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-            updateCount()
+            applyPage(page)
             updateSelectionUi()
         }
     }
@@ -473,13 +610,19 @@ class LibraryActivity : Activity() {
         rows: Map<String, FileIndexDb.Row>,
         receiptsMap: Map<String, ReceiptStore.ReceiptFile>,
         liveMap: Map<String, FsClient.Record>
+    ): List<Item> = buildLocalItems(rows, receiptsMap, liveMap) +
+        buildPcOnlyItems(receiptsMap, liveMap, rows.keys)
+
+    /** Local half of the merge (also used per-page by [computePage]). */
+    private fun buildLocalItems(
+        rows: Map<String, FileIndexDb.Row>,
+        receiptsMap: Map<String, ReceiptStore.ReceiptFile>,
+        liveMap: Map<String, FsClient.Record>
     ): List<Item> {
         val backedShas = HashSet<String>()
         for (rf in receiptsMap.values) backedShas += rf.sha256
         val merged = ArrayList<Item>()
-        val localPaths = HashSet<String>()
         for ((path, row) in rows) {
-            localPaths += path
             val rf = receiptsMap[path]
             val live = liveMap[path]
             val receiptHit = row.receiptVerified && rf != null && rf.size == row.size &&
@@ -497,17 +640,27 @@ class LibraryActivity : Activity() {
                 liveIntegrity = live?.integrity ?: row.pcIntegrity
             )
         }
+        return merged
+    }
+
+    /** PC-only half of the merge: in receipts / live LIST, not on the phone. */
+    private fun buildPcOnlyItems(
+        receiptsMap: Map<String, ReceiptStore.ReceiptFile>,
+        liveMap: Map<String, FsClient.Record>,
+        localPaths: Set<String>
+    ): List<Item> {
         val pcOnlyPaths = (receiptsMap.keys + liveMap.keys).filter { it !in localPaths }
+        val out = ArrayList<Item>()
         for (p in pcOnlyPaths.sorted()) {
             val rec = liveMap[p]
             val rf = receiptsMap[p]
-            merged += Item(
+            out += Item(
                 p, rec?.size ?: rf?.size ?: -1, rec?.sha256 ?: rf?.sha256,
                 local = false, status = Status.PC_ONLY,
                 receiptVerified = rf != null, liveIntegrity = rec?.integrity
             )
         }
-        return merged
+        return out
     }
 
     /**
@@ -530,7 +683,7 @@ class LibraryActivity : Activity() {
     private fun applyProgressBadges() {
         if (!BackupProgress.active) return
         var changed = false
-        for (it in items) {
+        for (it in pageItems) {
             if (it.local && it.path == BackupProgress.currentPath &&
                 it.status != Status.BACKED
             ) {
@@ -551,7 +704,9 @@ class LibraryActivity : Activity() {
         selBar.visibility = if (selecting) View.VISIBLE else View.GONE
         safetyCard.visibility = if (selecting) View.VISIBLE else View.GONE
         if (!selecting) return
-        val chosen = items.filter { it.path in selected }
+        // Counts come from the cross-page selection snapshots, not the
+        // rendered page (design v1.3: 选择跨页保留已选计数）.
+        val chosen = selectionInfo.values.toList()
         val verified = chosen.count { c -> receiptVouches(c) }
         val bytes = chosen.sumOf { it.size }
         selCount.text = "已选 ${chosen.size} 项"
@@ -566,7 +721,12 @@ class LibraryActivity : Activity() {
             // the player. Leaving selection mode stays as it was: clear
             // the selection via 取消 in the selection bar.
             if (item.status == Status.BACKED) {
-                if (!selected.add(item.path)) selected.remove(item.path)
+                if (!selected.add(item.path)) {
+                    selected.remove(item.path)
+                    selectionInfo.remove(item.path)
+                } else {
+                    selectionInfo[item.path] = item
+                }
                 (gridView.adapter as BaseAdapter).notifyDataSetChanged()
                 updateSelectionUi()
             }
@@ -716,7 +876,10 @@ class LibraryActivity : Activity() {
     // ------------------------------------------------------------ §6.4 flow
 
     private fun startFreeUpSpace() {
-        val candidates = items.filter { it.status == Status.BACKED && it.path in selected }
+        // Candidates come from the cross-page selection snapshots.
+        val candidates = selectionInfo.values
+            .filter { it.status == Status.BACKED && it.path in selected }
+            .sortedBy { it.path }
         if (candidates.isEmpty()) {
             Toast.makeText(this, "先点选标有「已备份」的文件", Toast.LENGTH_SHORT).show()
             return
@@ -807,7 +970,8 @@ class LibraryActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_DELETE) {
-            val files = items.filter { it.path in selected && it.status == Status.BACKED }
+            val files = selectionInfo.values
+                .filter { it.path in selected && it.status == Status.BACKED }
                 .map { File(dcimDir(), it.path) }
             reportDeleteResult(files)
         }
@@ -821,6 +985,7 @@ class LibraryActivity : Activity() {
             Toast.LENGTH_LONG
         ).show()
         selected.clear()
+        selectionInfo.clear()
         refresh()
     }
 
@@ -1082,5 +1247,8 @@ class LibraryActivity : Activity() {
 
     companion object {
         private const val REQ_DELETE = 4711
+
+        /** Design v1.3: library pages hold 48 items (6,269 ≈ 131 pages). */
+        const val PAGE_SIZE = 48
     }
 }

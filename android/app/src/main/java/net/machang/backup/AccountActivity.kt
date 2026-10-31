@@ -27,6 +27,7 @@ import kotlin.concurrent.thread
 class AccountActivity : Activity() {
 
     companion object {
+        private const val REQ_VPN = 1003
         private const val PREFS = "settings"
         private const val KEY_SECRET = "mesh_secret"
         private const val KEY_USER_ID = "v2_user_id"
@@ -37,7 +38,6 @@ class AccountActivity : Activity() {
         private const val KEY_PC_PORT = "pc_port"
     }
 
-    private lateinit var serverInput: EditText
     private lateinit var accountInput: EditText
     private lateinit var passwordInput: EditText
     private lateinit var loginButtons: LinearLayout
@@ -47,6 +47,8 @@ class AccountActivity : Activity() {
     private lateinit var sessionPillSlot: LinearLayout
     private lateinit var pairingPillSlot: LinearLayout
     private lateinit var deviceInfo: TextView
+    private lateinit var netStateValue: TextView
+    private lateinit var serverAddrValue: TextView
     private lateinit var secretInput: EditText
     private lateinit var userIdInput: EditText
     private lateinit var deviceIdInput: EditText
@@ -60,7 +62,6 @@ class AccountActivity : Activity() {
         buildUi()
 
         val p = prefs()
-        serverInput.setText(p.getString(KEY_SERVER_URL, "http://36.133.114.164:18090"))
         accountInput.setText(p.getString(KEY_ACCOUNT, ""))
         secretInput.setText(p.getString(KEY_SECRET, ""))
         userIdInput.setText(p.getString(KEY_USER_ID, ""))
@@ -75,7 +76,96 @@ class AccountActivity : Activity() {
 
     override fun onPause() {
         persistSettings()
+        netHandler.removeCallbacks(netPoller)
         super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::netStateValue.isInitialized) {
+            netHandler.post(netPoller)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_VPN) {
+            if (resultCode == RESULT_OK) {
+                MeshAuto.start(this)
+            } else {
+                MeshState.markFailed("未授予 VPN 权限")
+                AppLog.log("VPN 权限被拒绝，组网未启动")
+            }
+        }
+    }
+
+    private val netHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val netPoller = object : Runnable {
+        override fun run() {
+            refreshNetStatus()
+            netHandler.postDelayed(this, 2000)
+        }
+    }
+
+    /** 网络状态 row: shared MeshState + live route cost, same wording as
+     *  the home page pill. Route cost is a JNI call — off-thread. */
+    private fun refreshNetStatus() {
+        if (!::netStateValue.isInitialized) return
+        serverAddrValue.text = PcConn.serverUrl(this)
+        thread(name = "net-status") {
+            val direct = try {
+                EasyTierBridge.peerRouteCost(PcConn.pcHost(this@AccountActivity)) == 1
+            } catch (t: Throwable) {
+                false
+            }
+            runOnUiThread {
+                if (isFinishing || !::netStateValue.isInitialized) return@runOnUiThread
+                netStateValue.text = when {
+                    direct -> "已连接 · 直连"
+                    MeshState.phase == MeshState.Phase.FAILED ->
+                        "失败：${MeshState.failureReason ?: "未知原因"}"
+                    MeshState.phase == MeshState.Phase.STARTING -> "组网中…"
+                    MeshState.phase == MeshState.Phase.UP -> "已组网 · 等待直连"
+                    else -> "未连接"
+                }
+            }
+        }
+    }
+
+    /** The inconspicuous server-address edit path (design v1.4: the
+     *  field leaves the main UI; support can still change it by
+     *  long-pressing the read-only 服务地址 row). */
+    private fun onEditServerAddress() {
+        val input = EditText(this).apply {
+            setText(PcConn.serverUrl(this@AccountActivity))
+            setSingleLine(true)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("账号服务地址")
+            .setMessage("地址由账号服务下发，一般无需修改。改错将无法登录。")
+            .setView(input)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存") { _, _ ->
+                val v = input.text.toString().trim()
+                if (v.isEmpty()) {
+                    prefs().edit().remove(KEY_SERVER_URL).apply()
+                } else {
+                    prefs().edit().putString(KEY_SERVER_URL, v).apply()
+                }
+                serverAddrValue.text = PcConn.serverUrl(this)
+                AppLog.log("账号服务地址已更新为 ${PcConn.serverUrl(this)}")
+            }
+            .show()
+    }
+
+    private fun onScanPcLogin() {
+        if (!SessionRestore.hasStoredSession(this)) {
+            android.widget.Toast.makeText(
+                this, "请先登录账号，再用扫码登录电脑", android.widget.Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        startActivity(android.content.Intent(this, QrScanActivity::class.java))
     }
 
     /** Tab switches are instant in both directions (see [Ui.navBar]). */
@@ -86,9 +176,11 @@ class AccountActivity : Activity() {
     }
 
     private fun persistSettings() {
-        if (!::serverInput.isInitialized) return
+        if (!::accountInput.isInitialized) return
+        // NOTE: server_url is deliberately NOT written here anymore —
+        // the address left the main UI (design v1.4); it changes only
+        // through the long-press editor on the read-only 服务地址 row.
         prefs().edit()
-            .putString(KEY_SERVER_URL, serverInput.text.toString().trim())
             .putString(KEY_ACCOUNT, accountInput.text.toString().trim())
             .putString(KEY_SECRET, secretInput.text.toString().trim())
             .putString(KEY_USER_ID, userIdInput.text.toString().trim())
@@ -171,7 +263,7 @@ class AccountActivity : Activity() {
             AppLog.log("请填写账号和密码")
             return
         }
-        val server = serverInput.text.toString().trim()
+        val server = PcConn.serverUrl(this)
         AppLog.log(if (register) "正在注册…" else "正在登录…")
         thread(name = "account") {
             try {
@@ -224,7 +316,12 @@ class AccountActivity : Activity() {
                     if (valid) "配对状态: 已批准，可以备份" else "配对状态: $reason" +
                         if (reason == "not_approved") "（等待电脑端批准）" else ""
                 )
-                runOnUiThread { updateAccountStatus() }
+                runOnUiThread {
+                    updateAccountStatus()
+                    // 登录成功即自动组网 (design v1.2): provisioning just
+                    // landed, so the mesh can come up right away.
+                    MeshAuto.ensure(this@AccountActivity, REQ_VPN)
+                }
             } catch (t: Throwable) {
                 AppLog.log("账号操作失败: ${t.message}")
             }
@@ -239,7 +336,7 @@ class AccountActivity : Activity() {
             setSlotPill(pairingPillSlot, "配对: 未注册", Ui.StatusKind.NONE)
             return
         }
-        val server = serverInput.text.toString().trim()
+        val server = PcConn.serverUrl(this)
         thread(name = "pairing") {
             try {
                 val (valid, reason) = AccountClient(server).validate(deviceId, token)
@@ -275,7 +372,7 @@ class AccountActivity : Activity() {
         // the refresh token to /api/auth/logout kills the stored session
         // pair on the server too, not just on this phone.
         val refresh = SecureStore.get(this, SecureStore.KEY_REFRESH_TOKEN)
-        val server = serverInput.text.toString().trim()
+        val server = PcConn.serverUrl(this)
         if (refresh != null) {
             thread(name = "logout") { AccountClient(server).logout(refresh) }
         }
@@ -299,6 +396,52 @@ class AccountActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         )
+        // ---- 扫码登录电脑 (design v1.4: FIRST row of 我的， brand-tinted,
+        // pinned top — the high-frequency shortcut for a second device)
+        val scanCard = Ui.cardBlock(this) {
+            val row = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = Ui.rounded(this@AccountActivity, Ui.BRAND_50, Ui.R_TILE)
+                setPadding(
+                    Ui.dp(this@AccountActivity, 10), Ui.dp(this@AccountActivity, 8),
+                    Ui.dp(this@AccountActivity, 12), Ui.dp(this@AccountActivity, 8)
+                )
+                isClickable = true
+                setOnClickListener { onScanPcLogin() }
+            }
+            row.addView(Ui.brandTile(this@AccountActivity, 36))
+            val texts = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(Ui.dp(this@AccountActivity, 10), 0, 0, 0)
+            }
+            texts.addView(TextView(this@AccountActivity).apply {
+                text = "扫码登录电脑"
+                textSize = 14f
+                typeface = Ui.font(800)
+                setTextColor(Ui.BRAND_800)
+            })
+            texts.addView(TextView(this@AccountActivity).apply {
+                text = "用手机扫码，免输密码登录电脑端"
+                textSize = 11f
+                setTextColor(Ui.SLATE)
+            })
+            row.addView(
+                texts,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            row.addView(TextView(this@AccountActivity).apply {
+                text = "›"
+                textSize = 18f
+                setTextColor(Ui.BRAND_600)
+            })
+            addView(row)
+        }
+        scanCard.setPadding(
+            Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10)
+        )
+        col.addView(scanCard)
+
         // ---- profile card (mockup): avatar + account + pills
         col.addView(Ui.cardBlock(this) {
             val row = LinearLayout(this@AccountActivity).apply {
@@ -345,19 +488,11 @@ class AccountActivity : Activity() {
             addView(pills)
         })
 
-        // ---- account form card
+        // ---- account form card (v1.4: the server-address field left
+        // the main UI — address comes from the account service record;
+        // the read-only row lives in the 设备与配对 card below)
         col.addView(Ui.cardBlock(this) {
             addView(Ui.sectionTitle(this@AccountActivity, "账号"))
-            serverInput = Ui.field(this@AccountActivity, "账号服务地址")
-            addView(serverInput, Ui.spaced(Ui.matchWrap(), 2, this@AccountActivity))
-            addView(
-                Ui.subText(
-                    this@AccountActivity,
-                    "说明：默认是公网服务地址，未组网也能登录（测试期为明文 HTTP，" +
-                        "正式版将换成域名 + HTTPS）。"
-                ),
-                Ui.spaced(Ui.matchWrap(), 4, this@AccountActivity)
-            )
             accountInput = Ui.field(this@AccountActivity, "账号")
             addView(accountInput, Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity))
             passwordInput = Ui.field(this@AccountActivity, "密码", password = true)
@@ -380,12 +515,27 @@ class AccountActivity : Activity() {
             addView(loginButtons, Ui.spaced(Ui.matchWrap(), 10, this@AccountActivity))
         })
 
-        // ---- device & pairing card
+        // ---- device & pairing card (+ read-only 网络状态 rows, v1.4)
         col.addView(Ui.cardBlock(this) {
             addView(Ui.sectionTitle(this@AccountActivity, "设备与配对"))
             deviceInfo = Ui.bodyText(this@AccountActivity)
             deviceInfo.textSize = 13f
             addView(deviceInfo)
+            addView(Ui.hairline(this@AccountActivity),
+                Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity))
+            netStateValue = Ui.kvValue(this@AccountActivity, "未连接")
+            addView(Ui.kvRow(this@AccountActivity, "网络状态", netStateValue))
+            serverAddrValue = Ui.kvValue(this@AccountActivity, PcConn.serverUrl(this@AccountActivity))
+            val addrRow = Ui.kvRow(this@AccountActivity, "服务地址", serverAddrValue)
+            addrRow.setOnLongClickListener {
+                onEditServerAddress()
+                true
+            }
+            addView(addrRow)
+            addView(
+                Ui.subText(this@AccountActivity, "服务地址由账号服务下发，一般无需修改（长按可改）。"),
+                Ui.spaced(Ui.matchWrap(), 2, this@AccountActivity)
+            )
             addView(Ui.ghostButton(this@AccountActivity, "刷新配对状态").apply {
                 setOnClickListener { onRefreshPairing() }
             }, Ui.spaced(Ui.matchWrap(), 10, this@AccountActivity))

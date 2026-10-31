@@ -155,6 +155,50 @@ h1, h2 { margin: 0; font-weight: 600; }
 .login-err { color: var(--red); font-size: 13px; min-height: 0; text-align: center; }
 .login-err:not(:empty) { min-height: 18px; }
 
+/* login tabs + QR pane (design v1.4) */
+.login-tabs {
+  display: flex; gap: 4px; background: var(--mist, #eef4f5); border-radius: 10px; padding: 4px;
+}
+.login-tab {
+  flex: 1; border: 0; background: transparent; cursor: pointer; padding: 8px 0;
+  font-size: 14px; color: var(--ink-sub); border-radius: 8px; font-family: inherit;
+}
+.login-tab.active { background: #fff; color: var(--ink); font-weight: 600; box-shadow: 0 1px 4px rgba(10,60,70,.12); }
+.qr-box {
+  align-self: center; width: 212px; height: 212px; background: #fff;
+  border: 1px solid var(--line); border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.qr-hint { color: var(--slate); font-size: 13px; }
+.qr-status { text-align: center; font-size: 13.5px; color: var(--ink); min-height: 19px; }
+.qr-count { text-align: center; font-size: 12px; color: var(--accent-deep, #c77400); min-height: 16px; }
+#qrPane { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+#qrPane .btn { align-self: center; }
+#loginCard { display: flex; flex-direction: column; gap: 12px; margin: 0; }
+#loginCard[hidden] { display: none; }
+
+/* sidebar license pill (v1.5: window-wide identity line) */
+.license-pill {
+  align-self: flex-start; background: rgba(30,158,102,.18); color: #7fd6ab;
+  border: 1px solid rgba(30,158,102,.35); font-size: 11.5px; font-weight: 600;
+  border-radius: 999px; padding: 3px 10px; margin: 0 4px;
+}
+
+/* devices page note */
+.sec-note { color: var(--slate); font-size: 12.5px; margin: 0; }
+
+/* records pager (design v1.3) */
+.pager {
+  display: flex; align-items: center; gap: 10px; padding: 10px 2px 0;
+}
+.pager-label { font-size: 13px; color: var(--ink-sub); min-width: 92px; text-align: center; }
+.pager-jump { margin-left: auto; font-size: 13px; color: var(--ink-sub); display: flex; align-items: center; gap: 6px; }
+.pager-jump input {
+  width: 56px; border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
+  font-size: 13px; outline: none; background: #fbfdfd; color: var(--ink); font-family: inherit;
+}
+.pager-jump input:focus { border-color: var(--teal-600); background: #fff; }
+
 .fld { display: flex; flex-direction: column; gap: 6px; }
 .fld > span { font-size: 13px; color: var(--ink-sub); }
 .fld input[type="text"], .fld input[type="password"], .fld input[type="number"] {
