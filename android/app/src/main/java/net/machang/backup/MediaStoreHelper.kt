@@ -87,6 +87,48 @@ object MediaStoreHelper {
         return uri
     }
 
+    /** One DCIM file's metadata (path relative to the DCIM root). */
+    data class DcMeta(val relPath: String, val size: Long, val mtimeMs: Long)
+
+    /**
+     * Metadata-only listing of everything MediaStore has indexed under
+     * [dcimRoot] (recursive): relative path, size, modification time.
+     * Used by the library page's freshness diff against the local file
+     * index — it reads NO file content and computes NO hashes.
+     * DATE_MODIFIED is seconds per the MediaStore contract.
+     */
+    fun listDcimMetadata(ctx: Context, dcimRoot: File): List<DcMeta> {
+        val prefix = dcimRoot.absolutePath.trimEnd('/') + "/"
+        val out = LinkedHashMap<String, DcMeta>()
+        val projection = arrayOf(
+            MediaStore.MediaColumns.DATA,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.DATE_MODIFIED
+        )
+        for (base in collections()) {
+            try {
+                ctx.contentResolver.query(base, projection, null, null, null)?.use { c ->
+                    val di = c.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    val si = c.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                    val mi = c.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)
+                    if (di < 0) return@use
+                    while (c.moveToNext()) {
+                        val abs = c.getString(di) ?: continue
+                        if (!abs.startsWith(prefix)) continue
+                        val rel = abs.substring(prefix.length)
+                        val size = if (si >= 0 && !c.isNull(si)) c.getLong(si) else -1L
+                        val mtimeMs =
+                            if (mi >= 0 && !c.isNull(mi)) c.getLong(mi) * 1000L else 0L
+                        out[rel] = DcMeta(rel, size, mtimeMs)
+                    }
+                }
+            } catch (t: Throwable) {
+                // One collection unavailable on this device; others count.
+            }
+        }
+        return out.values.toList()
+    }
+
     fun isVideoName(name: String): Boolean {
         val n = name.lowercase()
         return n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".mkv") ||

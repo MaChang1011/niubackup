@@ -330,7 +330,11 @@ class MainActivity : Activity() {
                 BackupClient(
                     logger, filesDir, identity.userId, identity.deviceId, identity.token,
                     IntSupplier { EasyTierBridge.peerRouteCost(host) }
-                )
+                ).apply {
+                    // Feed the library page's local file index as the
+                    // session runs (metadata / backed / receipt events).
+                    setIndexSink(FileIndexDb.sink(this@MainActivity))
+                }
             } else {
                 BackupClient(logger, filesDir)
             }

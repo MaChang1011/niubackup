@@ -64,6 +64,8 @@ class AutoBackupWorker(ctx: Context, params: WorkerParameters) :
             logger, ctx.filesDir, identity.userId, identity.deviceId, identity.token,
             IntSupplier { EasyTierBridge.peerRouteCost(host) }
         )
+        // Keep the library page's local file index fed from auto sessions too.
+        client.setIndexSink(FileIndexDb.sink(ctx))
         BackupProgress.begin()
         val failures = try {
             client.runBackup(

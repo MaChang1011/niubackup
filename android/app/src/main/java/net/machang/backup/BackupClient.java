@@ -89,6 +89,60 @@ public class BackupClient {
         void onProgress(long sentBytes, long totalBytes, String currentPath);
     }
 
+    /**
+     * Optional local file-index feed (the Android library page's SQLite
+     * index): the engine reports per-file metadata as it scans, confirmed
+     * backups as they land or are receiver-skipped, and the files of a
+     * signature-verified receipt when one arrives — so the library page
+     * can render backup state without ever hashing the library itself.
+     * Null (the default) disables the feed; the PC sender and v1-only
+     * clients never set one. Every call is guarded: a sink failure can
+     * never disturb a session.
+     */
+    public interface IndexSink {
+        /** One scanned file (sha256 null when unknown, e.g. stream-hash). */
+        void onMeta(String path, long size, long mtime, String sha256);
+        /** The PC holds this exact file (DONE, or receiver-skipped as
+         *  already stored); sha256 null when the session never learned it. */
+        void onBacked(String path, long size, long mtime, String sha256);
+        /** A file listed by a signature-verified session receipt. */
+        void onReceiptFile(String path, long size, String sha256);
+        /** Flush any buffered events (session end). */
+        void flush();
+    }
+
+    private volatile IndexSink indexSink;
+
+    /** Attach the local file-index feed (Android only; see IndexSink). */
+    public void setIndexSink(IndexSink sink) {
+        this.indexSink = sink;
+    }
+
+    private void sinkMeta(Entry e) {
+        IndexSink s = indexSink;
+        if (s == null) return;
+        String sha = (e.sha == null || e.sha.isEmpty()) ? null : e.sha;
+        try {
+            s.onMeta(e.path, e.size, e.mtime, sha);
+        } catch (Throwable ignore) { /* the index must never break a session */ }
+    }
+
+    private void sinkBacked(Entry e, String sha256) {
+        IndexSink s = indexSink;
+        if (s == null) return;
+        try {
+            s.onBacked(e.path, e.size, e.mtime, sha256);
+        } catch (Throwable ignore) { /* the index must never break a session */ }
+    }
+
+    private void sinkFlush() {
+        IndexSink s = indexSink;
+        if (s == null) return;
+        try {
+            s.flush();
+        } catch (Throwable ignore) { /* the index must never break a session */ }
+    }
+
     /** Stats of the most recent session (for the session-log report). */
     public volatile int lastOkCount;
     public volatile int lastFailCount;
@@ -334,6 +388,10 @@ public class BackupClient {
             Map<String, Long> wanted = readDecisions(in);
             int skipped = entries.size() - wanted.size();
             logger.log("接收端需要 " + wanted.size() + " 个文件，跳过 " + skipped + " 个");
+            for (Entry e : entries) {
+                // Not wanted = the receiver already holds this exact file.
+                if (!wanted.containsKey(e.path)) sinkBacked(e, e.sha);
+            }
 
             Map<String, Entry> byPath = new HashMap<>();
             for (Entry e : entries) byPath.put(e.path, e);
@@ -358,6 +416,7 @@ public class BackupClient {
                 String res = Wire.readLine(in);
                 if (res != null && res.startsWith("DONE")) {
                     okCount++;
+                    sinkBacked(e, e.sha);
                     logger.log("  已发送 " + e.path + " (" + bytes + " 字节，偏移 " + offset + ")");
                 } else {
                     failures++;
@@ -374,7 +433,9 @@ public class BackupClient {
             if (v2() && receipt != null && receipt.startsWith("RECEIPT ")) {
                 handleSignedReceipt(receipt.substring("RECEIPT ".length()));
             }
+            sinkFlush();
         } catch (IOException e) {
+            sinkFlush();
             logger.log("连接/传输失败: " + e.getMessage());
             return Math.max(failures, 1);
         }
@@ -471,6 +532,14 @@ public class BackupClient {
                 Map<String, Long> wanted = readDecisions(in);
                 int skippedHere = batch.size() - wanted.size();
                 receiverSkipped += skippedHere;
+                for (Entry e : batch) {
+                    // Not wanted = the receiver's stored copy matched this
+                    // (size, mtime) with integrity ok: it is backed up.
+                    // Stream-hash skips never reveal the stored sha.
+                    if (!wanted.containsKey(e.path)) {
+                        sinkBacked(e, streamHash ? null : e.sha);
+                    }
+                }
                 Map<String, Entry> byPath = new HashMap<>();
                 for (Entry e : batch) byPath.put(e.path, e);
                 for (Map.Entry<String, Long> w : wanted.entrySet()) {
@@ -535,6 +604,7 @@ public class BackupClient {
                                     + " 接收端=" + rsha + "，将通知接收端删除该副本");
                         } else {
                             okCount++;
+                            sinkBacked(e, streamHash ? rsha : e.sha);
                             logger.log("  已发送 " + e.path + " (" + bytes + " 字节，偏移 " + offset + ")"
                                     + (streamHash ? "，哈希校验一致" : ""));
                         }
@@ -568,11 +638,13 @@ public class BackupClient {
             if (receipt != null && receipt.startsWith("RECEIPT ")) {
                 handleSignedReceipt(receipt.substring("RECEIPT ".length()));
             }
+            sinkFlush();
             if (offered == 0) {
                 logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
                 return 0;
             }
         } catch (IOException e) {
+            sinkFlush();
             logger.log("连接/传输失败: " + e.getMessage());
             return Math.max(failures, 1);
         }
@@ -612,8 +684,24 @@ public class BackupClient {
             }
             // M4c: also keep the receipt in the generalized store — but only
             // a VERIFIED receipt may vouch for a file (§6.4 deletion gate).
-            if (valid) ReceiptStore.save(cacheDir, stored);
+            if (valid) {
+                ReceiptStore.save(cacheDir, stored);
+                // Feed the local file index: each receipt file pins its
+                // (path, size, sha256) as receipt-verified evidence.
+                IndexSink s = indexSink;
+                if (s != null) {
+                    try {
+                        for (String obj : ReceiptStore.arrayObjects(doc, "files")) {
+                            String p = MiniJson.str(obj, "path");
+                            String sha = MiniJson.str(obj, "sha256");
+                            long sz = MiniJson.num(obj, "size", -1);
+                            if (p != null && sha != null) s.onReceiptFile(p, sz, sha);
+                        }
+                    } catch (Throwable ignore) { /* index feed is best effort */ }
+                }
+            }
         }
+        sinkFlush();
     }
 
     static boolean verifyEcdsa(String payload, String sigB64, String pubB64) {
@@ -667,6 +755,7 @@ public class BackupClient {
                 logger.log("跳过无法读取的文件: " + path + " (" + ex.getMessage() + ")");
                 e = null;
             }
+            if (e != null) sinkMeta(e);
             done++;
             if (done % 200 == 0 || done == total) {
                 logger.log("扫描进度（元数据）: " + done + "/" + total);
@@ -712,6 +801,7 @@ public class BackupClient {
                 logger.log("跳过无法读取的文件: " + path + " (" + ex.getMessage() + ")");
                 e = null;
             }
+            if (e != null) sinkMeta(e);
             done++;
             if (done % 200 == 0 || done == total) {
                 logger.log("哈希进度: " + done + "/" + total

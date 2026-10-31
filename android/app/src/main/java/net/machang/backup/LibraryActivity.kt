@@ -32,11 +32,19 @@ import kotlin.concurrent.thread
  * 文件库 page (design §6.1 + approved mockup v1.1): DCIM as a thumbnail grid,
  * merged with backup state.
  *
+ * State comes from the local SQLite file index ([FileIndexDb]), which the
+ * backup engine feeds as sessions run; this page renders straight from the
+ * index (milliseconds) and refreshes it in the background with a
+ * metadata-only MediaStore diff — it NEVER scans or hashes DCIM content
+ * (the old scan-on-open hashed all ~6,300 files and wedged the page).
+ *
  * Every cell carries one of four badges, merged from three sources:
  *   未备份 — local file with no matching verified receipt / PC record;
  *   备份中 x% — the file a running session is currently sending;
- *   已备份 — local file whose sha256 appears in a signature-verified stored
- *             receipt or in the PC's live LIST with integrity ok;
+ *   已备份 — the index confirms the PC holds this (path, size, mtime), or a
+ *             signature-verified receipt / the PC's live LIST vouches for
+ *             it with matching size (and matching sha whenever a sha is
+ *             known — stream-hash sessions may never learn one);
  *   仅PC有 — in the receipts / PC records but no longer on the phone
  *             (restorable via §6.3 download-back, streamable via playback).
  *
@@ -84,6 +92,10 @@ class LibraryActivity : Activity() {
     private lateinit var safetyText: TextView
     private lateinit var gridView: GridView
     private var items: List<Item> = emptyList()
+
+    /** Latest snapshot of the local file index (see [FileIndexDb]). */
+    @Volatile
+    private var indexRows: Map<String, FileIndexDb.Row> = emptyMap()
     private var receipts: Map<String, ReceiptStore.ReceiptFile> = emptyMap()
     private val selected = HashSet<String>()
     private val downloadPct = HashMap<String, Int>()
@@ -167,7 +179,7 @@ class LibraryActivity : Activity() {
         buildChips()
 
         statusView = TextView(this).apply {
-            text = "正在扫描 DCIM 并合并备份状态…"
+            text = "正在读取本地文件索引…"
             textSize = 12f
             setTextColor(Ui.SLATE)
             setPadding(Ui.dp(this@LibraryActivity, 16), 2, Ui.dp(this@LibraryActivity, 16), 4)
@@ -325,81 +337,194 @@ class LibraryActivity : Activity() {
     private fun dcimDir(): File =
         Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
 
+    // Refresh coalescing: overlapping triggers (onCreate, onResume,
+    // post-download, post-delete) collapse into at most one extra pass.
+    private val refreshLock = Object()
+    private var refreshActive = false
+    private var refreshPending = false
+
+    /**
+     * Two-phase refresh, index-first:
+     *  1. Render immediately from the local file index + stored receipts
+     *     (a SQLite read — milliseconds, no DCIM walk at all).
+     *  2. In the background, freshen the index with a metadata-only
+     *     MediaStore diff, merge the live PC LIST when reachable, and
+     *     re-render. No content is read and no hash is computed anywhere
+     *     on this page.
+     */
     private fun refresh() {
-        statusView.text = "正在扫描 DCIM 并合并备份状态…"
+        synchronized(refreshLock) {
+            if (refreshActive) {
+                refreshPending = true
+                return
+            }
+            refreshActive = true
+        }
         thread(name = "library-refresh") {
-            val scanner = BackupClient(BackupClient.Logger { }, filesDir)
-            val localEntries = try {
-                scanner.scan(dcimDir())
-            } catch (t: Throwable) {
-                emptyList()
-            }
-            val mergedReceipts = ReceiptStore.loadMerged(filesDir)
-            val backedShas = HashSet<String>()
-            for (rf in mergedReceipts.values) backedShas += rf.sha256
-
-            var live: List<FsClient.Record>? = null
+            var rerun = false
             try {
-                val fs = PcConn.createFsClient(this)
-                if (fs != null) {
-                    fs.connect()
-                    live = fs.list()
-                    fs.close()
+                val db = FileIndexDb.get(this)
+                val rows0 = db.loadAll()
+                val receipts0 = ReceiptStore.loadMerged(filesDir)
+                val first = buildItems(rows0, receipts0, emptyMap())
+                main.post {
+                    indexRows = rows0
+                    receipts = receipts0
+                    items = first
+                    emptyView.visibility = if (first.isEmpty()) View.VISIBLE else View.GONE
+                    (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+                    updateCount()
                 }
-            } catch (t: Throwable) {
-                live = null
-            }
-            val liveMap = HashMap<String, FsClient.Record>()
-            if (live != null) {
-                RecordsCache.save(this, live)
-                for (r in live) liveMap[r.path] = r
-            }
-
-            val merged = ArrayList<Item>()
-            val localPaths = HashSet<String>()
-            for (e in localEntries) {
-                localPaths += e.path
-                val receiptHit = mergedReceipts[e.path]?.sha256 == e.sha
-                val liveHit = liveMap[e.path]?.let {
-                    it.sha256 == e.sha && "ok" == it.integrity
-                } == true
-                val shaHit = backedShas.contains(e.sha)
-                merged += Item(
-                    e.path, e.size, e.sha, local = true,
-                    status = if (receiptHit || liveHit || shaHit) {
-                        Status.BACKED
-                    } else {
-                        Status.NOT_BACKED
-                    },
-                    receiptVerified = receiptHit,
-                    liveIntegrity = liveMap[e.path]?.integrity
-                )
-            }
-            val pcOnlyPaths = (mergedReceipts.keys + liveMap.keys).filter { it !in localPaths }
-            for (p in pcOnlyPaths.sorted()) {
-                val rec = liveMap[p]
-                val rf = mergedReceipts[p]
-                merged += Item(
-                    p, rec?.size ?: rf?.size ?: -1, rec?.sha256 ?: rf?.sha256,
-                    local = false, status = Status.PC_ONLY,
-                    receiptVerified = rf != null, liveIntegrity = rec?.integrity
-                )
-            }
-            main.post {
-                items = merged
-                receipts = mergedReceipts
-                liveOk = live != null
-                liveByPath = liveMap
-                selected.retainAll(merged.filter { it.status == Status.BACKED }.map { it.path })
-                // The status line reports only the connection state; the
-                // empty case is the centered overlay over the grid area.
-                emptyView.visibility = if (merged.isEmpty()) View.VISIBLE else View.GONE
-                statusView.text = if (liveOk) "电脑记录为实时" else "电脑离线（按回执判断）"
-                (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-                updateCount()
-                updateSelectionUi()
+                refreshDiff(db)
+            } finally {
+                synchronized(refreshLock) {
+                    rerun = refreshPending
+                    refreshPending = false
+                    refreshActive = false
+                }
+                if (rerun) refresh()
             }
         }
+    }
+
+    /** Phase 2 of [refresh]: metadata diff + live merge + final render. */
+    private fun refreshDiff(db: FileIndexDb) {
+        // Freshness diff: MediaStore metadata (path/size/mtime) vs the
+        // index. mtime compares at SECOND granularity because MediaStore's
+        // DATE_MODIFIED is seconds while the index also carries the
+        // engine's millisecond mtimes.
+        try {
+            val metas = MediaStoreHelper.listDcimMetadata(this, dcimDir())
+            val current = db.loadAll()
+            val changed = ArrayList<FileIndexDb.Meta>()
+            val seen = HashSet<String>()
+            for (m in metas) {
+                seen += m.relPath
+                val row = current[m.relPath]
+                when {
+                    row == null || row.size != m.size ->
+                        changed += FileIndexDb.Meta(m.relPath, m.size, m.mtimeMs, null)
+                    row.mtime == 0L ->
+                        // Receipt-created placeholder: adopt the real
+                        // mtime, keep its backup evidence.
+                        db.refreshMtime(m.relPath, m.mtimeMs)
+                    row.mtime / 1000 != m.mtimeMs / 1000 ->
+                        changed += FileIndexDb.Meta(m.relPath, m.size, m.mtimeMs, null)
+                }
+            }
+            if (changed.isNotEmpty()) db.upsertMetaBatch(changed)
+            // Vanished locals: MediaStore alone can lag the filesystem, so
+            // a row is dropped only when the file is actually gone (a stat,
+            // not a read). If it later shows up in receipts/LIST it renders
+            // as 仅PC有, as before.
+            val gone = current.keys.filter { it !in seen && !File(dcimDir(), it).exists() }
+            if (gone.isNotEmpty()) db.deletePaths(gone)
+        } catch (t: Throwable) {
+            // Freshness is best effort; the index render stands.
+        }
+
+        val mergedReceipts = ReceiptStore.loadMerged(filesDir)
+        var live: List<FsClient.Record>? = null
+        try {
+            val fs = PcConn.createFsClient(this)
+            if (fs != null) {
+                fs.connect()
+                live = fs.list()
+                fs.close()
+            }
+        } catch (t: Throwable) {
+            live = null
+        }
+        val liveMap = HashMap<String, FsClient.Record>()
+        if (live != null) {
+            RecordsCache.save(this, live)
+            for (r in live) liveMap[r.path] = r
+            db.applyPcRecords(live)
+        }
+        val rows = db.loadAll()
+        val merged = buildItems(rows, mergedReceipts, liveMap)
+        main.post {
+            items = merged
+            receipts = mergedReceipts
+            indexRows = rows
+            liveOk = live != null
+            liveByPath = liveMap
+            selected.retainAll(merged.filter { it.status == Status.BACKED }.map { it.path })
+            // The status line reports only the connection state; the
+            // empty case is the centered overlay over the grid area.
+            emptyView.visibility = if (merged.isEmpty()) View.VISIBLE else View.GONE
+            statusView.text = if (liveOk) "电脑记录为实时" else "电脑离线（按回执判断）"
+            (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+            updateCount()
+            updateSelectionUi()
+        }
+    }
+
+    /**
+     * Merge the three state sources into grid items. Local rows come from
+     * the index; a local file counts as 已备份 when the index already
+     * confirms the PC holds its (path, size, mtime), or a verified receipt
+     * vouches for it (see [receiptVouches]), or the live LIST holds an
+     * integrity-ok record with matching size (and matching sha whenever
+     * the index knows one), or a known sha appears in any verified
+     * receipt (renamed-file fallback, as before).
+     */
+    private fun buildItems(
+        rows: Map<String, FileIndexDb.Row>,
+        receiptsMap: Map<String, ReceiptStore.ReceiptFile>,
+        liveMap: Map<String, FsClient.Record>
+    ): List<Item> {
+        val backedShas = HashSet<String>()
+        for (rf in receiptsMap.values) backedShas += rf.sha256
+        val merged = ArrayList<Item>()
+        val localPaths = HashSet<String>()
+        for ((path, row) in rows) {
+            localPaths += path
+            val rf = receiptsMap[path]
+            val live = liveMap[path]
+            val receiptHit = row.receiptVerified && rf != null && rf.size == row.size &&
+                (row.sha256 == null || rf.sha256 == row.sha256)
+            val liveHit = live != null && "ok" == live.integrity && live.size == row.size &&
+                (row.sha256 == null || live.sha256 == row.sha256)
+            val shaHit = row.sha256 != null && backedShas.contains(row.sha256)
+            val backed = row.status == FileIndexDb.STATUS_BACKED || receiptHit || liveHit || shaHit
+            merged += Item(
+                path, row.size,
+                row.sha256 ?: live?.sha256 ?: rf?.sha256,
+                local = true,
+                status = if (backed) Status.BACKED else Status.NOT_BACKED,
+                receiptVerified = receiptHit,
+                liveIntegrity = live?.integrity ?: row.pcIntegrity
+            )
+        }
+        val pcOnlyPaths = (receiptsMap.keys + liveMap.keys).filter { it !in localPaths }
+        for (p in pcOnlyPaths.sorted()) {
+            val rec = liveMap[p]
+            val rf = receiptsMap[p]
+            merged += Item(
+                p, rec?.size ?: rf?.size ?: -1, rec?.sha256 ?: rf?.sha256,
+                local = false, status = Status.PC_ONLY,
+                receiptVerified = rf != null, liveIntegrity = rec?.integrity
+            )
+        }
+        return merged
+    }
+
+    /**
+     * §6.4 evidence check, aligned with stream-hash semantics: a verified
+     * receipt vouches for [item] when path+size match and either the sha
+     * is known to match, or no local sha is known and the index recorded
+     * this receipt against the item's exact (size, mtime) during the
+     * session (receipt_verified — the index clears it whenever the file's
+     * size or mtime later changes).
+     */
+    private fun receiptVouches(item: Item): Boolean {
+        val rf = receipts[item.path] ?: return false
+        if (rf.size != item.size) return false
+        val sha = item.sha
+        if (sha != null) return rf.sha256 == sha
+        val row = indexRows[item.path] ?: return false
+        return row.receiptVerified && row.size == item.size
     }
 
     private fun applyProgressBadges() {
@@ -427,10 +552,7 @@ class LibraryActivity : Activity() {
         safetyCard.visibility = if (selecting) View.VISIBLE else View.GONE
         if (!selecting) return
         val chosen = items.filter { it.path in selected }
-        val verified = chosen.count { c ->
-            val rf = receipts[c.path]
-            rf != null && rf.sha256 == c.sha
-        }
+        val verified = chosen.count { c -> receiptVouches(c) }
         val bytes = chosen.sumOf { it.size }
         selCount.text = "已选 ${chosen.size} 项"
         safetyText.text = "所选 ${chosen.size} 项中 $verified 项持有已验证回执，预计释放 " +
@@ -564,13 +686,17 @@ class LibraryActivity : Activity() {
             return
         }
         thread(name = "freeup-precheck") {
-            // Gate 1 (always): a signature-verified receipt must vouch for the
-            // file with the same sha256 as the current local copy.
-            val receiptsNow = ReceiptStore.loadMerged(filesDir)
-            val receiptOk = candidates.filter { c ->
-                val rf = receiptsNow[c.path]
-                rf != null && rf.sha256 == c.sha
+            // Gate 1 (always): a signature-verified receipt must vouch for
+            // the file — same sha256 as the current local copy, or, when no
+            // local sha is known (stream-hash), the index's receipt flag
+            // for this exact (size, mtime). See receiptVouches.
+            receipts = ReceiptStore.loadMerged(filesDir)
+            try {
+                indexRows = FileIndexDb.get(this).loadAll()
+            } catch (t: Throwable) {
+                // Keep the previous snapshot; the gate degrades to sha-only.
             }
+            val receiptOk = candidates.filter { c -> receiptVouches(c) }
             // Gate 2 (when the PC is reachable): live integrity cross-check —
             // suspect or missing records are excluded, never silently deleted.
             var excluded = candidates.size - receiptOk.size
@@ -586,7 +712,8 @@ class LibraryActivity : Activity() {
                     val before = finalList.size
                     finalList = finalList.filter { c ->
                         val r = byPath[c.path]
-                        r != null && "ok" == r.integrity && r.sha256 == c.sha
+                        r != null && "ok" == r.integrity && r.size == c.size &&
+                            (c.sha == null || r.sha256 == c.sha)
                     }
                     excluded += before - finalList.size
                     checkedLive = true
