@@ -31,7 +31,8 @@ fails with "duplicate class: Wire/Hash" (by design since M1 — that is
 also why the laptop build tree keeps the sender's classes in a separate
 output dir). A clean build = the two commands above, each from an empty
 output dir; both were re-verified from clean on 2026-10-31 in the repo
-and in the laptop tree (`~/niubackup-pc/v2`).
+and in the laptop tree (`~/niubackup/receiver` + `~/niubackup/sender`,
+the laptop root is isomorphic to this repo).
 
 ## Seed a user + device (prints the device token ONCE; only its hash is stored)
 

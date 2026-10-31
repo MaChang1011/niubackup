@@ -2,7 +2,7 @@
 
 > 给接手开发者的自包含手册：环境在哪、怎么构建、哪些坑踩过、现在跑着什么、还剩什么。
 > 产品与协议的定版口径以 `docs/product-design.md` 为准；本文只讲「怎么干活」。
-> 最后更新：2026-10-31 夜（目录统一迁移 + 彻底从零重置之后）。
+> 最后更新：2026-10-31 夜（笔记本目录与仓库同构重排 + 彻底从零重置之后）。
 
 ## 1. 环境地图
 
@@ -23,15 +23,18 @@
 
 ### 1.2 笔记本（用户家里的 Ubuntu；组网 10.200.0.2 / 局域网 192.168.3.32）
 
-统一目录 **`~/niubackup/`**（2026-10-31 迁移定版，旧路径已全部废弃）：
+统一目录 **`~/niubackup/` 与仓库根同构**（2026-10-31 重排定版）：目录名与仓库一一对应，笔记本＝仓库的同构工作副本；旧路径（`~/niubackup-pc`、`~/niubackup-android`、`~/nb-desktop-build`、`~/niubackup-desktop-run`，以及中间态的 `~/niubackup/{pc,run}`）已全部废弃。仓库没有的只有两个笔记本专属目录：`.run/`（运行时物料）与 `archive/`（归档）。
 
 | 路径 | 用途 |
 |---|---|
-| `~/niubackup/pc/` | PC 端源码与运行树。现行代码在 `pc/v2/`（接收端/发送端源码 + classes + lib）；`pc/` 根下有早期副本与 BUILD 索引，**以 v2 为准** |
-| `~/niubackup/android/` | 安卓工程构建树（gradle 在此跑） |
+| `~/niubackup/android/` | 安卓工程构建树（gradle 在此跑；构建产物 `app/build/`、`.gradle/` 原地保留） |
+| `~/niubackup/receiver/` | 接收端：源码（`BackupReceiver.java`、`NiuPcApp.java`、`BUILD.md`）+ 当前构建产物 `classes/` |
+| `~/niubackup/sender/` | 发送端：源码（`BackupSender.java`）+ 当前构建产物 `classes/` |
 | `~/niubackup/desktop/` | 桌面端构建树；壳二进制在 `desktop/src-tauri/target/release/niubackup-desktop` |
-| `~/niubackup/run/` | 运行物料：`run/engine/` 是桌面正式引擎包（classes + easytier-core 2.7.0 + runtime）；`run/formal-config/` 是正式启动配置（xdg、shell-config.json、SWITCH-STEPS.md） |
-| `~/niubackup/archive/` | 2026-10-31 彻底重置前的归档（records.db 快照、465 文件清单 CSV、回执副本、截图），只读留档 |
+| `~/niubackup/server/` | 账户服务源码副本（仅源码与配置模板，不含线上秘密；构建/部署仍在云服务器做，见 §1.1） |
+| `~/niubackup/docs/`、`brand/`、`deploy/`、`packaging/`、`lib/` 与根文件 | 自仓库同步、与仓库一致；`lib/` 是构建用 jar（git 忽略，非源码） |
+| `~/niubackup/.run/` | **运行时专属（隐藏目录，仓库无对应物）**：`.run/engine/` 是桌面正式引擎包（classes + easytier-core 2.7.0 + runtime）；`.run/formal-config/` 是正式启动配置（xdg、shell-config.json、SWITCH-STEPS.md） |
+| `~/niubackup/archive/` | 归档，只读留档：重置前留档（records.db 快照、465 文件清单 CSV、回执副本、截图）；`archive/pc-v1/` 是 v1 自用接收端整树（其进程 cwd 在此，见下）；`archive/pc-v2-history/` 是 v2 历代 classes 备份与 .bak 源码；`archive/desktop-artifacts/` 是桌面构建日志与前端 .bak |
 
 运行时数据**不在**统一目录、不要搬：
 
@@ -42,9 +45,9 @@
 
 ```bash
 systemd-run --user --unit=niubackup-desktop-formal \
-  -p Environment="XDG_CONFIG_HOME=$HOME/niubackup/run/formal-config/xdg" \
-  -p Environment="XDG_DATA_HOME=$HOME/niubackup/run/formal-config/xdg" \
-  -p Environment="NB_DESKTOP_ENGINE_DIR=$HOME/niubackup/run/engine" \
+  -p Environment="XDG_CONFIG_HOME=$HOME/niubackup/.run/formal-config/xdg" \
+  -p Environment="XDG_DATA_HOME=$HOME/niubackup/.run/formal-config/xdg" \
+  -p Environment="NB_DESKTOP_ENGINE_DIR=$HOME/niubackup/.run/engine" \
   $HOME/niubackup/desktop/src-tauri/target/release/niubackup-desktop
 ```
 
@@ -55,7 +58,7 @@ systemd-run --user --unit=niubackup-desktop-formal \
 - cargo 在 `~/.cargo/bin`：非登录 SSH shell 的 PATH 里可能没有，桌面构建用登录 shell 或先补 PATH（曾出现「构建静默没跑、二进制没更新」的假成功，务必核对产物时间戳）。
 - 笔记本直连不上 github.com：需要 GitHub 资源时在别处拉取再 scp 进来。本机代理是 Clash Verge `127.0.0.1:7897`。
 - 笔记本上还有自用 easytier 服务（machang-net）与 Syncthing 残留服务，与产品无关。
-- 同机 10.200.0.2:28741 还跑着一个 v1 自用接收端（`~/PhoneBackup`），不是产品，别停别改。
+- 同机 10.200.0.2:28741 还跑着一个 v1 自用接收端（目标 `~/PhoneBackup`），不是产品，别停别改。其运行树在 `~/niubackup/archive/pc-v1/`（进程 cwd 即该目录、相对 classpath `out`；同构重排时整树改名搬入，进程未停、cwd 随改名跟随，至今照常监听）。
 
 ### 1.3 手机（OnePlus PJA110，Android 16 / ColorOS）
 
@@ -65,12 +68,12 @@ systemd-run --user --unit=niubackup-desktop-formal \
 
 ## 2. 仓库与构建纪律
 
-- 本仓库是 canonical；笔记本 `pc/`、`android/`、`desktop/` 三棵树与仓库对应目录（`receiver/`+`sender/` ↔ `pc/v2/`、`android/`、`desktop/`）必须保持字节一致，改完用 md5 抽查。漂移出过事故，别省这步。
+- 本仓库是 canonical；笔记本 `~/niubackup/` 与仓库同构，各对应目录（`receiver/`、`sender/`、`android/`、`desktop/`、`server/`、`docs/` 等）的源码必须保持字节一致（构建产物与 `lib/*.jar` 除外），改完用 md5 全量比对、别只抽查。漂移出过事故，别省这步。2026-10-31 重排后全量比对基线：128 个受控文件三方（笔记本＝工作区仓库＝origin/main）一致。
 - **接收端/发送端分开编译**（血泪纪律）：`BackupReceiver.java`（+`NiuPcApp.java`）一套、`BackupSender.java` 一套，各自一条 javac。两边各带一份同名辅助类（MiniJson/Wire/Hash），混编必冲突；且两份 MiniJson 有过细微差异——817341c 的扫码登录 NPE 就是引擎 classpath 装错了发送端变体（esc() 缺 null 守卫）。命令见 `receiver/BUILD.md`。
 - 安卓构建：`cd ~/niubackup/android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleDebug`。JNI 库（libeasytier_android_jni.so，EasyTier 2.7.0）的构建配方见 `android/BUILD-NOTES.md`（host 构建需 `RUSTFLAGS="-C link-arg=-fuse-ld=bfd"` 与 `PROTOC=~/tools/bin/protoc`）。
 - 桌面构建：`desktop/` 下 `cargo build --release`，Tauri 的 `custom-protocol` feature 必须开（已在 Cargo.toml 固定；裸构建出 dev 模式二进制会去连 localhost:1420，d4996df 的教训）。前端是原生 HTML/CSS/JS，二维码库 qrcode-generator 1.4.4 已 vendored 在 `desktop/src/qrcode.js`（MIT），不引 CDN。
 - 账户服务构建/部署见 §1.1；换 jar 前把旧 jar 备份为 `niubackup-server.jar.bak-<日期>-<事由>`，重启后验活（注册探针号或查 /admin/ 200）。
-- **引擎包刷新纪律**：`run/engine/app/classes` 必须与 `pc/v2/classes` 一致（md5 核对）；`run/engine/` 内的 easytier-core 必须是 **2.7.0** 且 `setcap cap_net_admin,cap_net_raw=ep`（`getcap` 核对）——2.6.4 与 2.7.0 的 secure mode 握手不兼容，无 cap 时 sidecar 建不了 TUN。
+- **引擎包刷新纪律**：`.run/engine/app/classes` 必须与 `receiver/classes` 一致（md5 核对）；`.run/engine/` 内的 easytier-core 必须是 **2.7.0** 且 `setcap cap_net_admin,cap_net_raw=ep`（`getcap` 核对）——2.6.4 与 2.7.0 的 secure mode 握手不兼容，无 cap 时 sidecar 建不了 TUN。
 
 ## 3. 协议与接口摘要
 
