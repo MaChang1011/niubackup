@@ -64,9 +64,11 @@ public class PcLoginController {
     }
 
     /**
-     * PC: poll the ticket. While pending → {status:"pending"}. Once approved,
-     * the first poll claims the sealed credentials (and voids the ticket);
-     * later polls — like expired tickets — answer {status:"expired"}.
+     * PC: poll the ticket. While pending → {status:"pending", device_name,
+     * created_at}. Once approved, the first poll claims the sealed credentials
+     * (plus device_name/created_at) and voids the ticket; later polls — like
+     * expired tickets — answer {status:"expired"}. device_name/created_at let
+     * the phone's confirm card show which PC is asking and when it asked.
      */
     @GetMapping("/{ticketId}")
     @Transactional
@@ -89,7 +91,10 @@ public class PcLoginController {
             return ResponseEntity.ok(Util.body("status", "expired"));
         }
         if ("pending".equals(status)) {
-            return ResponseEntity.ok(Util.body("status", "pending"));
+            return ResponseEntity.ok(Util.body(
+                    "status", "pending",
+                    "device_name", String.valueOf(t.get("device_name")),
+                    "created_at", createdAt(t)));
         }
         // approved → one-shot claim: the payload was read with the row above;
         // flip the status atomically — only the poll that wins the flip may
@@ -103,7 +108,17 @@ public class PcLoginController {
         if (flipped == 0 || payload == null) {
             return ResponseEntity.ok(Util.body("status", "expired"));
         }
-        return ResponseEntity.ok(claimBody(payload));
+        Map<String, Object> body = claimBody(payload);
+        body.put("device_name", String.valueOf(t.get("device_name")));
+        body.put("created_at", createdAt(t));
+        return ResponseEntity.ok(body);
+    }
+
+    /** created_at in the same ISO-8601 form create() uses for expires_at. */
+    private static String createdAt(Map<String, Object> t) {
+        Object c = t.get("created_at");
+        if (c instanceof Timestamp ts) return ts.toInstant().toString();
+        return c == null ? null : String.valueOf(c);
     }
 
     /**
