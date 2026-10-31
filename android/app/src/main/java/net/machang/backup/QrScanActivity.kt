@@ -127,11 +127,27 @@ class QrScanActivity : Activity() {
                 camera = cam
                 val params = cam.parameters
                 params.previewFormat = ImageFormat.NV21
-                // Prefer a ~720p preview: big enough for QR decode, cheap to copy.
-                val size = params.supportedPreviewSizes
-                    ?.filter { it.width in 640..1600 }
-                    ?.minByOrNull { kotlin.math.abs(it.width - 1280) }
-                if (size != null) params.setPreviewSize(size.width, size.height)
+                // Pick the preview size by ASPECT first: with
+                // setDisplayOrientation(90) the displayed frame is the
+                // buffer rotated, so its aspect is bufferH/bufferW; the
+                // size whose displayed aspect is closest to the view's
+                // distorts least (fitSurface then center-crops the rest).
+                // Resolution is the tie-break — ~720p-1080p is plenty for
+                // QR decode and cheap to copy per frame. (The old rule —
+                // width closest to 1280, aspect ignored — picked 16:9 for
+                // a much taller screen and the preview came out visibly
+                // stretched.)
+                val viewW = if (sv.width > 0) sv.width else resources.displayMetrics.widthPixels
+                val viewH = if (sv.height > 0) sv.height else resources.displayMetrics.heightPixels
+                val size = choosePreviewSize(params.supportedPreviewSizes, viewW, viewH)
+                if (size != null) {
+                    params.setPreviewSize(size.width, size.height)
+                    AppLog.log(
+                        "扫码相机预览 ${size.width}x${size.height}（显示比 " +
+                            "%.3f，视图 ${viewW}x${viewH} 比 %.3f）"
+                                .format(size.height.toDouble() / size.width, viewW.toDouble() / viewH)
+                    )
+                }
                 if (Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE in
                     (params.supportedFocusModes ?: emptyList())
                 ) {
@@ -146,10 +162,65 @@ class QrScanActivity : Activity() {
                 cam.startPreview()
                 previewRunning = true
                 statusText.text = ""
+                sv.post { fitSurface() }
             }
         } catch (t: Throwable) {
             stopCamera()
             statusText.text = "相机打开失败：${t.message}。轻点屏幕重试。"
+        }
+    }
+
+    /**
+     * The supported preview size whose DISPLAYED aspect (buffer rotated
+     * 90° → height/width) is closest to the view's aspect; ties break
+     * toward ~1280x960 of pixels (enough for ZXing, cheap per frame).
+     */
+    private fun choosePreviewSize(
+        sizes: List<Camera.Size>?, viewW: Int, viewH: Int
+    ): Camera.Size? {
+        if (sizes.isNullOrEmpty()) return null
+        val usable = sizes.filter { it.width in 640..1920 && it.height > 0 }
+        if (usable.isEmpty()) return null
+        val viewRatio = if (viewW > 0 && viewH > 0) viewW.toDouble() / viewH else 0.5
+        return usable.minWithOrNull(
+            compareBy<Camera.Size> {
+                kotlin.math.abs(kotlin.math.ln((it.height.toDouble() / it.width) / viewRatio))
+            }.thenBy {
+                kotlin.math.abs(it.width.toDouble() * it.height - 1280.0 * 960.0)
+            }
+        )
+    }
+
+    /**
+     * Center-crop the SurfaceView: scale it (aspect preserved) until it
+     * COVERS the scan layer, centered — the camera then fills the screen
+     * with the overflow cropped away instead of stretching the frame to
+     * fit a mismatched box. Runs from surfaceChanged and after preview
+     * start; converges because an already-correct size is left alone.
+     */
+    private fun fitSurface() {
+        val sv = surfaceView ?: return
+        val cam = camera ?: return
+        val ps = try {
+            cam.parameters.previewSize
+        } catch (t: Throwable) {
+            return
+        } ?: return
+        // Displayed frame dims after setDisplayOrientation(90): swapped.
+        val dispW = ps.height.toDouble()
+        val dispH = ps.width.toDouble()
+        val layerW = scanLayer.width
+        val layerH = scanLayer.height
+        if (layerW == 0 || layerH == 0 || dispW == 0.0 || dispH == 0.0) return
+        val scale = maxOf(layerW / dispW, layerH / dispH)
+        val tw = kotlin.math.ceil(dispW * scale).toInt()
+        val th = kotlin.math.ceil(dispH * scale).toInt()
+        val lp = sv.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (kotlin.math.abs(lp.width - tw) > 2 || kotlin.math.abs(lp.height - th) > 2) {
+            lp.width = tw
+            lp.height = th
+            lp.gravity = Gravity.CENTER
+            sv.layoutParams = lp
         }
     }
 
@@ -502,6 +573,7 @@ class QrScanActivity : Activity() {
             override fun surfaceChanged(
                 holder: SurfaceHolder, format: Int, width: Int, height: Int
             ) {
+                fitSurface()
             }
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {

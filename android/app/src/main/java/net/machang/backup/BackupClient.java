@@ -358,9 +358,30 @@ public class BackupClient {
         // killed by the receiver's session read timeout. Capability is
         // therefore probed on a throwaway fs-mode HELLO, which writes no
         // backup session state on the receiver.
-        boolean[] caps = probeCaps(host, port);
-        boolean batchCapable = caps[0];
-        boolean streamCapable = caps[1];
+        //
+        // The probe also gates the session itself: if the receiver never
+        // answers (or answers HELLO_ERR), there is no usable session to be
+        // had right now, and silently degrading to the pre-connection full
+        // hash below would burn many minutes hashing the whole library in
+        // front of a dead door — on a cold cache that is EVERY file. That
+        // failure mode shipped once (2026-10-31): the phone hashed 6,220
+        // files for 10+ minutes, sending nothing, because the desktop
+        // engine was not up yet when the probe ran. So the probe retries
+        // briefly and the session then fails fast and loud. Only a
+        // receiver that answers HELLO_ACK *without* batch takes the
+        // legacy pre-hash path.
+        Caps caps = probeCapsWithRetry(host, port);
+        if (caps == null) {
+            logger.log("无法连接电脑端（能力探测无应答），本次备份未开始。"
+                    + "请确认电脑端牛备已打开并登录、手机与电脑已组网后重试。");
+            return 1;
+        }
+        if (caps.errCode != null) {
+            logger.log("电脑端拒绝了探测连接（" + caps.errCode + "），本次备份未开始。");
+            return 1;
+        }
+        boolean batchCapable = caps.batch;
+        boolean streamCapable = caps.stream;
         HashSession hs = null; // lazy: stream-hash sessions never hash up front
         List<Entry> entries = null;
         if (!batchCapable) {
@@ -401,23 +422,16 @@ public class BackupClient {
                 return runBatchSession(in, out, rootDir, files, hs, streamHash, progress);
             }
             if (entries == null) {
-                // The probe advertised batch but this HELLO_ACK does not:
-                // fall back to the single-manifest flow on this connection.
-                if (hs == null) hs = new HashSession(rootDir, files.size());
-                entries = hs.hashAll(rootDir, files);
-                hs.finish();
-                lastSkippedCount = hs.skippedCount;
-                logScanSummary(rootDir, entries.size());
-                if (entries.isEmpty()) {
-                    // Nothing to offer; close gracefully with an empty
-                    // manifest instead of leaving the receiver waiting.
-                    Wire.writeLine(out, "MANIFEST-END");
-                    readDecisions(in);
-                    Wire.writeLine(out, "BYE");
-                    readReceiptsAfterBye(in);
-                    logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
-                    return 0;
-                }
+                // The probe advertised batch but this HELLO_ACK does not.
+                // The old fallback hashed the whole library on the live
+                // connection — on a cold cache a many-minute stall that
+                // the receiver's read timeout would kill mid-hash anyway.
+                // Nothing has been offered yet, so stop cleanly instead:
+                // BYE and no partial state on either side.
+                logger.log("电脑端未按探测结果启用分批模式，本次备份已停止（未发送任何文件）。"
+                        + "请确认电脑端牛备为最新版本后重试。");
+                try { Wire.writeLine(out, "BYE"); } catch (IOException ignore) { }
+                return 1;
             }
             return runSingleManifest(in, out, rootDir, entries, progress);
         } catch (IOException e) {
@@ -433,18 +447,52 @@ public class BackupClient {
         }
     }
 
+    /** One capability-probe outcome. */
+    private static final class Caps {
+        boolean batch;
+        boolean stream;
+        /** Non-null when the receiver answered HELLO_ERR (it is alive and
+         *  v2-speaking, but refuses this client right now). */
+        String errCode;
+    }
+
     /**
-     * Capability probe on a throwaway fs-mode connection: returns
-     * {batch, streamhash} as advertised by the receiver's HELLO_ACK
-     * ({@code "batch":1} / {@code "streamhash":1}). fs sessions write
-     * no backup session state on the receiver, so probing is side-effect
-     * free apart from one session log pair. Any failure → both false.
+     * Probe with retries: a single no-answer is retried twice (1.5 s
+     * apart) because the usual cause is transient — the mesh peer or the
+     * desktop engine still coming up. Returns the first positive outcome
+     * (HELLO_ACK caps or a HELLO_ERR code), or null when the receiver
+     * never answered at all.
      */
-    private boolean[] probeCaps(String host, int port) {
+    private Caps probeCapsWithRetry(String host, int port) {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            Caps c = probeOnce(host, port);
+            if (c != null) return c;
+            if (attempt < 3) {
+                try {
+                    Thread.sleep(1500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Capability probe on a throwaway fs-mode connection: the caps come
+     * from the receiver's HELLO_ACK ({@code "batch":1} /
+     * {@code "streamhash":1}); a HELLO_ERR is reported via
+     * {@link Caps#errCode}; anything else (timeout, refused, EOF, an
+     * unrecognized greeting) is "no answer" → null. fs sessions write
+     * no backup session state on the receiver, so probing is side-effect
+     * free apart from one session log pair.
+     */
+    private Caps probeOnce(String host, int port) {
         Socket rawSocket = new Socket();
         try (Socket s = rawSocket) {
-            rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
-            s.setSoTimeout(30_000);
+            rawSocket.connect(new java.net.InetSocketAddress(host, port), 6_000);
+            s.setSoTimeout(10_000);
             InputStream in = s.getInputStream();
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
             int routeCost = -1;
@@ -456,11 +504,22 @@ public class BackupClient {
                     + "\",\"device_token\":\"" + MiniJson.esc(deviceToken)
                     + "\",\"route_cost\":" + routeCost + ",\"mode\":\"fs\"}");
             String resp = Wire.readLine(in);
-            if (resp == null || !resp.startsWith("HELLO_ACK")) return new boolean[]{false, false};
-            return new boolean[]{MiniJson.num(resp, "batch", 0) == 1,
-                    MiniJson.num(resp, "streamhash", 0) == 1};
+            if (resp == null) return null;
+            if (resp.startsWith("HELLO_ACK")) {
+                Caps c = new Caps();
+                c.batch = MiniJson.num(resp, "batch", 0) == 1;
+                c.stream = MiniJson.num(resp, "streamhash", 0) == 1;
+                return c;
+            }
+            if (resp.startsWith("HELLO_ERR")) {
+                Caps c = new Caps();
+                c.errCode = MiniJson.str(resp, "code");
+                if (c.errCode == null || c.errCode.isEmpty()) c.errCode = resp;
+                return c;
+            }
+            return null; // unrecognized greeting: no usable answer
         } catch (Exception e) {
-            return new boolean[]{false, false};
+            return null;
         }
     }
 
