@@ -38,13 +38,22 @@ import kotlin.concurrent.thread
  * (size · time · 回执已验证 ✓ when a verified receipt covers the path),
  * and inline ghost actions 播放 / 下载回来. Tapping an image row opens the
  * full-screen photo preview; tapping a video row plays it.
- * When the PC is unreachable, the last fetched copy is shown and labeled.
+ *
+ * Three display states, kept visually distinct: LIVE （实时记录， green
+ * pill) — fetched from the PC just now; STALE （记录截至 HH:MM, amber
+ * 离线缓存 pill) — the PC is unreachable and the last fetched copy is
+ * shown; EMPTY — the PC answered (or not) and there are no records yet,
+ * an explicit hint row in the card instead of a blank void. The page
+ * reloads on every resume; overlapping loads are generation-guarded so
+ * only the newest fetch reaches the UI. Since the receiver serves fs
+ * sessions concurrently with backups, LIVE works even mid-backup.
  */
 class RecordsActivity : Activity() {
 
     private sealed class Row {
         data class Day(val label: String) : Row()
         data class Entry(val record: FsClient.Record) : Row()
+        data class Hint(val text: String) : Row()
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -135,7 +144,14 @@ class RecordsActivity : Activity() {
         overridePendingTransition(0, 0)
     }
 
+    @Volatile
+    private var loadGen = 0
+
     private fun loadRecords() {
+        // Loads overlap by design (onCreate + every onResume): only the
+        // newest load's result may reach the UI — a slow stale fetch must
+        // never overwrite fresher records.
+        val gen = ++loadGen
         thread(name = "records-load") {
             // Receipt coverage powers the 回执已验证 meta (verified locally).
             val receipts = try {
@@ -157,15 +173,16 @@ class RecordsActivity : Activity() {
             if (live != null) {
                 val list = live
                 RecordsCache.save(this, list)
-                main.post { show(list, null, receipts) }
+                main.post { if (gen == loadGen) show(list, null, receipts) }
             } else {
                 val cached = RecordsCache.load(this)
                 main.post {
+                    if (gen != loadGen) return@post
                     if (cached != null) {
                         show(cached.records, cached.fetchedAt, receipts)
                     } else {
                         records = emptyList()
-                        rows = emptyList()
+                        rows = listOf(Row.Hint("暂无备份记录 · 连上电脑后回到本页会自动刷新"))
                         receiptPaths = receipts
                         (listView.adapter as BaseAdapter).notifyDataSetChanged()
                         Ui.setPill(connPill, "电脑离线", Ui.StatusKind.PC)
@@ -179,7 +196,18 @@ class RecordsActivity : Activity() {
     private fun show(list: List<FsClient.Record>, staleAt: Long?, receipts: Set<String>) {
         records = list
         receiptPaths = receipts
-        rows = buildRows(list)
+        // Empty is a state of its own — an explicit hint row, never a
+        // blank card that looks like a loading failure.
+        rows = if (list.isEmpty()) {
+            listOf(
+                Row.Hint(
+                    if (staleAt == null) "暂无备份记录 · 完成一次备份后会显示在这里"
+                    else "暂无备份记录"
+                )
+            )
+        } else {
+            buildRows(list)
+        }
         if (staleAt == null) {
             Ui.setPill(connPill, "直连中", Ui.StatusKind.OK)
             stripText.text = if (list.isEmpty()) {
@@ -188,8 +216,9 @@ class RecordsActivity : Activity() {
                 "实时记录 · 共 ${list.size} 个文件 · 刚刚从电脑更新"
             }
         } else {
-            Ui.setPill(connPill, "电脑离线", Ui.StatusKind.PC)
-            stripText.text = "记录截至 ${fmtTime(staleAt)} · 离线时显示缓存 · 共 ${list.size} 个文件"
+            // Amber pill: this is the offline cache, NOT live data.
+            Ui.setPill(connPill, "离线缓存", Ui.StatusKind.WAIT)
+            stripText.text = "记录截至 ${fmtTime(staleAt)} · 电脑暂时不可达 · 共 ${list.size} 个文件"
         }
         (listView.adapter as BaseAdapter).notifyDataSetChanged()
         for (r in list) if (r.thumb) prefetchThumb(r)
@@ -349,15 +378,33 @@ class RecordsActivity : Activity() {
         override fun getCount(): Int = rows.size
         override fun getItem(position: Int): Any = rows[position]
         override fun getItemId(position: Int): Long = position.toLong()
-        override fun getViewTypeCount(): Int = 2
-        override fun getItemViewType(position: Int): Int =
-            if (rows[position] is Row.Day) 0 else 1
+        override fun getViewTypeCount(): Int = 3
+        override fun getItemViewType(position: Int): Int = when (rows[position]) {
+            is Row.Day -> 0
+            is Row.Entry -> 1
+            is Row.Hint -> 2
+        }
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             return when (val row = rows[position]) {
                 is Row.Day -> dayView(row.label, convertView)
                 is Row.Entry -> entryView(row.record, convertView, position)
+                is Row.Hint -> hintView(row.text, convertView)
             }
+        }
+
+        private fun hintView(text: String, convertView: View?): View {
+            val tv = (convertView as? TextView) ?: TextView(this@RecordsActivity).apply {
+                textSize = 12f
+                setTextColor(Ui.SLATE)
+                gravity = Gravity.CENTER
+                setPadding(
+                    Ui.dp(this@RecordsActivity, 8), Ui.dp(this@RecordsActivity, 26),
+                    Ui.dp(this@RecordsActivity, 8), Ui.dp(this@RecordsActivity, 26)
+                )
+            }
+            tv.text = text
+            return tv
         }
 
         private fun dayView(label: String, convertView: View?): View {

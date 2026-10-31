@@ -17,8 +17,15 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.*;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -69,6 +76,14 @@ import com.sun.net.httpserver.HttpServer;
  *    --approve/--devices/--sync are operator commands over the stored PC
  *    device token (the PC-approves-phone path); a supervised easytier-core
  *    sidecar joins the issued nb- network (see MeshSidecar).
+ *  - Concurrency (2026-10-31): sessions are handled on a bounded pool of
+ *    worker threads, so fs sessions (records / library / playback) are
+ *    served WHILE a backup runs — the old sequential accept→handle→close
+ *    loop starved them in the backlog for the whole backup and the phone's
+ *    Records page showed nothing. At most ONE backup session per device
+ *    runs at a time (a second backup HELLO gets HELLO_ERR BUSY) because
+ *    ingest mutates per-device .part state; fs sessions are unlimited.
+ *    See Store for the database thread-safety scheme.
  *
  * Data dir (default &lt;target&gt;/.niubackup): records.db, receiver-key.pkcs8 (600),
  * receiver-key.pub, thumbs/, account.json (account mode, 600), easytier.toml.
@@ -109,6 +124,24 @@ public class BackupReceiver {
     MeshSidecar sidecar;
     volatile long lastSyncOkMs = 0;
     static volatile ServerSocket currentServer;
+
+    /**
+     * Device dirs (absolute, normalized) with a backup session currently
+     * running. Guards the per-device .part/.part.meta ingest state: a
+     * second concurrent backup for the same device would corrupt resume
+     * offsets, so it is rejected BUSY at HELLO time. Keyed by device dir,
+     * which is unique per (user, device) in v2 and per device name in v1.
+     */
+    final Set<String> activeBackupDirs = ConcurrentHashMap.newKeySet();
+
+    /** Claim the single backup slot for a device dir; false when already running. */
+    boolean tryBeginBackup(Path deviceDir) {
+        return activeBackupDirs.add(deviceDir.toAbsolutePath().normalize().toString());
+    }
+
+    void endBackup(Path deviceDir) {
+        activeBackupDirs.remove(deviceDir.toAbsolutePath().normalize().toString());
+    }
 
     // Tauri shell control API (--control): loopback-only JSON HTTP API.
     // controlOnly = the process parked with no saved session, serving ONLY
@@ -484,6 +517,20 @@ public class BackupReceiver {
         }
         if (ss == null) throw new BindException("cannot bind " + bind + ":" + port);
         currentServer = ss;
+        // Sessions run CONCURRENTLY (2026-10-31): a backup session can last
+        // hours, and fs sessions must be answered while one is in flight.
+        // Bounded pool of named daemon worker threads; when the pool and
+        // its queue are saturated the just-accepted socket is closed at
+        // once rather than left waiting unanswered in the backlog.
+        AtomicInteger sessionSeq = new AtomicInteger();
+        ThreadFactory sessionThreads = task -> {
+            Thread t = new Thread(task, "nb-session-" + sessionSeq.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        ExecutorService pool = new ThreadPoolExecutor(
+                4, 32, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(128), sessionThreads);
         try (ServerSocket server = ss) {
             log("listening on " + (addr == null ? "*" : addr.getHostAddress()) + ":" + port
                     + ", target dir " + targetRoot + ", data dir " + dataDir
@@ -499,14 +546,23 @@ public class BackupReceiver {
                 }
                 log("connection from " + s.getRemoteSocketAddress());
                 try {
-                    handle(s);
-                } catch (Exception e) {
-                    log("session error: " + e);
-                } finally {
+                    pool.execute(() -> {
+                        try {
+                            handle(s);
+                        } catch (Exception e) {
+                            log("session error: " + e);
+                        } finally {
+                            try { s.close(); } catch (IOException ignore) { }
+                        }
+                    });
+                } catch (RejectedExecutionException full) {
+                    log("session pool saturated, dropping connection from "
+                            + s.getRemoteSocketAddress());
                     try { s.close(); } catch (IOException ignore) { }
                 }
             }
         } finally {
+            pool.shutdownNow();
             if (currentServer == ss) currentServer = null;
         }
     }
@@ -704,15 +760,28 @@ public class BackupReceiver {
             Wire.writeLine(out, "HELLO_ERR {\"code\":\"" + err + "\"}");
             return;
         }
-        Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1}");
-        log("v2 session start: user=" + auth.userId + " device=" + auth.deviceId + " mode=" + auth.mode);
         if (auth.mode.equals("fs")) {
+            // fs sessions are read-only and unlimited — no backup slot.
+            Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1}");
+            log("v2 session start: user=" + auth.userId + " device=" + auth.deviceId + " mode=" + auth.mode);
             handleFs(in, out, auth);
-        } else {
-            Path deviceDir = targetRoot.resolve("users").resolve(auth.userId)
-                    .resolve("devices").resolve(auth.deviceId);
+            return;
+        }
+        Path deviceDir = targetRoot.resolve("users").resolve(auth.userId)
+                .resolve("devices").resolve(auth.deviceId);
+        if (!tryBeginBackup(deviceDir)) {
+            Wire.writeLine(out, "HELLO_ERR {\"code\":\"BUSY\"}");
+            log("backup HELLO rejected (BUSY — a session for this device is already running):"
+                    + " user=" + auth.userId + " device=" + auth.deviceId);
+            return;
+        }
+        try {
+            Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1}");
+            log("v2 session start: user=" + auth.userId + " device=" + auth.deviceId + " mode=" + auth.mode);
             Files.createDirectories(deviceDir);
             runBackupSession(in, out, deviceDir, auth);
+        } finally {
+            endBackup(deviceDir);
         }
     }
 
@@ -726,11 +795,20 @@ public class BackupReceiver {
             Wire.writeLine(out, "ERR protocol version mismatch, server speaks 2 (v1 via --allow-v1)");
             return;
         }
-        Wire.writeLine(out, "OK 1");
         Path deviceDir = targetRoot.resolve(device);
-        Files.createDirectories(deviceDir);
-        log("legacy v1 session, device=" + device);
-        runBackupSession(in, out, deviceDir, null);
+        if (!tryBeginBackup(deviceDir)) {
+            Wire.writeLine(out, "ERR busy: another backup session for this device is in progress");
+            log("legacy v1 HELLO rejected (BUSY): device=" + device);
+            return;
+        }
+        try {
+            Wire.writeLine(out, "OK 1");
+            Files.createDirectories(deviceDir);
+            log("legacy v1 session, device=" + device);
+            runBackupSession(in, out, deviceDir, null);
+        } finally {
+            endBackup(deviceDir);
+        }
     }
 
     // ------------------------------------------------------------------ backup session (v1 flow, v2-aware)
@@ -1117,29 +1195,44 @@ public class BackupReceiver {
         String name = stored.getFileName().toString().toLowerCase(Locale.ROOT);
         int dot = name.lastIndexOf('.');
         String ext = dot < 0 ? "" : name.substring(dot + 1);
-        boolean ok = false;
-        if (ext.equals("jpg") || ext.equals("jpeg") || ext.equals("png")
-                || ext.equals("gif") || ext.equals("bmp")) {
-            ok = thumbViaImageIO(stored, out);
-        } else if (ext.equals("heic") || ext.equals("heif")) {
-            if (convertPresent) {
-                ok = runTool(Arrays.asList("convert", stored + "[0]",
-                        "-auto-orient", "-resize", THUMB_EDGE + "x" + THUMB_EDGE + ">",
-                        out.toString()), 60);
+        // Generate into a unique temp file, then rename into place: with
+        // concurrent sessions, two devices can ingest identical content
+        // (same sha → same thumb path) at the same time. Temp + rename
+        // means writers never interleave into one file, and fs THUMB
+        // readers only ever see a complete thumbnail.
+        Path tmp = Files.createTempFile(thumbsDir, "thumb-", ".jpg");
+        try {
+            boolean ok = false;
+            if (ext.equals("jpg") || ext.equals("jpeg") || ext.equals("png")
+                    || ext.equals("gif") || ext.equals("bmp")) {
+                ok = thumbViaImageIO(stored, tmp);
+            } else if (ext.equals("heic") || ext.equals("heif")) {
+                if (convertPresent) {
+                    ok = runTool(Arrays.asList("convert", stored + "[0]",
+                            "-auto-orient", "-resize", THUMB_EDGE + "x" + THUMB_EDGE + ">",
+                            tmp.toString()), 60);
+                }
+            } else if (ext.equals("mp4") || ext.equals("mov") || ext.equals("mkv")
+                    || ext.equals("avi") || ext.equals("webm") || ext.equals("3gp") || ext.equals("m4v")) {
+                if (ffmpegPresent) {
+                    ok = runTool(Arrays.asList("ffmpeg", "-y", "-ss", "1", "-i", stored.toString(),
+                            "-frames:v", "1", "-vf", "scale=" + THUMB_EDGE + ":-2",
+                            tmp.toString()), 60);
+                }
             }
-        } else if (ext.equals("mp4") || ext.equals("mov") || ext.equals("mkv")
-                || ext.equals("avi") || ext.equals("webm") || ext.equals("3gp") || ext.equals("m4v")) {
-            if (ffmpegPresent) {
-                ok = runTool(Arrays.asList("ffmpeg", "-y", "-ss", "1", "-i", stored.toString(),
-                        "-frames:v", "1", "-vf", "scale=" + THUMB_EDGE + ":-2",
-                        out.toString()), 60);
+            if (ok && Files.isRegularFile(tmp) && Files.size(tmp) > 0) {
+                try {
+                    Files.move(tmp, out, StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException ex) {
+                    Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
+                }
+                return out.getFileName().toString();
             }
+            return null;
+        } finally {
+            Files.deleteIfExists(tmp);
         }
-        if (ok && Files.isRegularFile(out) && Files.size(out) > 0) {
-            return out.getFileName().toString();
-        }
-        Files.deleteIfExists(out);
-        return null;
     }
 
     boolean thumbViaImageIO(Path src, Path out) {
@@ -1303,6 +1396,21 @@ public class BackupReceiver {
 
     // ------------------------------------------------------------------ SQLite store
 
+    /**
+     * The record store — and the process-wide database thread-safety
+     * scheme: ONE Store instance holds ONE JDBC Connection, and EVERY
+     * method is synchronized on the Store monitor, so all database access
+     * is serialized no matter which thread calls (session worker threads,
+     * the account-sync thread, control-API threads, one-shot commands in
+     * this process). A bare JDBC Connection is NOT thread-safe; the
+     * monitor is what makes sharing this one safe. WAL + busy_timeout
+     * additionally cover short-lived EXTERNAL processes (--seed, --verify,
+     * --devices/--approve CLI runs) opening the same file while the
+     * server is up. Rules for future code: never touch {@code db} outside
+     * a synchronized Store method; never open a second in-process
+     * connection; keep statements short (the monitor is held for the
+     * duration of each call — no network or disk I/O inside Store).
+     */
     static final class Store {
         private final Connection db;
 
@@ -1311,6 +1419,13 @@ public class BackupReceiver {
             db = DriverManager.getConnection("jdbc:sqlite:" + file.toAbsolutePath());
             try (Statement st = db.createStatement()) {
                 st.execute("PRAGMA busy_timeout = 5000");
+                try {
+                    st.execute("PRAGMA journal_mode = WAL");
+                } catch (SQLException ignore) {
+                    // Keep the default journal mode if WAL is unavailable
+                    // (e.g. exotic filesystem); correctness does not depend
+                    // on it — the Store monitor is the in-process scheme.
+                }
                 st.execute("CREATE TABLE IF NOT EXISTS users ("
                         + "id TEXT PRIMARY KEY, created_at INTEGER NOT NULL DEFAULT 0)");
                 st.execute("CREATE TABLE IF NOT EXISTS devices ("
