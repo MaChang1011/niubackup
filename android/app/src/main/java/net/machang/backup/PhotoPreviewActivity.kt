@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.util.LruCache
 import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
@@ -96,6 +97,30 @@ class PhotoPreviewActivity : Activity() {
     private var loadGen = 0
 
     private val main = Handler(Looper.getMainLooper())
+
+    /**
+     * Decoded full-size (screen-sampled) bitmaps by path, ~32 MiB: paging
+     * back to an already-viewed photo must not decode (or, for PC copies,
+     * download) it again.
+     */
+    private val fullCache = object : LruCache<String, Bitmap>(32 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int =
+            (value.byteCount / 1024).coerceAtLeast(1)
+    }
+
+    /** Decode target for the "full" image: the screen's long edge. */
+    private fun screenTarget(): Int {
+        val dm = resources.displayMetrics
+        return maxOf(dm.widthPixels, dm.heightPixels).coerceAtLeast(1)
+    }
+
+    /** The shared 320px thumbnail file (same key rule as RecordsActivity). */
+    private fun thumbFileFor(path: String, sha: String?): File {
+        val dir = File(filesDir, "thumb-cache").apply { mkdirs() }
+        val key = (if (!sha.isNullOrEmpty()) sha else path.hashCode().toString())
+            .replace("/", "_")
+        return File(dir, "$key.jpg")
+    }
 
     private fun dcimDir(): File =
         Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
@@ -410,36 +435,104 @@ class PhotoPreviewActivity : Activity() {
     private fun loadImage(path: String) {
         val gen = ++loadGen
         imageView.resetZoom()
+        // Already decoded this session: show it at once, no re-decode,
+        // no re-download, no placeholder flicker.
+        fullCache.get(path)?.let { bmp ->
+            loadingView.visibility = View.GONE
+            imageView.setImageBitmap(bmp)
+            return
+        }
         imageView.setImageBitmap(null)
         val localFile = File(dcimDir(), path)
         val isLocal = locals[index] && localFile.isFile
+        val target = screenTarget()
         if (isLocal) {
             loadingView.visibility = View.GONE
             thread(name = "preview-local") {
-                val bmp = decodeSampled(localFile)
+                // Paint a 320px stand-in first so the page never sits
+                // blank while the full decode runs.
+                val thumb = decodeSampled(localFile, 320)
+                if (thumb != null) {
+                    main.post {
+                        if (gen == loadGen && fullCache.get(path) == null) {
+                            imageView.setImageBitmap(thumb)
+                        }
+                    }
+                }
+                val bmp = decodeSampled(localFile, target)
+                if (bmp != null) fullCache.put(path, bmp)
                 main.post {
                     if (gen == loadGen && bmp != null) imageView.setImageBitmap(bmp)
                 }
             }
             return
         }
-        // PC copy: fetch full-size via the existing FsClient download.
+        // PC copy already downloaded earlier: decode from the preview cache.
         val cached = previewCacheFile(path)
         if (cached.isFile && (sizes[index] <= 0 || cached.length() == sizes[index])) {
             loadingView.visibility = View.GONE
             thread(name = "preview-cache") {
-                val bmp = decodeSampled(cached)
+                val bmp = decodeSampled(cached, target)
+                if (bmp != null) fullCache.put(path, bmp)
                 main.post {
                     if (gen == loadGen && bmp != null) imageView.setImageBitmap(bmp)
                 }
             }
             return
         }
-        loadingView.text = "正在从电脑读取原图…"
-        loadingView.visibility = View.VISIBLE
+        // PC copy: the PC-generated 320px thumbnail (already fetched by the
+        // 记录 page into thumb-cache, or one THUMB request away) paints
+        // immediately; the full-size fetch continues behind it.
+        val thumbFile = thumbFileFor(path, shas.getOrNull(index))
+        val thumbOnDisk = thumbFile.isFile
+        if (thumbOnDisk) {
+            loadingView.visibility = View.GONE
+            thread(name = "preview-thumb") {
+                val tb = try {
+                    BitmapFactory.decodeFile(thumbFile.absolutePath)
+                } catch (t: Throwable) {
+                    null
+                }
+                if (tb != null) {
+                    main.post {
+                        if (gen == loadGen && fullCache.get(path) == null) {
+                            imageView.setImageBitmap(tb)
+                        }
+                    }
+                }
+            }
+        } else {
+            loadingView.text = "正在从电脑读取原图…"
+            loadingView.visibility = View.VISIBLE
+        }
         thread(name = "preview-fetch") {
             try {
                 val fs = PcConn.createFsClient(this) ?: throw IllegalStateException("无设备身份")
+                if (!thumbOnDisk) {
+                    // Fetch the tiny thumbnail first — one round trip and
+                    // the page has something to show.
+                    try {
+                        val bytes = fs.thumb(path)
+                        if (bytes != null) {
+                            try {
+                                thumbFile.writeBytes(bytes)
+                            } catch (t: Throwable) {
+                                // Cache write is best effort.
+                            }
+                            val tb = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                            if (tb != null) {
+                                main.post {
+                                    if (gen == loadGen && fullCache.get(path) == null) {
+                                        loadingView.visibility = View.GONE
+                                        imageView.setImageBitmap(tb)
+                                    }
+                                }
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        // Placeholder is best effort; the fetch goes on.
+                    }
+                }
                 val size = if (sizes[index] > 0) sizes[index] else {
                     fs.connect()
                     fs.list().firstOrNull { it.path == path }?.size ?: -1
@@ -447,7 +540,8 @@ class PhotoPreviewActivity : Activity() {
                 val tmp = fs.download(path, size, File(cacheDir, "preview-dl"), null)
                 fs.close()
                 tmp.copyTo(cached, overwrite = true)
-                val bmp = decodeSampled(cached)
+                val bmp = decodeSampled(cached, target)
+                if (bmp != null) fullCache.put(path, bmp)
                 main.post {
                     if (gen != loadGen) return@post
                     loadingView.visibility = View.GONE
@@ -467,14 +561,16 @@ class PhotoPreviewActivity : Activity() {
         }
     }
 
-    private fun decodeSampled(file: File): Bitmap? {
+    private fun decodeSampled(file: File, targetPx: Int): Bitmap? {
         if (!file.isFile) return null
         return try {
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, opts)
             if (opts.outWidth <= 0) return null
             var sample = 1
-            while (opts.outWidth / sample > 2048 || opts.outHeight / sample > 2048) sample *= 2
+            while (opts.outWidth / sample > targetPx || opts.outHeight / sample > targetPx) {
+                sample *= 2
+            }
             BitmapFactory.decodeFile(
                 file.absolutePath,
                 BitmapFactory.Options().apply { inSampleSize = sample }

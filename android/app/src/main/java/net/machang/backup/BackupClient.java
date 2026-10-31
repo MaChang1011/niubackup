@@ -172,7 +172,20 @@ public class BackupClient {
 
     public BackupClient(Logger logger, File cacheDir, String userId, String deviceId,
                         String deviceToken, IntSupplier routeCostSupplier) {
-        this.logger = logger;
+        Logger base = logger != null ? logger : msg -> { };
+        // Durability: mirror every session log line to <filesDir>/backup-log.txt
+        // so a real-device session can be diagnosed after the fact (the on-screen
+        // AppLog is in-memory only). Session lines never contain the device
+        // token or key material — the client never logs them.
+        if (cacheDir != null) {
+            FileLog fileLog = new FileLog(cacheDir);
+            this.logger = msg -> {
+                base.log(msg);
+                fileLog.write(msg);
+            };
+        } else {
+            this.logger = base;
+        }
         this.cacheDir = cacheDir;
         this.userId = userId;
         this.deviceId = deviceId;
@@ -184,6 +197,67 @@ public class BackupClient {
         return userId != null && !userId.isEmpty()
                 && deviceId != null && !deviceId.isEmpty()
                 && deviceToken != null && !deviceToken.isEmpty();
+    }
+
+    /**
+     * Append-only mirror of the session log at {@code <filesDir>/backup-log.txt},
+     * rotated once past ~512 KiB (one previous generation kept). Strictly
+     * best effort: every failure is swallowed — the file log must never
+     * disturb a backup session.
+     */
+    private static final class FileLog {
+        private static final long MAX_BYTES = 512L * 1024;
+        private final File dir;
+        private BufferedWriter writer;
+
+        FileLog(File dir) {
+            this.dir = dir;
+            try {
+                writer = open();
+                writer.write("==== backup session log opened "
+                        + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                        .format(new java.util.Date()) + " ====");
+                writer.newLine();
+                writer.flush();
+            } catch (Throwable ignore) {
+                writer = null;
+            }
+        }
+
+        private BufferedWriter open() throws IOException {
+            File f = new File(dir, "backup-log.txt");
+            if (f.length() > MAX_BYTES) {
+                File prev = new File(dir, "backup-log.txt.1");
+                try { java.nio.file.Files.deleteIfExists(prev.toPath()); } catch (Throwable ignore) { }
+                try {
+                    java.nio.file.Files.move(f.toPath(), prev.toPath());
+                } catch (Throwable ignore) {
+                    try { java.nio.file.Files.deleteIfExists(f.toPath()); } catch (Throwable ignore2) { }
+                }
+            }
+            return new BufferedWriter(new OutputStreamWriter(
+                    new FileOutputStream(f, true), StandardCharsets.UTF_8));
+        }
+
+        synchronized void write(String msg) {
+            if (writer == null) return;
+            try {
+                // Rotate mid-session too: a long stream-hash session logs
+                // one line per file and can pass the cap on its own.
+                if (new File(dir, "backup-log.txt").length() > MAX_BYTES) {
+                    try { writer.close(); } catch (Throwable ignore) { }
+                    writer = open();
+                }
+                writer.write(new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                        .format(new java.util.Date()));
+                writer.write(' ');
+                writer.write(msg);
+                writer.newLine();
+                writer.flush();
+            } catch (Throwable ignore) {
+                // Never let logging break the session.
+            }
+        }
     }
 
     /** Runs one backup session for {@code rootDir}. Returns the number of failed files. */
@@ -432,6 +506,10 @@ public class BackupClient {
             logger.log("回执: " + receipt);
             if (v2() && receipt != null && receipt.startsWith("RECEIPT ")) {
                 handleSignedReceipt(receipt.substring("RECEIPT ".length()));
+            } else if (v2()) {
+                logger.log("回执未取得：BYE 后未收到签名回执（收到: "
+                        + (receipt == null ? "连接已断开" : receipt)
+                        + "），本轮文件在手机侧无回执凭证");
             }
             sinkFlush();
         } catch (IOException e) {
@@ -637,6 +715,13 @@ public class BackupClient {
             logger.log("回执: " + receipt);
             if (receipt != null && receipt.startsWith("RECEIPT ")) {
                 handleSignedReceipt(receipt.substring("RECEIPT ".length()));
+            } else {
+                // Without the signed receipt nothing on this phone can vouch
+                // for the session's files (§6.4 stays empty) — say so loudly
+                // in the (now persisted) log so the break is findable later.
+                logger.log("回执未取得：BYE 后未收到签名回执（收到: "
+                        + (receipt == null ? "连接已断开" : receipt)
+                        + "），本轮文件在手机侧无回执凭证");
             }
             sinkFlush();
             if (offered == 0) {
@@ -666,7 +751,9 @@ public class BackupClient {
         String sig = MiniJson.str(receiptJson, "signature");
         String pub = MiniJson.str(receiptJson, "pubkey");
         if (doc == null || sig == null || pub == null) {
-            logger.log("回执不含签名块");
+            logger.log("回执不含签名块 (receipt=" + (doc != null ? "有" : "无")
+                    + " signature=" + (sig != null ? "有" : "无")
+                    + " pubkey=" + (pub != null ? "有" : "无") + ")");
             return;
         }
         boolean valid = verifyEcdsa(doc, sig, pub);

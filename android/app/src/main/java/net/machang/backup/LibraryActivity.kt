@@ -560,11 +560,16 @@ class LibraryActivity : Activity() {
     }
 
     private fun onItemTap(item: Item) {
-        val selecting = selected.isNotEmpty()
-        if (selecting && item.status == Status.BACKED) {
-            if (!selected.add(item.path)) selected.remove(item.path)
-            (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-            updateSelectionUi()
+        if (selected.isNotEmpty()) {
+            // Selection mode (entered by long-press): a tap only toggles
+            // releasable (backed-up) items — it never opens the preview or
+            // the player. Leaving selection mode stays as it was: clear
+            // the selection via 取消 in the selection bar.
+            if (item.status == Status.BACKED) {
+                if (!selected.add(item.path)) selected.remove(item.path)
+                (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+                updateSelectionUi()
+            }
             return
         }
         // Images open the full-screen preview (mockup 照片预览页）.
@@ -572,36 +577,67 @@ class LibraryActivity : Activity() {
             openPreview(item)
             return
         }
-        when (item.status) {
-            Status.BACKED -> {
-                if (!selected.add(item.path)) selected.remove(item.path)
-                (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-                updateSelectionUi()
-            }
-            Status.PC_ONLY -> {
-                val name = nameOf(item)
-                val options = mutableListOf<String>()
-                if (MediaStoreHelper.isPlayableName(name)) options += "播放（流式）"
-                options += "下载回手机"
-                AlertDialog.Builder(this)
-                    .setTitle(name)
-                    .setItems(options.toTypedArray()) { _, which ->
-                        if (options[which].startsWith("播放")) {
-                            startActivity(
-                                Intent(this, PlayerActivity::class.java)
-                                    .putExtra(PlayerActivity.EXTRA_PATH, item.path)
-                                    .putExtra(PlayerActivity.EXTRA_SIZE, item.size)
+        // Videos open the player (design v1.1): the local file when the
+        // phone still holds a backed-up copy, otherwise the PC copy
+        // streamed over the tunnel. A plain tap never selects — selection
+        // is long-press only.
+        if (MediaStoreHelper.isPlayableName(nameOf(item))) {
+            val localFile = File(dcimDir(), item.path)
+            when {
+                item.local && localFile.isFile && item.status == Status.BACKED ->
+                    startActivity(
+                        Intent(this, PlayerActivity::class.java)
+                            .putExtra(PlayerActivity.EXTRA_PATH, item.path)
+                            .putExtra(PlayerActivity.EXTRA_SIZE, item.size)
+                            .putExtra(
+                                PlayerActivity.EXTRA_LOCAL_FILE,
+                                localFile.absolutePath
                             )
-                        } else {
-                            downloadBack(item)
-                        }
-                    }
-                    .show()
+                    )
+                item.status == Status.BACKED ->
+                    startActivity(
+                        Intent(this, PlayerActivity::class.java)
+                            .putExtra(PlayerActivity.EXTRA_PATH, item.path)
+                            .putExtra(PlayerActivity.EXTRA_SIZE, item.size)
+                    )
+                item.status == Status.PC_ONLY -> showPcOnlyActions(item)
+                else -> Toast.makeText(
+                    this, "该文件尚未备份，去「备份」页点「立即备份」", Toast.LENGTH_SHORT
+                ).show()
             }
-            else -> {
-                Toast.makeText(this, "该文件尚未备份，去「备份」页点「立即备份」", Toast.LENGTH_SHORT).show()
-            }
+            return
         }
+        when (item.status) {
+            Status.BACKED -> Toast.makeText(
+                this, "已备份到电脑 · 长按可多选并释放空间", Toast.LENGTH_SHORT
+            ).show()
+            Status.PC_ONLY -> showPcOnlyActions(item)
+            else -> Toast.makeText(
+                this, "该文件尚未备份，去「备份」页点「立即备份」", Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    /** PC-only item actions: stream-play (videos) / download back. */
+    private fun showPcOnlyActions(item: Item) {
+        val name = nameOf(item)
+        val options = mutableListOf<String>()
+        if (MediaStoreHelper.isPlayableName(name)) options += "播放（流式）"
+        options += "下载回手机"
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setItems(options.toTypedArray()) { _, which ->
+                if (options[which].startsWith("播放")) {
+                    startActivity(
+                        Intent(this, PlayerActivity::class.java)
+                            .putExtra(PlayerActivity.EXTRA_PATH, item.path)
+                            .putExtra(PlayerActivity.EXTRA_SIZE, item.size)
+                    )
+                } else {
+                    downloadBack(item)
+                }
+            }
+            .show()
     }
 
     private fun openPreview(tapped: Item) {

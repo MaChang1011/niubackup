@@ -19,6 +19,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
@@ -55,6 +56,11 @@ class PlayerActivity : Activity() {
         val path = intent.getStringExtra(EXTRA_PATH) ?: ""
         val size = intent.getLongExtra(EXTRA_SIZE, -1)
         val fileName = path.substringAfterLast('/')
+        // Local playback (library tap on a backed-up video that is still on
+        // the phone): play the on-device file directly instead of streaming
+        // the PC copy. Falls back to streaming when the file has vanished.
+        val localFile = intent.getStringExtra(EXTRA_LOCAL_FILE)
+            ?.let { File(it) }?.takeIf { it.isFile }
         Ui.statusBar(this, Ui.VIEW_BG)
         // Same edge-to-edge opt-out as the tab scaffold (Ui.page): the
         // insets listener below then owns the top bar's status clearance.
@@ -89,7 +95,7 @@ class PlayerActivity : Activity() {
             setTextColor(Ui.VIEW_TEXT)
         })
         titleCol.addView(TextView(this).apply {
-            text = "来自你的电脑 · 备份记录"
+            text = if (localFile != null) "来自这台手机 · 本地文件" else "来自你的电脑 · 备份记录"
             textSize = 11f
             setTextColor(Ui.VIEW_SUB)
         })
@@ -152,7 +158,11 @@ class PlayerActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
         })
         body.addView(TextView(this).apply {
-            text = "${fmtSize(size)} · 电脑上的备份副本 · 经组网直连播放"
+            text = if (localFile != null) {
+                "${fmtSize(size)} · 手机里的原文件 · 本地播放"
+            } else {
+                "${fmtSize(size)} · 电脑上的备份副本 · 经组网直连播放"
+            }
             textSize = 11.5f
             setTextColor(Ui.VIEW_SUB)
             setPadding(0, Ui.dp(this@PlayerActivity, 3), 0, 0)
@@ -190,7 +200,7 @@ class PlayerActivity : Activity() {
             ).apply { rightMargin = Ui.dp(this@PlayerActivity, 5) }
         )
         chip.addView(TextView(this).apply {
-            text = "直连流式"
+            text = if (localFile != null) "本地播放" else "直连流式"
             textSize = 11f
             typeface = Ui.font(800)
             setTextColor(Color.WHITE)
@@ -198,7 +208,11 @@ class PlayerActivity : Activity() {
         chipRow.addView(chip)
         note.addView(chipRow)
         note.addView(TextView(this).apply {
-            text = "经产品组网从你的电脑直连播放 — 不经服务器中转，不先下载完整文件；拖动进度时会短暂缓冲。"
+            text = if (localFile != null) {
+                "直接播放手机里的原文件 — 不耗流量、不经组网；这个文件也已经备份在你的电脑上。"
+            } else {
+                "经产品组网从你的电脑直连播放 — 不经服务器中转，不先下载完整文件；拖动进度时会短暂缓冲。"
+            }
             textSize = 11.5f
             setTextColor(Color.rgb(0xC6, 0xDE, 0xE5))
             setLineSpacing(0f, 1.55f)
@@ -339,13 +353,17 @@ class PlayerActivity : Activity() {
                 Ui.dp(this@PlayerActivity, 16), Ui.dp(this@PlayerActivity, 20)
             )
         }
-        val downloadBtn = Ui.accentButton(this, "下载回来").apply {
-            textSize = 13.5f
-            setOnClickListener { downloadBack(path, size) }
+        if (localFile == null) {
+            // 下载回来 only makes sense when playing the PC copy; the file
+            // is already on the phone in local mode.
+            val downloadBtn = Ui.accentButton(this, "下载回来").apply {
+                textSize = 13.5f
+                setOnClickListener { downloadBack(path, size) }
+            }
+            actions.addView(downloadBtn, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            ))
         }
-        actions.addView(downloadBtn, LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
-        ))
         val detailBtn = TextView(this).apply {
             text = "详情"
             textSize = 13f
@@ -364,7 +382,11 @@ class PlayerActivity : Activity() {
                 AlertDialog.Builder(this@PlayerActivity)
                     .setTitle(fileName)
                     .setMessage(
-                        "路径: $path\n大小: ${fmtSize(size)}\n来源: 你的电脑（${PcConn.pcHost(this@PlayerActivity)}）\n方式: 直连流式播放（fs READ 分段读取）"
+                        if (localFile != null) {
+                            "路径: $path\n大小: ${fmtSize(size)}\n来源: 这台手机（${localFile.absolutePath}）\n方式: 本地播放"
+                        } else {
+                            "路径: $path\n大小: ${fmtSize(size)}\n来源: 你的电脑（${PcConn.pcHost(this@PlayerActivity)}）\n方式: 直连流式播放（fs READ 分段读取）"
+                        }
                     )
                     .setPositiveButton("好", null)
                     .show()
@@ -375,14 +397,21 @@ class PlayerActivity : Activity() {
         ).apply { leftMargin = Ui.dp(this@PlayerActivity, 10) })
         root.addView(actions)
 
-        // ---- player (unchanged streaming stack)
-        val fsFactory: () -> FsClient = {
-            PcConn.createFsClient(this) ?: throw IllegalStateException("无设备身份，先登录或填写开发者令牌")
+        // ---- player: local file when the phone still holds it, else the
+        // streaming stack (FsDataSource over the direct tunnel).
+        val source = if (localFile != null) {
+            ProgressiveMediaSource.Factory(
+                DefaultDataSource.Factory(this)
+            ).createMediaSource(MediaItem.fromUri(Uri.fromFile(localFile)))
+        } else {
+            val fsFactory: () -> FsClient = {
+                PcConn.createFsClient(this)
+                    ?: throw IllegalStateException("无设备身份，先登录或填写开发者令牌")
+            }
+            ProgressiveMediaSource.Factory(
+                FsDataSource.Factory(fsFactory, path, size)
+            ).createMediaSource(MediaItem.fromUri(Uri.parse("niubackup://fs")))
         }
-        val mediaItem = MediaItem.fromUri(Uri.parse("niubackup://fs"))
-        val source = ProgressiveMediaSource.Factory(
-            FsDataSource.Factory(fsFactory, path, size)
-        ).createMediaSource(mediaItem)
         player = ExoPlayer.Builder(this).build().also { exo ->
             playerView.player = exo
             exo.setMediaSource(source)
@@ -486,5 +515,8 @@ class PlayerActivity : Activity() {
     companion object {
         const val EXTRA_PATH = "fs_path"
         const val EXTRA_SIZE = "fs_size"
+
+        /** Absolute path of a local copy to play directly (optional). */
+        const val EXTRA_LOCAL_FILE = "local_file"
     }
 }
