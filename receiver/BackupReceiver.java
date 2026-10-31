@@ -2040,13 +2040,14 @@ final class AccountLink {
 /**
  * MeshSidecar — a supervised easytier-core child process joining THIS user's
  * nb- network (M4c). The receiver writes the TOML config from the account
- * provisioning (schema validated against easytier-core 2.6.4 --check-config:
- * top-level identity + [network_identity] + [[peer]], `listeners = []`,
- * `[flags] secure_mode`), then launches the core with its own RPC portal and
+ * provisioning (schema validated against easytier-core 2.7.0
+ * easytier-core/src/config/toml.rs: top-level identity + [network_identity]
+ * + [[peer]], `listeners = []`, `[secure_mode] enabled`), then launches the
+ * core with its own RPC portal and
  * supervises it: on exit it is relaunched (rewriting the config first, so a
  * rotated network secret is picked up).
  *
- * Secure mode: the first launch tries `[flags] secure_mode = true`. If the
+ * Secure mode: the first launch tries `[secure_mode] enabled = true`. If the
  * process dies within the probe window for a non-privilege reason, it is
  * retried once without secure mode and the fallback is logged loudly —
  * 2.6.4 exposes no stable node public key to pin (see docs/m4b-notes.md),
@@ -2120,7 +2121,11 @@ final class MeshSidecar {
         b.append("[[peer]]\n");
         b.append("uri = \"").append(tomlEsc(st.publicNode)).append("\"\n");
         if (secureMode && !secureFellBack) {
-            b.append("\n[flags]\nsecure_mode = true\n");
+            // easytier-core 2.7.0 schema (easytier-core/src/config/toml.rs:
+            // Config.secure_mode is a top-level field): secure mode is its
+            // own [secure_mode] section. The 2.6.4 spelling
+            // `[flags] secure_mode = true` is rejected by 2.7.0.
+            b.append("\n[secure_mode]\nenabled = true\n");
         }
         Files.writeString(configFile(), b.toString(), StandardCharsets.UTF_8);
         try {
