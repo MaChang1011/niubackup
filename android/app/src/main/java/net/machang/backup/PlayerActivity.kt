@@ -56,6 +56,11 @@ class PlayerActivity : Activity() {
         val size = intent.getLongExtra(EXTRA_SIZE, -1)
         val fileName = path.substringAfterLast('/')
         Ui.statusBar(this, Ui.VIEW_BG)
+        // Same edge-to-edge opt-out as the tab scaffold (Ui.page): the
+        // insets listener below then owns the top bar's status clearance.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

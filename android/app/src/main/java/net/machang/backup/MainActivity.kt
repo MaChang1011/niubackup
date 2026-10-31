@@ -522,6 +522,7 @@ class MainActivity : Activity() {
                 text = "自动备份（充电 + WiFi + 空闲 + 直连时）"
                 textSize = 13.5f
                 setTextColor(Ui.INK)
+                minHeight = Ui.dp(this@MainActivity, 44)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     buttonTintList = android.content.res.ColorStateList.valueOf(Ui.BRAND_600)
                 }

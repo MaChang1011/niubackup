@@ -89,7 +89,7 @@ class RecordsActivity : Activity() {
             ).apply {
                 leftMargin = Ui.dp(this@RecordsActivity, 16)
                 rightMargin = Ui.dp(this@RecordsActivity, 16)
-                topMargin = Ui.dp(this@RecordsActivity, 8)
+                topMargin = Ui.dp(this@RecordsActivity, Ui.PAGE_TOP)
             }
         }
         stripText = TextView(this).apply {

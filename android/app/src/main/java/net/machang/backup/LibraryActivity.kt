@@ -43,9 +43,10 @@ import kotlin.concurrent.thread
  * Mockup behaviors: filter chips （全部/照片/视频/未备份）, video tiles show a
  * duration chip, 仅PC有 tiles are dimmed with a PC overlay, tapping an image
  * tile opens the full-screen photo preview, and SELECTION MODE (long-press,
- * or tapping a backed video) replaces the header in place: 取消 / 已选 N 项 /
- * 释放空间 (the scarce orange CTA), with the mandatory 释放安全 card above
- * the nav bar. The §6.4 free-up-space flow behind it is unchanged:
+ * or tapping a backed video) shows an action bar at the top of the content
+ * area — 取消 / 已选 N 项 / 释放空间 (the scarce orange CTA) — under the app
+ * bar, which itself never moves or changes, with the mandatory 释放安全
+ * card above the nav bar. The §6.4 free-up-space flow behind it is unchanged:
  * receipt-gated, live integrity cross-check when the PC is reachable,
  * explicit confirmation, then a MediaStore delete with system consent.
  */
@@ -73,8 +74,8 @@ class LibraryActivity : Activity() {
     }
 
     private val main = Handler(Looper.getMainLooper())
-    private lateinit var appBar: View
     private lateinit var statusView: TextView
+    private lateinit var emptyView: TextView
     private lateinit var countView: TextView
     private lateinit var chipsRow: LinearLayout
     private lateinit var selBar: LinearLayout
@@ -103,14 +104,14 @@ class LibraryActivity : Activity() {
         super.onCreate(savedInstanceState)
         val page = Ui.page(this, Ui.Page.LIBRARY, "文件库")
         val col = page.content
-        appBar = page.headerBar
 
-        // ---- selection-mode bar (replaces the header in place, mockup)
+        // ---- selection-mode action bar: lives at the top of the CONTENT
+        // area; the scaffold app bar above it stays fixed and untouched.
         selBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 12),
-                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 4))
+            setPadding(Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, Ui.PAGE_TOP),
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 8))
             visibility = View.GONE
             val cancel = TextView(this@LibraryActivity).apply {
                 text = "取消"
@@ -150,7 +151,7 @@ class LibraryActivity : Activity() {
         val chipsOuter = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 6),
+            setPadding(Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, Ui.PAGE_TOP),
                 Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 2))
         }
         chipsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -196,8 +197,37 @@ class LibraryActivity : Activity() {
                 }
             }
         }
-        col.addView(
+        // Grid area: the grid plus a centered empty state over it (the
+        // same centered-hint treatment as the records page's empty card).
+        val gridWrap = FrameLayout(this)
+        gridWrap.addView(
             gridView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        emptyView = TextView(this).apply {
+            text = "没有可显示的文件。\n完成一次备份后，这里会显示每个文件的备份状态。"
+            textSize = 12f
+            setTextColor(Ui.SLATE)
+            gravity = Gravity.CENTER
+            setLineSpacing(0f, 1.5f)
+            setPadding(
+                Ui.dp(this@LibraryActivity, 40), 0,
+                Ui.dp(this@LibraryActivity, 40), 0
+            )
+            visibility = View.GONE
+        }
+        gridWrap.addView(
+            emptyView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        col.addView(
+            gridWrap,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
 
@@ -361,12 +391,10 @@ class LibraryActivity : Activity() {
                 liveOk = live != null
                 liveByPath = liveMap
                 selected.retainAll(merged.filter { it.status == Status.BACKED }.map { it.path })
-                statusView.text = when {
-                    merged.isEmpty() ->
-                        "没有可显示的文件。完成一次备份后，这里会显示每个文件的备份状态。"
-                    liveOk -> "电脑记录为实时"
-                    else -> "电脑离线（按回执判断）"
-                }
+                // The status line reports only the connection state; the
+                // empty case is the centered overlay over the grid area.
+                emptyView.visibility = if (merged.isEmpty()) View.VISIBLE else View.GONE
+                statusView.text = if (liveOk) "电脑记录为实时" else "电脑离线（按回执判断）"
                 (gridView.adapter as BaseAdapter).notifyDataSetChanged()
                 updateCount()
                 updateSelectionUi()
@@ -392,11 +420,10 @@ class LibraryActivity : Activity() {
 
     private fun updateSelectionUi() {
         val selecting = selected.isNotEmpty()
+        // Only the in-content action bar appears; the app bar above it
+        // stays fixed and visible, so entering/leaving selection mode
+        // never shifts the page's top chrome.
         selBar.visibility = if (selecting) View.VISIBLE else View.GONE
-        // Selection mode takes over the fixed app bar's place (mockup).
-        if (::appBar.isInitialized) {
-            appBar.visibility = if (selecting) View.GONE else View.VISIBLE
-        }
         safetyCard.visibility = if (selecting) View.VISIBLE else View.GONE
         if (!selecting) return
         val chosen = items.filter { it.path in selected }

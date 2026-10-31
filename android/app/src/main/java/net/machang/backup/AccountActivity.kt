@@ -495,7 +495,7 @@ class AccountActivity : Activity() {
         ).apply {
             leftMargin = Ui.dp(this@AccountActivity, 16)
             rightMargin = Ui.dp(this@AccountActivity, 16)
-            topMargin = Ui.dp(this@AccountActivity, 11)
+            topMargin = Ui.dp(this@AccountActivity, Ui.PAGE_TOP)
             bottomMargin = Ui.dp(this@AccountActivity, 16)
         })
     }

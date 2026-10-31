@@ -115,6 +115,11 @@ class PhotoPreviewActivity : Activity() {
         index = (intent.getIntExtra(EXTRA_INDEX, 0)).coerceIn(0, paths.size - 1)
 
         Ui.statusBar(this, Ui.PHOTO_BG)
+        // Same edge-to-edge opt-out as the tab scaffold (Ui.page): the
+        // insets listener in buildUi then owns the top bar's clearance.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+        }
         buildUi()
         showCurrent()
         maybeShowHint()
@@ -158,8 +163,12 @@ class PhotoPreviewActivity : Activity() {
                     Color.TRANSPARENT
                 )
             )
+            // Top offset matches the player page (14 sides, 10 top +
+            // status inset, 32dp circle back button) so both viewer
+            // screens place their close control identically; the taller
+            // bottom padding is the scrim's fade tail below the controls.
             setPadding(
-                Ui.dp(this@PhotoPreviewActivity, 14), Ui.dp(this@PhotoPreviewActivity, 12),
+                Ui.dp(this@PhotoPreviewActivity, 14), Ui.dp(this@PhotoPreviewActivity, 10),
                 Ui.dp(this@PhotoPreviewActivity, 14), Ui.dp(this@PhotoPreviewActivity, 18)
             )
         }
@@ -269,7 +278,7 @@ class PhotoPreviewActivity : Activity() {
             root.setOnApplyWindowInsetsListener { _, insets ->
                 val bars = insets.getInsets(WindowInsets.Type.systemBars())
                 topBar.setPadding(
-                    Ui.dp(this, 14), Ui.dp(this, 12) + bars.top,
+                    Ui.dp(this, 14), Ui.dp(this, 10) + bars.top,
                     Ui.dp(this, 14), Ui.dp(this, 18)
                 )
                 actionsBar.setPadding(

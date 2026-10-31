@@ -97,6 +97,15 @@ object Ui {
     const val R_BADGE = 6
     const val R_THUMB = 9
 
+    // Top-chrome geometry, shared by every page so tab switches never
+    // shift the header or the first content element (top alignment pass):
+    // the app bar's content height is FIXED at 8dp top pad + the 28dp
+    // brand row + 10dp bottom pad, and every page's first content element
+    // starts exactly PAGE_TOP below the bar.
+    const val BAR_HEIGHT = 46
+    const val BAR_ROW = 28
+    const val PAGE_TOP = 12
+
     enum class StatusKind(val bg: Int, val text: Int, val dot: Int) {
         OK(OK_BG, OK_TEXT, Color.rgb(0x1E, 0x9E, 0x66)),
         RUN(RUN_BG, RUN_TEXT, Color.rgb(0x24, 0x70, 0xD8)),
@@ -179,12 +188,13 @@ object Ui {
      * away (MainActivity/AccountActivity bodies scroll under it).
      *
      * Edge-to-edge (targetSdk 35 draws behind the system bars): on API 30+
-     * the scaffold opts out of decor-fitting and pads the app bar by the
-     * status-bar inset — the BRAND_800 band extends through the status
-     * area with white icons, so the header looks intentional — and pads
-     * the nav bar by the navigation-bar inset so it clears the gesture
-     * bar. Below API 30 the framework still fits the window itself and
-     * the BRAND_800 status bar color carries the same look.
+     * the scaffold opts out of decor-fitting and grows the app bar by the
+     * status-bar inset — its padding stays constant, so the brand row
+     * keeps its exact [BAR_HEIGHT] geometry and simply extends through
+     * the status area (BRAND_800, white icons) — and pads the nav bar by
+     * the navigation-bar inset so it clears the gesture bar. Below API 30
+     * the framework still fits the window itself and the BRAND_800 status
+     * bar color carries the same look.
      */
     fun page(act: Activity, current: Page, title: String): PageRoot {
         statusBar(act, BRAND_800, lightIcons = true)
@@ -209,10 +219,12 @@ object Ui {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             root.setOnApplyWindowInsetsListener { _, insets ->
                 val bars = insets.getInsets(WindowInsets.Type.systemBars())
-                bar.setPadding(
-                    dp(act, 16), dp(act, 8) + bars.top,
-                    dp(act, 16), dp(act, 10)
-                )
+                // Grow the bar by the status inset instead of re-padding
+                // it: the brand row's inner geometry never changes, so
+                // the header is pixel-identical on every page.
+                val lp = bar.layoutParams as LinearLayout.LayoutParams
+                lp.height = dp(act, BAR_HEIGHT) + bars.top
+                bar.layoutParams = lp
                 nav.setPadding(0, 0, 0, bars.bottom)
                 insets
             }
@@ -226,6 +238,12 @@ object Ui {
      * wordmark on the left, the page title next to it, and an empty right
      * slot ([PageRoot.headerRight]) for the page's status pill / action.
      * BRAND_800 so it flows seamlessly from the same-colored status area.
+     *
+     * The bar's height is FIXED at [BAR_HEIGHT] and every element of the
+     * brand row (tile, wordmark, title, right slot) is exactly [BAR_ROW]
+     * tall, so nothing a page puts in the right slot can grow or shrink
+     * the header, and the wordmark/title text boxes share the tile's
+     * center line on every page — tab switches are pixel-stable.
      */
     fun appBar(act: Activity, title: String): Pair<LinearLayout, LinearLayout> {
         val bar = LinearLayout(act).apply {
@@ -234,30 +252,47 @@ object Ui {
             setBackgroundColor(BRAND_800)
             setPadding(dp(act, 16), dp(act, 8), dp(act, 16), dp(act, 10))
             elevation = dp(act, 2).toFloat()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(act, BAR_HEIGHT)
+            )
         }
-        bar.addView(brandTile(act, 28))
-        bar.addView(TextView(act).apply {
-            text = "牛备"
-            textSize = 16f
-            typeface = font(900)
-            setTextColor(Color.WHITE)
-            setPadding(dp(act, 8), 0, 0, 0)
-        })
+        bar.addView(brandTile(act, BAR_ROW))
+        bar.addView(
+            TextView(act).apply {
+                text = "牛备"
+                textSize = 16f
+                typeface = font(900)
+                setTextColor(Color.WHITE)
+                includeFontPadding = false
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(act, 8), 0, 0, 0)
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(act, BAR_ROW)
+            )
+        )
         bar.addView(
             TextView(act).apply {
                 text = title
                 textSize = 15f
                 typeface = font(600)
                 setTextColor(BRAND_100)
+                includeFontPadding = false
+                gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(act, 10), 0, 0, 0)
             },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            LinearLayout.LayoutParams(0, dp(act, BAR_ROW), 1f)
         )
         val right = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        bar.addView(right)
+        bar.addView(
+            right,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(act, BAR_ROW)
+            )
+        )
         return bar to right
     }
 
@@ -331,7 +366,9 @@ object Ui {
 
     /**
      * A white card (radius 16, mockup shadow, 14dp inner padding) with 16dp
-     * page margins. Add it WITHOUT layout params so its margins apply.
+     * side margins and a [PAGE_TOP] top gap — the same gap above every
+     * card, so a page's first card starts at the same offset everywhere.
+     * Add it WITHOUT layout params so its margins apply.
      */
     fun cardBlock(act: Activity, build: LinearLayout.() -> Unit): LinearLayout {
         val card = LinearLayout(act).apply {
@@ -343,7 +380,7 @@ object Ui {
             ).apply {
                 leftMargin = dp(act, 16)
                 rightMargin = dp(act, 16)
-                topMargin = dp(act, 11)
+                topMargin = dp(act, PAGE_TOP)
             }
         }
         elevateCard(act, card)
@@ -382,11 +419,12 @@ object Ui {
         stateListAnimator = null
     }
 
-    /** Primary action: brand-600 fill, radius 12. */
+    /** Primary action: brand-600 fill, radius 12, 44dp touch height. */
     fun primaryButton(act: Activity, text: String): Button = baseButton(act, text).apply {
         textSize = 14f
         setTextColor(Color.WHITE)
         background = rounded(act, BRAND_600, R_BTN)
+        minHeight = dp(act, 44)
         setPadding(dp(act, 18), dp(act, 11), dp(act, 18), dp(act, 11))
     }
 
@@ -395,6 +433,7 @@ object Ui {
         textSize = 14f
         setTextColor(Color.WHITE)
         background = rounded(act, ACCENT, R_BTN)
+        minHeight = dp(act, 44)
         setPadding(dp(act, 18), dp(act, 11), dp(act, 18), dp(act, 11))
     }
 
@@ -409,7 +448,7 @@ object Ui {
         ).apply {
             leftMargin = dp(act, 16)
             rightMargin = dp(act, 16)
-            topMargin = dp(act, 11)
+            topMargin = dp(act, PAGE_TOP)
         }
     }
 
@@ -417,6 +456,7 @@ object Ui {
         textSize = 13f
         setTextColor(BRAND_700)
         background = rounded(act, MIST, R_BTN)
+        minHeight = dp(act, 44)
         setPadding(dp(act, 14), dp(act, 9), dp(act, 14), dp(act, 9))
     }
 
@@ -427,7 +467,11 @@ object Ui {
         background = rounded(act, MIST, 8)
         minWidth = 0
         minimumWidth = 0
-        setPadding(dp(act, 10), dp(act, 6), dp(act, 10), dp(act, 6))
+        // No platform minimum height: an xs button must fit the app bar's
+        // fixed 28dp right slot without stretching the header.
+        minHeight = 0
+        minimumHeight = 0
+        setPadding(dp(act, 10), dp(act, 5), dp(act, 10), dp(act, 5))
     }
 
     fun field(act: Activity, hintText: String, password: Boolean = false): EditText =
@@ -437,6 +481,7 @@ object Ui {
             setTextColor(INK)
             setHintTextColor(NAV_INACTIVE)
             background = rounded(act, PAPER, R_BTN, LINE, 1)
+            minHeight = dp(act, 48)
             setPadding(dp(act, 12), dp(act, 11), dp(act, 12), dp(act, 11))
             inputType = InputType.TYPE_CLASS_TEXT or
                 (if (password) InputType.TYPE_TEXT_VARIATION_PASSWORD
