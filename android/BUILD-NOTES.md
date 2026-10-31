@@ -100,3 +100,40 @@ session; password only after explicit logout or server-side invalidation).
   in the dex. NOT installed this round — see docs/session-persistence.md
   for the on-device checklist and the remaining limits (30-day refresh
   window, lost-rotation-response edge).
+
+## Addendum (2026-10-31) — approved-design reskin + photo preview
+
+- The four pages, the player, and the new photo preview are skinned to the
+  user-approved design mockup (artifact `niubackup` v1.1; tokens extracted
+  verbatim via artifact inspection): brand teal scale (primary #0E6B7E),
+  scarce 牛橙 accent #F07F13, status pairs （已备份 #1E9E66 / 备份中 #2470D8 /
+  等待直连 #C77400 / 仅PC有 slate), radii 16/12/10/6, cards on #F3F7F8.
+  All skin lives in Ui.kt (tokens, badges/pills, filter chips, kv rows,
+  progress bar, brand tile, line-icon bottom nav with accent dot).
+- 备份： header mesh pill （直连/等待直连/未连接）; 账户与配对 kv card with the
+  mesh control; 立即备份 big button transforms IN PLACE into the progress
+  card while a session runs; conditions as colored dots （充电/WiFi/空闲/直连）;
+  log card shows the latest 6 lines only.
+- 文件库： filter chips （全部/照片/视频/未备份）; selection mode (long-press)
+  replaces the header （取消/已选 N 项/释放空间 orange) over the mandatory
+  释放安全 card; video duration chips; 仅PC有 dim + PC overlay; image tap
+  opens the preview. §6.4 flow unchanged.
+- 记录： connection pill + persistent freshness strip; ONE card with
+  day-grouped rows, inline 播放/下载回来； meta shows 回执已验证 ✓ when a
+  locally verified receipt covers the path; image rows open the preview.
+- 我的： profile card (gradient 牛 avatar, session/pairing pills), red-tinted
+  standalone logout. Stats card from the mockup NOT reproduced (no honest
+  data source for 已释放空间）; license-expiry date chip likewise omitted
+  (expiry is not exposed by existing client calls).
+- PlayerActivity: dark immersive skin, custom transport (accent seek bar,
+  ±10s, white main circle), persistent 直连流式 chip + note, amber 下载回来
+  + 详情； streaming stack (FsDataSource/ExoPlayer) untouched.
+- NEW PhotoPreviewActivity: full-screen viewer; local decode, PC copies
+  fetched full-size via the existing FsClient download into a preview
+  cache; translucent top bar (name/date/badge), swipe + arrows + dots,
+  pinch/double-tap zoom (ZoomImageView matrix), first-entry 双指放大 hint;
+  bottom 下载回来 (existing publish flow) / 释放空间 (the existing §6.4
+  gates + identical confirmation wording, single-file) / 记录.
+- Engine/protocol/session classes untouched (BackupClient, FsClient,
+  FsDataSource, PcConn, AccountClient, SessionRestore, SecureStore,
+  BackupVpnService, AutoBackupWorker).

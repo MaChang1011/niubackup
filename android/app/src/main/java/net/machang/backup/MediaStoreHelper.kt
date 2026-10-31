@@ -100,4 +100,11 @@ object MediaStoreHelper {
     }
 
     fun isPlayableName(name: String): Boolean = isVideoName(name) || isAudioName(name)
+
+    fun isImageName(name: String): Boolean {
+        val n = name.lowercase()
+        return n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") ||
+            n.endsWith(".heic") || n.endsWith(".heif") || n.endsWith(".webp") ||
+            n.endsWith(".gif") || n.endsWith(".bmp")
+    }
 }

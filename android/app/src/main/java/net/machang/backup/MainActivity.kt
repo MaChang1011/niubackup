@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -15,6 +16,9 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
@@ -28,14 +32,12 @@ import java.util.function.IntSupplier
 import kotlin.concurrent.thread
 
 /**
- * 备份 (Home) page:
- *  - 状态卡： account / pairing summary (details live on the 我的 page).
- *  - 组网卡： start/stop the mesh (product config when logged in, else the
- *    self-use machang-net secret) via [BackupVpnService].
- *  - 备份卡： big manual-backup button, live session progress, last-session
- *    summary, the auto-backup toggle (charging + WiFi + idle + direct route,
- *    WorkManager) with a live conditions indicator.
- *  - 日志卡： scrolling view fed by [AppLog].
+ * 备份 (Home) page, laid out per the approved design mockup (v1.1):
+ * header title + persistent mesh status pill → 账户与配对 card (kv rows +
+ * mesh control) → 立即备份 big button, which transforms IN PLACE into the
+ * progress card while a session runs (no page jump, no modal) → 上次备份
+ * card (summary + auto-backup toggle + live conditions dots) → 日志 card
+ * (latest human-readable lines only).
  *
  * Account forms, settings and developer overrides live in [AccountActivity];
  * the file library and PC records are their own pages (bottom navigation).
@@ -50,14 +52,22 @@ class MainActivity : Activity() {
         private const val KEY_LAST_SESSION = "last_session_summary"
     }
 
-    private lateinit var accountLine: TextView
-    private lateinit var pairingLine: TextView
+    private lateinit var meshPill: LinearLayout
+    private lateinit var accountValue: TextView
+    private lateinit var pairingSlot: LinearLayout
+    private lateinit var targetValue: TextView
     private lateinit var meshLine: TextView
     private lateinit var vpnButton: Button
+    private lateinit var backupButton: Button
+    private lateinit var progressCard: LinearLayout
+    private lateinit var progressBadgeSlot: LinearLayout
+    private lateinit var progressFile: TextView
+    private lateinit var progressSize: TextView
+    private lateinit var progressBar: Ui.ProgressBarView
     private lateinit var sessionLine: TextView
-    private lateinit var conditionsLine: TextView
     private lateinit var logView: TextView
 
+    private val condDots = HashMap<String, View>()
     private val handler = Handler(Looper.getMainLooper())
     private var poller: Runnable? = null
 
@@ -116,44 +126,66 @@ class MainActivity : Activity() {
 
     private fun refreshStatusCard() {
         val account = SecureStore.get(this, SecureStore.KEY_ACCOUNT)
-        val deviceId = SecureStore.get(this, SecureStore.KEY_DEVICE_ID)
-        val network = prefs().getString("network_name", null)
+        targetValue.text = "${PcConn.pcHost(this)} · 电脑备份目录"
         if (account == null) {
-            accountLine.text = if (SessionRestore.expiredHintPending(this)) {
+            accountValue.text = if (SessionRestore.expiredHintPending(this)) {
                 "登录已过期 — 去「我的」页重新登录"
             } else {
                 "未登录 — 去「我的」页注册或登录"
             }
-            pairingLine.text = "配对: —"
+            setPairingBadge("配对: —", Ui.StatusKind.NONE)
             return
         }
-        accountLine.text = "已登录: $account（设备 #$deviceId，网络 ${network ?: "—"}）"
-        pairingLine.text = "配对: 查询中…"
-        val devId = deviceId?.toLongOrNull()
+        accountValue.text = account
+        setPairingBadge("配对: 查询中…", Ui.StatusKind.NONE)
+        val devId = SecureStore.get(this, SecureStore.KEY_DEVICE_ID)?.toLongOrNull()
         val token = SecureStore.get(this, SecureStore.KEY_DEVICE_TOKEN)
         if (devId == null || token == null) {
-            pairingLine.text = "配对: —"
+            setPairingBadge("配对: —", Ui.StatusKind.NONE)
             return
         }
         thread(name = "home-pairing") {
-            val text = try {
+            val (text, kind) = try {
                 val (valid, reason) = AccountClient(PcConn.serverUrl(this)).validate(devId, token)
-                if (valid) "配对: 已批准 ✔" else "配对: $reason" +
-                    if (reason == "not_approved") "（等待电脑端批准）" else ""
+                if (valid) {
+                    "已批准" to Ui.StatusKind.OK
+                } else {
+                    (reason + if (reason == "not_approved") "（等待电脑端批准）" else "") to
+                        Ui.StatusKind.WAIT
+                }
             } catch (t: Throwable) {
-                "配对: 未知（账户服务不可达）"
+                "未知（账户服务不可达）" to Ui.StatusKind.NONE
             }
-            runOnUiThread { if (!isFinishing) pairingLine.text = text }
+            runOnUiThread { if (!isFinishing) setPairingBadge(text, kind) }
         }
     }
 
+    private fun setPairingBadge(text: String, kind: Ui.StatusKind) {
+        pairingSlot.removeAllViews()
+        pairingSlot.addView(Ui.badge(this, text, kind))
+    }
+
     private fun refreshSessionLine() {
-        sessionLine.text = if (BackupProgress.active) {
-            val p = BackupProgress.currentPath ?: ""
-            "备份进行中：$p（${BackupProgress.percent}%）"
+        if (BackupProgress.active) {
+            // Design rule: the big button transforms in place into the
+            // progress card while a session runs.
+            backupButton.visibility = View.GONE
+            progressCard.visibility = View.VISIBLE
+            val path = BackupProgress.currentPath ?: ""
+            progressFile.text = path.substringAfterLast('/').ifEmpty { "准备中…" }
+            progressSize.text = "${BackupProgress.percent}%"
+            progressBar.setPercent(BackupProgress.percent)
+            progressBadgeSlot.removeAllViews()
+            progressBadgeSlot.addView(
+                Ui.badge(this, "备份中 · ${BackupProgress.percent}%", Ui.StatusKind.RUN)
+            )
         } else {
-            prefs().getString(KEY_LAST_SESSION, "上次备份: 暂无记录") ?: "上次备份: 暂无记录"
+            progressCard.visibility = View.GONE
+            backupButton.visibility = View.VISIBLE
         }
+        sessionLine.text =
+            prefs().getString(KEY_LAST_SESSION, "暂无记录 — 完成一次备份后显示摘要")
+                ?: "暂无记录 — 完成一次备份后显示摘要"
     }
 
     // ------------------------------------------------------- conditions UI
@@ -176,7 +208,11 @@ class MainActivity : Activity() {
         poller = null
     }
 
-    /** Renders 充电 ● / WiFi ● / 空闲 ○ / 直连 ○ — route cost is a JNI call, off-thread. */
+    /**
+     * Live auto-backup conditions: 充电 / WiFi / 空闲 / 直连 dots (green when
+     * met, hollow slate otherwise). Route cost is a JNI call, off-thread.
+     * Also drives the header mesh pill （直连 / 等待直连）.
+     */
     private fun refreshConditionsAsync() {
         val charging = isCharging()
         val wifi = isOnWifi()
@@ -187,10 +223,29 @@ class MainActivity : Activity() {
             } catch (t: Throwable) {
                 false
             }
-            val dot = { on: Boolean -> if (on) "●" else "○" }
-            val text = "自动备份条件：充电 ${dot(charging)} · WiFi ${dot(wifi)} · " +
-                "空闲 ${dot(idle)} · 直连 ${dot(direct)}"
-            runOnUiThread { if (!isFinishing) conditionsLine.text = text }
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                setDot("充电", charging)
+                setDot("WiFi", wifi)
+                setDot("空闲", idle)
+                setDot("直连", direct)
+                when {
+                    direct -> Ui.setPill(meshPill, "组网已连接 · 直连", Ui.StatusKind.OK)
+                    meshRunning -> Ui.setPill(meshPill, "等待直连", Ui.StatusKind.WAIT)
+                    else -> Ui.setPill(meshPill, "组网未连接", Ui.StatusKind.PC)
+                }
+            }
+        }
+    }
+
+    private fun setDot(key: String, on: Boolean) {
+        val dot = condDots[key] ?: return
+        dot.background = if (on) {
+            Ui.circleDrawable(this, Ui.OK)
+        } else {
+            Ui.rounded(this, Color.TRANSPARENT, 999, Ui.SLATE, 1).apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+            }
         }
     }
 
@@ -226,7 +281,8 @@ class MainActivity : Activity() {
             )
             meshRunning = false
             vpnButton.text = "启动组网"
-            meshLine.text = "组网: 未运行"
+            meshLine.text = "未运行"
+            Ui.setPill(meshPill, "组网未连接", Ui.StatusKind.PC)
             AppLog.log("已请求停止组网")
             return
         }
@@ -248,7 +304,8 @@ class MainActivity : Activity() {
         PcConn.startMesh(this)
         meshRunning = true
         vpnButton.text = "停止组网"
-        meshLine.text = "组网: 启动中…"
+        meshLine.text = "启动中…"
+        Ui.setPill(meshPill, "等待直连", Ui.StatusKind.WAIT)
         AppLog.log("组网启动中…")
     }
 
@@ -309,7 +366,10 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ UI
 
     private fun renderLog() {
-        if (::logView.isInitialized) logView.text = AppLog.snapshot()
+        if (!::logView.isInitialized) return
+        // Home shows only the latest human lines (mockup: 3–4 lines).
+        val lines = AppLog.snapshot().trimEnd('\n').split('\n').filter { it.isNotBlank() }
+        logView.text = lines.takeLast(6).joinToString("\n")
     }
 
     private fun requestStoragePermissions() {
@@ -340,43 +400,123 @@ class MainActivity : Activity() {
             scroll,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
-        col.addView(Ui.header(this, "备份", "手机文件自动备份到你自己的电脑"))
+        meshPill = Ui.pill(this, "组网未连接", Ui.StatusKind.PC)
+        col.addView(Ui.header(this, "备份", right = meshPill))
 
-        // ---- status card
+        // ---- 账户与配对 card (kv rows + mesh control)
         col.addView(Ui.cardBlock(this) {
-            addView(Ui.sectionTitle(this@MainActivity, "状态"))
-            accountLine = Ui.bodyText(this@MainActivity)
-            addView(accountLine)
-            pairingLine = Ui.bodyText(this@MainActivity)
-            addView(pairingLine, Ui.spaced(Ui.matchWrap(), 4, this@MainActivity))
-        })
-
-        // ---- mesh card
-        col.addView(Ui.cardBlock(this) {
-            addView(Ui.sectionTitle(this@MainActivity, "组网"))
-            meshLine = Ui.bodyText(this@MainActivity, "组网: 未运行")
-            addView(meshLine)
-            vpnButton = Ui.accentButton(this@MainActivity, "启动组网").apply {
+            accountValue = Ui.kvValue(this@MainActivity, "")
+            addView(Ui.kvRow(this@MainActivity, "账号", accountValue))
+            pairingSlot = LinearLayout(this@MainActivity).apply {
+                gravity = Gravity.END
+            }
+            addView(Ui.kvRow(this@MainActivity, "配对状态", pairingSlot))
+            targetValue = Ui.kvValue(this@MainActivity, "")
+            addView(Ui.kvRow(this@MainActivity, "备份目标", targetValue))
+            addView(Ui.hairline(this@MainActivity))
+            val meshRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val meshCol = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            meshCol.addView(TextView(this@MainActivity).apply {
+                text = "产品组网"
+                textSize = 13.5f
+                setTextColor(Ui.INK)
+                typeface = Ui.font(700)
+            })
+            meshLine = Ui.subText(this@MainActivity, "未运行")
+            meshCol.addView(meshLine)
+            meshRow.addView(
+                meshCol,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            vpnButton = Ui.ghostButton(this@MainActivity, "启动组网").apply {
                 setOnClickListener { onMeshButton() }
             }
-            addView(vpnButton, Ui.spaced(Ui.matchWrap(), 8, this@MainActivity))
+            meshRow.addView(vpnButton)
+            addView(meshRow)
             addView(
-                Ui.subText(this@MainActivity, "组网连上后才能备份、下载和播放；备份只走直连，不走中继。"),
+                Ui.subText(
+                    this@MainActivity,
+                    "组网连上后才能备份、下载和播放；备份只走直连，不走中继。"
+                ),
                 Ui.spaced(Ui.matchWrap(), 6, this@MainActivity)
             )
         })
 
-        // ---- backup card
+        // ---- 立即备份 big button (transforms into the progress card)
+        backupButton = Ui.bigButton(this, "立即备份").apply {
+            setOnClickListener { onManualBackup() }
+        }
+        col.addView(backupButton)
+
+        // ---- progress card (hidden until a session runs)
+        progressCard = Ui.cardBlock(this) {
+            val headRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            headRow.addView(TextView(this@MainActivity).apply {
+                text = "本次进度"
+                textSize = 12f
+                setTextColor(Ui.SLATE)
+                typeface = Ui.font(700)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            progressBadgeSlot = LinearLayout(this@MainActivity)
+            headRow.addView(progressBadgeSlot)
+            addView(headRow)
+            val fileRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, Ui.dp(this@MainActivity, 8), 0, Ui.dp(this@MainActivity, 8))
+            }
+            progressFile = TextView(this@MainActivity).apply {
+                textSize = 13.5f
+                setTextColor(Ui.INK)
+                typeface = Ui.font(800)
+                setSingleLine(true)
+                ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            }
+            fileRow.addView(
+                progressFile,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            progressSize = TextView(this@MainActivity).apply {
+                textSize = 11.5f
+                setTextColor(Ui.SLATE)
+            }
+            fileRow.addView(progressSize)
+            addView(fileRow)
+            progressBar = Ui.progressBar(this@MainActivity, Ui.RUN)
+            addView(progressBar)
+            addView(
+                Ui.subText(this@MainActivity, "正在经直连传输；断点续传已启用，中断后可继续。"),
+                Ui.spaced(Ui.matchWrap(), 8, this@MainActivity)
+            )
+        }
+        progressCard.visibility = View.GONE
+        col.addView(progressCard)
+
+        // ---- 上次备份 card (+ auto-backup toggle + conditions dots)
         col.addView(Ui.cardBlock(this) {
-            addView(Ui.sectionTitle(this@MainActivity, "备份"))
-            addView(Ui.accentButton(this@MainActivity, "立即备份 DCIM").apply {
-                setOnClickListener { onManualBackup() }
-            }, Ui.matchWrap())
-            sessionLine = Ui.bodyText(this@MainActivity)
-            addView(sessionLine, Ui.spaced(Ui.matchWrap(), 8, this@MainActivity))
+            addView(Ui.sectionTitle(this@MainActivity, "上次备份"))
+            sessionLine = TextView(this@MainActivity).apply {
+                textSize = 13f
+                setTextColor(Ui.INK)
+                typeface = Ui.font(700)
+            }
+            addView(sessionLine)
+            addView(Ui.hairline(this@MainActivity))
             val autoBox = CheckBox(this@MainActivity).apply {
                 text = "自动备份（充电 + WiFi + 空闲 + 直连时）"
-                textSize = 14f
+                textSize = 13.5f
+                setTextColor(Ui.INK)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    buttonTintList = android.content.res.ColorStateList.valueOf(Ui.BRAND_600)
+                }
                 isChecked = prefs().getBoolean(KEY_AUTO, false)
                 setOnCheckedChangeListener { _, checked ->
                     prefs().edit().putBoolean(KEY_AUTO, checked).apply()
@@ -384,20 +524,52 @@ class MainActivity : Activity() {
                     AppLog.log(if (checked) "自动备份已开启" else "自动备份已关闭")
                 }
             }
-            addView(autoBox, Ui.spaced(Ui.matchWrap(), 8, this@MainActivity))
-            conditionsLine = Ui.subText(this@MainActivity)
-            addView(conditionsLine, Ui.spaced(Ui.matchWrap(), 2, this@MainActivity))
+            addView(autoBox, Ui.spaced(Ui.matchWrap(), 2, this@MainActivity))
+            val condRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, Ui.dp(this@MainActivity, 8), 0, 0)
+            }
+            for (label in listOf("充电", "WiFi", "空闲", "直连")) {
+                val group = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val dot = View(this@MainActivity).apply {
+                    background = Ui.circleDrawable(this@MainActivity, Ui.SLATE_BG)
+                }
+                condDots[label] = dot
+                group.addView(
+                    dot,
+                    LinearLayout.LayoutParams(
+                        Ui.dp(this@MainActivity, 8), Ui.dp(this@MainActivity, 8)
+                    ).apply { rightMargin = Ui.dp(this@MainActivity, 5) }
+                )
+                group.addView(TextView(this@MainActivity).apply {
+                    text = label
+                    textSize = 12f
+                    setTextColor(Ui.INK_2)
+                })
+                condRow.addView(
+                    group,
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+            addView(condRow)
         })
 
-        // ---- log card
+        // ---- 日志 card (latest lines only)
         col.addView(Ui.cardBlock(this) {
             addView(Ui.sectionTitle(this@MainActivity, "日志"))
             logView = TextView(this@MainActivity).apply {
-                textSize = 12f
+                textSize = 10.5f
                 typeface = android.graphics.Typeface.MONOSPACE
-                setTextColor(Ui.TEXT_SUB)
+                setTextColor(Ui.INK_2)
+                setLineSpacing(0f, 1.6f)
             }
             addView(logView)
         })
+        col.addView(View(this), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 12)
+        ))
     }
 }

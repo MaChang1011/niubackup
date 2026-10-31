@@ -63,10 +63,15 @@ object PcConn {
         }
     }
 
-    /** Account-service base URL (dev default: reachable only via the mesh). */
+    /**
+     * Account-service base URL. Default is the PUBLIC endpoint so login
+     * works before any mesh exists (the mesh address would be a
+     * chicken-and-egg: you need the account to get the mesh config).
+     * Editable in 我的/设置； a stored preference always wins.
+     */
     fun serverUrl(ctx: Context): String =
-        prefs(ctx).getString("server_url", "http://10.200.0.1:18090")
-            ?: "http://10.200.0.1:18090"
+        prefs(ctx).getString("server_url", "http://36.133.114.164:18090")
+            ?: "http://36.133.114.164:18090"
 
     /**
      * Build the BackupVpnService start intent for the current mode: product

@@ -29,7 +29,8 @@ import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /**
- * 文件库 page (design §6.1): DCIM as a thumbnail grid, merged with backup state.
+ * 文件库 page (design §6.1 + approved mockup v1.1): DCIM as a thumbnail grid,
+ * merged with backup state.
  *
  * Every cell carries one of four badges, merged from three sources:
  *   未备份 — local file with no matching verified receipt / PC record;
@@ -39,21 +40,22 @@ import kotlin.concurrent.thread
  *   仅PC有 — in the receipts / PC records but no longer on the phone
  *             (restorable via §6.3 download-back, streamable via playback).
  *
- * Selecting 已备份 cells and tapping 「释放空间」 runs the §6.4 free-up-space
- * flow: receipt-gated, live integrity cross-check when the PC is reachable,
+ * Mockup behaviors: filter chips （全部/照片/视频/未备份）, video tiles show a
+ * duration chip, 仅PC有 tiles are dimmed with a PC overlay, tapping an image
+ * tile opens the full-screen photo preview, and SELECTION MODE (long-press,
+ * or tapping a backed video) replaces the header in place: 取消 / 已选 N 项 /
+ * 释放空间 (the scarce orange CTA), with the mandatory 释放安全 card above
+ * the nav bar. The §6.4 free-up-space flow behind it is unchanged:
+ * receipt-gated, live integrity cross-check when the PC is reachable,
  * explicit confirmation, then a MediaStore delete with system consent.
- *
- * Styling is intentionally plain (functional restructure first; a design
- * pass reskins later). Thumbnails are decoded off-thread with an LruCache;
- * videos use their first frame, PC-only items a placeholder.
  */
 class LibraryActivity : Activity() {
 
-    enum class Status(val label: String, val color: Int) {
-        NOT_BACKED("未备份", Color.rgb(0xB0, 0x30, 0x30)),
-        BACKING_UP("备份中", Color.rgb(0xB0, 0x70, 0x00)),
-        BACKED("已备份", Color.rgb(0x1E, 0x7A, 0x34)),
-        PC_ONLY("仅PC有", Color.rgb(0x44, 0x55, 0xAA))
+    enum class Status(val label: String, val kind: Ui.StatusKind) {
+        NOT_BACKED("未备份", Ui.StatusKind.NONE),
+        BACKING_UP("备份中", Ui.StatusKind.RUN),
+        BACKED("已备份", Ui.StatusKind.OK),
+        PC_ONLY("仅PC有", Ui.StatusKind.PC)
     }
 
     data class Item(
@@ -66,15 +68,27 @@ class LibraryActivity : Activity() {
         val liveIntegrity: String?
     )
 
+    private enum class Filter(val label: String) {
+        ALL("全部"), PHOTO("照片"), VIDEO("视频"), NOT_BACKED("未备份")
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private lateinit var statusView: TextView
-    private lateinit var freeButton: Button
+    private lateinit var countView: TextView
+    private lateinit var chipsRow: LinearLayout
+    private lateinit var selBar: LinearLayout
+    private lateinit var selCount: TextView
+    private lateinit var safetyCard: LinearLayout
+    private lateinit var safetyText: TextView
     private lateinit var gridView: GridView
     private var items: List<Item> = emptyList()
+    private var receipts: Map<String, ReceiptStore.ReceiptFile> = emptyMap()
     private val selected = HashSet<String>()
     private val downloadPct = HashMap<String, Int>()
+    private val durations = HashMap<String, Long>()
     private var liveOk: Boolean = false
     private var liveByPath: Map<String, FsClient.Record> = emptyMap()
+    private var filterMode = Filter.ALL
     private var poller: Runnable? = null
     private var createdOnce = false
     private var wasPaused = false
@@ -88,47 +102,124 @@ class LibraryActivity : Activity() {
         super.onCreate(savedInstanceState)
         val page = Ui.page(this, Ui.Page.LIBRARY)
         val col = page.content
-        col.addView(Ui.header(this, "文件库", "本机照片/视频与备份状态"))
+
+        // ---- selection-mode bar (replaces the header in place, mockup)
+        selBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 12),
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 4))
+            visibility = View.GONE
+            val cancel = TextView(this@LibraryActivity).apply {
+                text = "取消"
+                textSize = 12.5f
+                setTextColor(Ui.BRAND_600)
+                typeface = Ui.font(600)
+                isClickable = true
+                setOnClickListener {
+                    selected.clear()
+                    (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+                    updateSelectionUi()
+                }
+            }
+            addView(cancel)
+            selCount = TextView(this@LibraryActivity).apply {
+                textSize = 14f
+                setTextColor(Ui.INK)
+                typeface = Ui.font(900)
+                gravity = Gravity.CENTER
+            }
+            addView(selCount, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            ))
+            addView(Ui.accentButton(this@LibraryActivity, "释放空间").apply {
+                textSize = 11.5f
+                setPadding(Ui.dp(this@LibraryActivity, 12), Ui.dp(this@LibraryActivity, 7),
+                    Ui.dp(this@LibraryActivity, 12), Ui.dp(this@LibraryActivity, 7))
+                setOnClickListener { startFreeUpSpace() }
+            })
+        }
+        col.addView(selBar)
+        col.addView(Ui.header(this, "文件库", right = Ui.xsButton(this, "刷新").apply {
+            setOnClickListener { refresh() }
+        }))
+
+        // ---- filter chips + count
+        val chipsOuter = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 6),
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 2))
+        }
+        chipsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        chipsOuter.addView(chipsRow, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+        ))
+        countView = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Ui.SLATE)
+        }
+        chipsOuter.addView(countView)
+        col.addView(chipsOuter)
+        buildChips()
+
         statusView = TextView(this).apply {
             text = "正在扫描 DCIM 并合并备份状态…"
-            textSize = 13.5f
-            setTextColor(Ui.TEXT_SUB)
-            setPadding(Ui.dp(this@LibraryActivity, 16), 4, Ui.dp(this@LibraryActivity, 16), 4)
+            textSize = 12f
+            setTextColor(Ui.SLATE)
+            setPadding(Ui.dp(this@LibraryActivity, 16), 2, Ui.dp(this@LibraryActivity, 16), 4)
         }
         col.addView(statusView)
-        val refreshBtn = Button(this).apply {
-            text = "刷新"
-            setAllCaps(false)
-            setOnClickListener { refresh() }
-        }
-        freeButton = Button(this).apply {
-            text = "释放空间"
-            setAllCaps(false)
-            setOnClickListener { startFreeUpSpace() }
-        }
-        val btnRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(Ui.dp(this@LibraryActivity, 12), 0, Ui.dp(this@LibraryActivity, 12), 0)
-            addView(refreshBtn)
-            addView(freeButton)
-        }
-        col.addView(btnRow)
+
         gridView = GridView(this).apply {
             numColumns = GridView.AUTO_FIT
             columnWidth = Ui.dp(this@LibraryActivity, 110)
-            horizontalSpacing = Ui.dp(this@LibraryActivity, 4)
-            verticalSpacing = Ui.dp(this@LibraryActivity, 4)
+            horizontalSpacing = Ui.dp(this@LibraryActivity, 6)
+            verticalSpacing = Ui.dp(this@LibraryActivity, 6)
             setPadding(
-                Ui.dp(this@LibraryActivity, 8), Ui.dp(this@LibraryActivity, 8),
-                Ui.dp(this@LibraryActivity, 8), Ui.dp(this@LibraryActivity, 8)
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 6),
+                Ui.dp(this@LibraryActivity, 16), Ui.dp(this@LibraryActivity, 8)
             )
             adapter = GridAdapter()
-            setOnItemClickListener { _, _, pos, _ -> onItemTap(items[pos]) }
+            setOnItemClickListener { _, _, pos, _ -> onItemTap(visibleItems()[pos]) }
+            setOnItemLongClickListener { _, _, pos, _ ->
+                val item = visibleItems()[pos]
+                if (item.status == Status.BACKED) {
+                    selected += item.path
+                    (adapter as BaseAdapter).notifyDataSetChanged()
+                    updateSelectionUi()
+                    true
+                } else {
+                    false
+                }
+            }
         }
         col.addView(
             gridView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
+
+        // ---- 释放安全 card (mandatory before delete; mockup)
+        safetyCard = Ui.cardBlock(this) {
+            val row = LinearLayout(this@LibraryActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(Ui.badge(this@LibraryActivity, "可安全释放", Ui.StatusKind.OK))
+            safetyText = TextView(this@LibraryActivity).apply {
+                textSize = 11.5f
+                setTextColor(Ui.INK_2)
+                setLineSpacing(0f, 1.45f)
+                setPadding(Ui.dp(this@LibraryActivity, 10), 0, 0, 0)
+            }
+            row.addView(safetyText, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            ))
+            addView(row)
+        }
+        safetyCard.visibility = View.GONE
+        col.addView(safetyCard)
+
         refresh()
         createdOnce = true
         // Poll while visible so 备份中 badges tick with the running session.
@@ -159,6 +250,39 @@ class LibraryActivity : Activity() {
         super.onDestroy()
     }
 
+    // -------------------------------------------------------------- filters
+
+    private fun buildChips() {
+        chipsRow.removeAllViews()
+        for (f in Filter.values()) {
+            val chip = Ui.filterChip(this, f.label, f == filterMode)
+            chip.setOnClickListener {
+                filterMode = f
+                buildChips()
+                (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+                updateCount()
+            }
+            chipsRow.addView(chip, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = Ui.dp(this@LibraryActivity, 6) })
+        }
+    }
+
+    private fun visibleItems(): List<Item> = when (filterMode) {
+        Filter.ALL -> items
+        Filter.PHOTO -> items.filter { MediaStoreHelper.isImageName(nameOf(it)) }
+        Filter.VIDEO -> items.filter { MediaStoreHelper.isVideoName(nameOf(it)) }
+        Filter.NOT_BACKED -> items.filter { it.status == Status.NOT_BACKED }
+    }
+
+    private fun nameOf(item: Item): String = item.path.substringAfterLast('/')
+
+    private fun updateCount() {
+        countView.text = "${visibleItems().size} 项"
+    }
+
+    // ---------------------------------------------------------------- data
+
     private fun dcimDir(): File =
         Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
 
@@ -171,9 +295,9 @@ class LibraryActivity : Activity() {
             } catch (t: Throwable) {
                 emptyList()
             }
-            val receipts = ReceiptStore.loadMerged(filesDir)
+            val mergedReceipts = ReceiptStore.loadMerged(filesDir)
             val backedShas = HashSet<String>()
-            for (rf in receipts.values) backedShas += rf.sha256
+            for (rf in mergedReceipts.values) backedShas += rf.sha256
 
             var live: List<FsClient.Record>? = null
             try {
@@ -196,7 +320,7 @@ class LibraryActivity : Activity() {
             val localPaths = HashSet<String>()
             for (e in localEntries) {
                 localPaths += e.path
-                val receiptHit = receipts[e.path]?.sha256 == e.sha
+                val receiptHit = mergedReceipts[e.path]?.sha256 == e.sha
                 val liveHit = liveMap[e.path]?.let {
                     it.sha256 == e.sha && "ok" == it.integrity
                 } == true
@@ -212,10 +336,10 @@ class LibraryActivity : Activity() {
                     liveIntegrity = liveMap[e.path]?.integrity
                 )
             }
-            val pcOnlyPaths = (receipts.keys + liveMap.keys).filter { it !in localPaths }
+            val pcOnlyPaths = (mergedReceipts.keys + liveMap.keys).filter { it !in localPaths }
             for (p in pcOnlyPaths.sorted()) {
                 val rec = liveMap[p]
-                val rf = receipts[p]
+                val rf = mergedReceipts[p]
                 merged += Item(
                     p, rec?.size ?: rf?.size ?: -1, rec?.sha256 ?: rf?.sha256,
                     local = false, status = Status.PC_ONLY,
@@ -224,18 +348,19 @@ class LibraryActivity : Activity() {
             }
             main.post {
                 items = merged
+                receipts = mergedReceipts
                 liveOk = live != null
                 liveByPath = liveMap
                 selected.retainAll(merged.filter { it.status == Status.BACKED }.map { it.path })
                 statusView.text = when {
                     merged.isEmpty() ->
                         "没有可显示的文件。完成一次备份后，这里会显示每个文件的备份状态。"
-                    else ->
-                        "共 ${merged.size} 项（本机 ${localEntries.size}，仅PC ${merged.size - localEntries.size}）· " +
-                            if (liveOk) "电脑记录为实时" else "电脑离线（按回执判断）"
+                    liveOk -> "电脑记录为实时"
+                    else -> "电脑离线（按回执判断）"
                 }
                 (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-                updateFreeButton()
+                updateCount()
+                updateSelectionUi()
             }
         }
     }
@@ -254,19 +379,45 @@ class LibraryActivity : Activity() {
         if (changed) (gridView.adapter as BaseAdapter).notifyDataSetChanged()
     }
 
-    private fun updateFreeButton() {
-        freeButton.text = if (selected.isEmpty()) "释放空间" else "释放空间（已选 ${selected.size}）"
+    // ------------------------------------------------------------ selection
+
+    private fun updateSelectionUi() {
+        val selecting = selected.isNotEmpty()
+        selBar.visibility = if (selecting) View.VISIBLE else View.GONE
+        safetyCard.visibility = if (selecting) View.VISIBLE else View.GONE
+        if (!selecting) return
+        val chosen = items.filter { it.path in selected }
+        val verified = chosen.count { c ->
+            val rf = receipts[c.path]
+            rf != null && rf.sha256 == c.sha
+        }
+        val bytes = chosen.sumOf { it.size }
+        selCount.text = "已选 ${chosen.size} 项"
+        safetyText.text = "所选 ${chosen.size} 项中 $verified 项持有已验证回执，预计释放 " +
+            "${fmtSize(bytes)}。点「释放空间」时将逐项复核回执与电脑记录，未通过校验的文件会自动排除、不会删除。"
     }
 
     private fun onItemTap(item: Item) {
+        val selecting = selected.isNotEmpty()
+        if (selecting && item.status == Status.BACKED) {
+            if (!selected.add(item.path)) selected.remove(item.path)
+            (gridView.adapter as BaseAdapter).notifyDataSetChanged()
+            updateSelectionUi()
+            return
+        }
+        // Images open the full-screen preview (mockup 照片预览页）.
+        if (MediaStoreHelper.isImageName(nameOf(item))) {
+            openPreview(item)
+            return
+        }
         when (item.status) {
             Status.BACKED -> {
                 if (!selected.add(item.path)) selected.remove(item.path)
                 (gridView.adapter as BaseAdapter).notifyDataSetChanged()
-                updateFreeButton()
+                updateSelectionUi()
             }
             Status.PC_ONLY -> {
-                val name = item.path.substringAfterLast('/')
+                val name = nameOf(item)
                 val options = mutableListOf<String>()
                 if (MediaStoreHelper.isPlayableName(name)) options += "播放（流式）"
                 options += "下载回手机"
@@ -289,6 +440,45 @@ class LibraryActivity : Activity() {
                 Toast.makeText(this, "该文件尚未备份，去「备份」页点「立即备份」", Toast.LENGTH_SHORT).show()
             }
         }
+    }
+
+    private fun openPreview(tapped: Item) {
+        val images = visibleItems().filter { MediaStoreHelper.isImageName(nameOf(it)) }
+        val idx = images.indexOfFirst { it.path == tapped.path }
+        if (idx < 0) return
+        val paths = ArrayList<String>()
+        val sizes = LongArray(images.size)
+        val dates = LongArray(images.size)
+        val locals = BooleanArray(images.size)
+        val statuses = IntArray(images.size)
+        images.forEachIndexed { i, it ->
+            paths += it.path
+            sizes[i] = it.size
+            locals[i] = it.local
+            statuses[i] = when (it.status) {
+                Status.BACKED -> PhotoPreviewActivity.ST_BACKED
+                Status.PC_ONLY -> PhotoPreviewActivity.ST_PC_ONLY
+                Status.BACKING_UP -> PhotoPreviewActivity.ST_BACKING
+                Status.NOT_BACKED -> PhotoPreviewActivity.ST_NOT_BACKED
+            }
+            dates[i] = when {
+                it.local -> File(dcimDir(), it.path).lastModified()
+                liveByPath[it.path] != null -> liveByPath[it.path]!!.backedAt
+                else -> receipts[it.path]?.ts ?: 0L
+            }
+        }
+        startActivity(
+            Intent(this, PhotoPreviewActivity::class.java)
+                .putStringArrayListExtra(PhotoPreviewActivity.EXTRA_PATHS, paths)
+                .putExtra(PhotoPreviewActivity.EXTRA_INDEX, idx)
+                .putExtra(PhotoPreviewActivity.EXTRA_SIZES, sizes)
+                .putExtra(PhotoPreviewActivity.EXTRA_DATES, dates)
+                .putExtra(PhotoPreviewActivity.EXTRA_LOCALS, locals)
+                .putExtra(PhotoPreviewActivity.EXTRA_STATUSES, statuses)
+                .putExtra(PhotoPreviewActivity.EXTRA_KIND, PhotoPreviewActivity.KIND_LIBRARY)
+                .putExtra(PhotoPreviewActivity.EXTRA_SHAS,
+                    ArrayList(images.map { it.sha ?: "" }))
+        )
     }
 
     private fun downloadBack(item: Item) {
@@ -336,9 +526,9 @@ class LibraryActivity : Activity() {
         thread(name = "freeup-precheck") {
             // Gate 1 (always): a signature-verified receipt must vouch for the
             // file with the same sha256 as the current local copy.
-            val receipts = ReceiptStore.loadMerged(filesDir)
+            val receiptsNow = ReceiptStore.loadMerged(filesDir)
             val receiptOk = candidates.filter { c ->
-                val rf = receipts[c.path]
+                val rf = receiptsNow[c.path]
                 rf != null && rf.sha256 == c.sha
             }
             // Gate 2 (when the PC is reachable): live integrity cross-check —
@@ -444,7 +634,7 @@ class LibraryActivity : Activity() {
         if (!item.local) return // PC-only: no local bytes to decode; placeholder stays.
         val file = File(dcimDir(), item.path)
         thumbIo.execute {
-            val bmp = decodeThumb(file)
+            val bmp = decodeThumb(file, item.path)
             if (bmp != null) {
                 thumbCache.put(key, bmp)
                 main.post {
@@ -454,7 +644,7 @@ class LibraryActivity : Activity() {
         }
     }
 
-    private fun decodeThumb(file: File): Bitmap? {
+    private fun decodeThumb(file: File, relPath: String): Bitmap? {
         if (!file.isFile) return null
         val name = file.name.lowercase()
         return try {
@@ -462,6 +652,8 @@ class LibraryActivity : Activity() {
                 val mmr = MediaMetadataRetriever()
                 try {
                     mmr.setDataSource(file.absolutePath)
+                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        ?.toLongOrNull()?.let { durations[relPath] = it }
                     mmr.getFrameAtTime(0)?.let { scaleToWidth(it, 256) }
                 } finally {
                     try {
@@ -495,20 +687,28 @@ class LibraryActivity : Activity() {
     // --------------------------------------------------------------- adapter
 
     private inner class GridAdapter : BaseAdapter() {
-        override fun getCount(): Int = items.size
-        override fun getItem(position: Int): Any = items[position]
+        override fun getCount(): Int = visibleItems().size
+        override fun getItem(position: Int): Any = visibleItems()[position]
         override fun getItemId(position: Int): Long = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val item = items[position]
+            val item = visibleItems()[position]
             val cellSize = Ui.dp(this@LibraryActivity, 110)
             val cell = (convertView as? LinearLayout) ?: buildCell(cellSize)
             val frame = cell.getChildAt(0) as FrameLayout
             val image = frame.getChildAt(0) as ImageView
             val badge = frame.getChildAt(1) as TextView
             val check = frame.getChildAt(2) as TextView
+            val duration = frame.getChildAt(3) as TextView
+            val pcOverlay = frame.getChildAt(4) as View
             val name = cell.getChildAt(1) as TextView
 
+            // Selection outline: 2.5dp brand stroke inset (mockup).
+            frame.background = if (item.path in selected) {
+                Ui.rounded(this@LibraryActivity, Ui.SLATE_BG, Ui.R_TILE, Ui.BRAND_600, 3)
+            } else {
+                Ui.rounded(this@LibraryActivity, Ui.SLATE_BG, Ui.R_TILE)
+            }
             bindThumbnail(item, image)
             name.text = item.path.substringAfterLast('/')
             val pct = downloadPct[item.path]
@@ -517,65 +717,143 @@ class LibraryActivity : Activity() {
                 item.status == Status.BACKING_UP -> "备份中 ${BackupProgress.percent}%"
                 else -> item.status.label
             }
-            badge.setBackgroundColor(
-                if (pct != null) Status.BACKING_UP.color else item.status.color
-            )
+            val kind = if (pct != null) Ui.StatusKind.RUN else item.status.kind
+            badge.setTextColor(kind.text)
+            badge.background = Ui.rounded(this@LibraryActivity, kind.bg, Ui.R_BADGE)
             check.visibility = if (item.path in selected) View.VISIBLE else View.GONE
+            // Duration chip for local videos; ▶ marker when duration unknown.
+            val durMs = durations[item.path]
+            duration.visibility = when {
+                !MediaStoreHelper.isVideoName(nameOf(item)) -> View.GONE
+                durMs != null -> {
+                    duration.text = fmtDuration(durMs)
+                    View.VISIBLE
+                }
+                else -> {
+                    duration.text = "▶"
+                    View.VISIBLE
+                }
+            }
+            pcOverlay.visibility = if (item.local) View.GONE else View.VISIBLE
             return cell
         }
 
         private fun buildCell(cellSize: Int): LinearLayout {
             val cell = LinearLayout(this@LibraryActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(2, 2, 2, 2)
+                setPadding(1, 1, 1, 1)
             }
             val frame = FrameLayout(this@LibraryActivity).apply {
                 layoutParams = LinearLayout.LayoutParams(cellSize, cellSize)
+                background = Ui.rounded(this@LibraryActivity, Ui.SLATE_BG, Ui.R_TILE)
+                clipToOutline = true
             }
             frame.addView(
                 ImageView(this@LibraryActivity).apply {
                     scaleType = ImageView.ScaleType.CENTER_CROP
-                    setBackgroundColor(Color.rgb(0xE8, 0xE8, 0xE8))
                 },
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT
                 )
             )
+            // Status badge, pinned bottom-left with a 5dp inset (mockup).
             frame.addView(
                 TextView(this@LibraryActivity).apply {
-                    textSize = 10f
-                    setTextColor(Color.WHITE)
-                    setPadding(8, 2, 8, 2)
+                    textSize = 10.5f
+                    typeface = Ui.font(700)
+                    setPadding(
+                        Ui.dp(this@LibraryActivity, 7), Ui.dp(this@LibraryActivity, 4),
+                        Ui.dp(this@LibraryActivity, 7), Ui.dp(this@LibraryActivity, 4)
+                    )
+                    elevation = Ui.dp(this@LibraryActivity, 2).toFloat()
                 },
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     Gravity.BOTTOM or Gravity.START
-                )
+                ).apply {
+                    leftMargin = Ui.dp(this@LibraryActivity, 5)
+                    bottomMargin = Ui.dp(this@LibraryActivity, 5)
+                }
             )
+            // Selection tick: brand circle with white ✓, top-right.
             frame.addView(
                 TextView(this@LibraryActivity).apply {
                     text = "✓"
-                    textSize = 13f
+                    textSize = 11f
+                    gravity = Gravity.CENTER
                     setTextColor(Color.WHITE)
-                    setBackgroundColor(Color.argb(170, 0x1E, 0x7A, 0x34))
-                    setPadding(7, 1, 7, 1)
+                    background = Ui.circleDrawable(this@LibraryActivity, Ui.BRAND_600)
+                    visibility = View.GONE
+                },
+                FrameLayout.LayoutParams(
+                    Ui.dp(this@LibraryActivity, 19), Ui.dp(this@LibraryActivity, 19),
+                    Gravity.TOP or Gravity.END
+                ).apply {
+                    topMargin = Ui.dp(this@LibraryActivity, 5)
+                    rightMargin = Ui.dp(this@LibraryActivity, 5)
+                }
+            )
+            // Duration chip, bottom-right (mockup: dark scrim, radius 5).
+            frame.addView(
+                TextView(this@LibraryActivity).apply {
+                    textSize = 9.5f
+                    typeface = Ui.font(700)
+                    setTextColor(Color.WHITE)
+                    background = Ui.rounded(
+                        this@LibraryActivity,
+                        Color.argb(0x8C, 0x08, 0x18, 0x1E), 5
+                    )
+                    setPadding(
+                        Ui.dp(this@LibraryActivity, 5), Ui.dp(this@LibraryActivity, 2),
+                        Ui.dp(this@LibraryActivity, 5), Ui.dp(this@LibraryActivity, 2)
+                    )
                     visibility = View.GONE
                 },
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.TOP or Gravity.END
+                    Gravity.BOTTOM or Gravity.END
+                ).apply {
+                    rightMargin = Ui.dp(this@LibraryActivity, 5)
+                    bottomMargin = Ui.dp(this@LibraryActivity, 5)
+                }
+            )
+            // 仅PC有 dim + centered PC marker (mockup).
+            val pcOverlay = LinearLayout(this@LibraryActivity).apply {
+                gravity = Gravity.CENTER
+                setBackgroundColor(Color.argb(0x57, 0x26, 0x36, 0x42))
+                visibility = View.GONE
+                addView(TextView(this@LibraryActivity).apply {
+                    text = "PC"
+                    textSize = 12f
+                    typeface = Ui.font(800)
+                    setTextColor(Color.WHITE)
+                    background = Ui.rounded(
+                        this@LibraryActivity, Color.TRANSPARENT, 999, Color.WHITE, 1
+                    )
+                    setPadding(
+                        Ui.dp(this@LibraryActivity, 8), Ui.dp(this@LibraryActivity, 4),
+                        Ui.dp(this@LibraryActivity, 8), Ui.dp(this@LibraryActivity, 4)
+                    )
+                })
+            }
+            frame.addView(
+                pcOverlay,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
                 )
             )
             cell.addView(frame)
             cell.addView(
                 TextView(this@LibraryActivity).apply {
                     textSize = 11f
+                    setTextColor(Ui.INK_2)
                     setSingleLine(true)
                     ellipsize = TextUtils.TruncateAt.END
-                    setPadding(2, 2, 2, 0)
+                    setPadding(2, Ui.dp(this@LibraryActivity, 3), 2, 0)
                 },
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
@@ -584,6 +862,11 @@ class LibraryActivity : Activity() {
             )
             return cell
         }
+    }
+
+    private fun fmtDuration(ms: Long): String {
+        val totalSec = ms / 1000
+        return "%02d:%02d".format(totalSec / 60, totalSec % 60)
     }
 
     private fun fmtSize(bytes: Long): String = when {

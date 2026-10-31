@@ -3,7 +3,9 @@ package net.machang.backup
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -11,18 +13,16 @@ import android.widget.TextView
 import kotlin.concurrent.thread
 
 /**
- * 我的 page: account + settings.
+ * 我的 page (approved mockup v1.1): profile card (gradient avatar with 牛，
+ * account, network/device sub-line, session + pairing pills) → 账号 form
+ * card → 设备与配对 card → 设置 / 开发者选项 cards → 关于 card (wordmark) →
+ * standalone logout button (low-saturation red ghost).
  *
- *  - 账号区： account-service URL + register/login; on login this phone is
- *    registered as a device, provisioning is fetched, and the product mesh is
- *    auto-configured (moved here from the old single-screen MainActivity).
- *  - 设备信息： account, device id, per-user network, pairing state.
- *  - 设置： PC backup port; developer overrides (self-use mesh secret and
- *    the M4a standalone v2 identity fields).
- *  - 关于： app name / version.
- *
- * Secrets live in [SecureStore] (Keystore-wrapped); only non-secret settings
- * go to the shared "settings" preferences, exactly as before.
+ * Behavior is unchanged from the functional build: on login this phone is
+ * registered as a device, provisioning is fetched, and the product mesh is
+ * auto-configured; a stored session keeps the password form hidden
+ * (session persistence). Secrets live in [SecureStore] (Keystore-wrapped);
+ * only non-secret settings go to the shared "settings" preferences.
  */
 class AccountActivity : Activity() {
 
@@ -42,6 +42,10 @@ class AccountActivity : Activity() {
     private lateinit var passwordInput: EditText
     private lateinit var loginButtons: LinearLayout
     private lateinit var accountStatus: TextView
+    private lateinit var profileAccount: TextView
+    private lateinit var profileSub: TextView
+    private lateinit var sessionPillSlot: LinearLayout
+    private lateinit var pairingPillSlot: LinearLayout
     private lateinit var deviceInfo: TextView
     private lateinit var secretInput: EditText
     private lateinit var userIdInput: EditText
@@ -56,7 +60,7 @@ class AccountActivity : Activity() {
         buildUi()
 
         val p = prefs()
-        serverInput.setText(p.getString(KEY_SERVER_URL, "http://10.200.0.1:18090"))
+        serverInput.setText(p.getString(KEY_SERVER_URL, "http://36.133.114.164:18090"))
         accountInput.setText(p.getString(KEY_ACCOUNT, ""))
         secretInput.setText(p.getString(KEY_SECRET, ""))
         userIdInput.setText(p.getString(KEY_USER_ID, ""))
@@ -92,6 +96,11 @@ class AccountActivity : Activity() {
 
     // ------------------------------------------------------------- account
 
+    private fun setSlotPill(slot: LinearLayout, text: String, kind: Ui.StatusKind) {
+        slot.removeAllViews()
+        slot.addView(Ui.pill(this, text, kind))
+    }
+
     private fun updateAccountStatus() {
         val account = SecureStore.get(this, SecureStore.KEY_ACCOUNT)
             ?: prefs().getString(KEY_ACCOUNT, "")?.ifEmpty { null }
@@ -104,9 +113,10 @@ class AccountActivity : Activity() {
         // It reappears only with no session, after 退出登录, or when the
         // restore found the session server-rejected (expired hint).
         val loggedIn = SessionRestore.hasStoredSession(this)
+        val expired = !loggedIn && SessionRestore.expiredHintPending(this)
         accountStatus.text = when {
-            loggedIn -> "已登录: ${account ?: ""}"
-            SessionRestore.expiredHintPending(this) -> "登录已过期，请重新登录"
+            loggedIn -> "已登录，会话已保存 — 下次打开自动恢复"
+            expired -> "登录已过期，请重新登录"
             else -> "未登录（填写账号密码后点注册或登录）"
         }
         if (::passwordInput.isInitialized && ::loginButtons.isInitialized) {
@@ -114,6 +124,28 @@ class AccountActivity : Activity() {
             passwordInput.visibility = vis
             loginButtons.visibility = vis
         }
+        // Profile card (mockup): account + network/device sub + pills.
+        profileAccount.text = account ?: "未登录"
+        profileSub.text = buildString {
+            append("网络 ${network ?: "—"}")
+            append(" · ")
+            append(deviceId?.let { "设备 #$it" } ?: "本机未注册")
+            append(" · ")
+            append(if (PcConn.isAccountMode(this@AccountActivity)) "账号模式" else "开发者模式")
+        }
+        setSlotPill(
+            sessionPillSlot,
+            when {
+                loggedIn -> "会话已保存"
+                expired -> "登录已过期"
+                else -> "未登录"
+            },
+            when {
+                loggedIn -> Ui.StatusKind.OK
+                expired -> Ui.StatusKind.WAIT
+                else -> Ui.StatusKind.NONE
+            }
+        )
         deviceInfo.text = buildString {
             append("账号: ${account ?: "—"}\n")
             append("用户 ID: ${userId ?: "—"}\n")
@@ -197,6 +229,7 @@ class AccountActivity : Activity() {
         val token = SecureStore.get(this, SecureStore.KEY_DEVICE_TOKEN)
         if (deviceId == null || token == null) {
             AppLog.log("尚未登录/注册设备")
+            setSlotPill(pairingPillSlot, "配对: 未注册", Ui.StatusKind.NONE)
             return
         }
         val server = serverInput.text.toString().trim()
@@ -207,8 +240,25 @@ class AccountActivity : Activity() {
                     if (valid) "配对状态: 已批准 ✔" else "配对状态: $reason" +
                         if (reason == "not_approved") "（等待电脑端批准）" else ""
                 )
+                runOnUiThread {
+                    if (isFinishing) return@runOnUiThread
+                    if (valid) {
+                        setSlotPill(pairingPillSlot, "已批准", Ui.StatusKind.OK)
+                    } else {
+                        setSlotPill(
+                            pairingPillSlot,
+                            if (reason == "not_approved") "等待电脑批准" else reason,
+                            Ui.StatusKind.WAIT
+                        )
+                    }
+                }
             } catch (t: Throwable) {
                 AppLog.log("刷新配对状态失败: ${t.message}")
+                runOnUiThread {
+                    if (!isFinishing) {
+                        setSlotPill(pairingPillSlot, "配对: 未知（服务不可达）", Ui.StatusKind.NONE)
+                    }
+                }
             }
         }
     }
@@ -242,9 +292,55 @@ class AccountActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         )
-        col.addView(Ui.header(this, "我的", "账号、设备与设置"))
+        col.addView(Ui.header(this, "我的"))
 
-        // ---- account card
+        // ---- profile card (mockup): avatar + account + pills
+        col.addView(Ui.cardBlock(this) {
+            val row = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(Ui.brandTile(this@AccountActivity, 44))
+            val info = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(Ui.dp(this@AccountActivity, 12), 0, 0, 0)
+            }
+            profileAccount = TextView(this@AccountActivity).apply {
+                textSize = 12.5f
+                typeface = Ui.font(800)
+                setTextColor(Ui.INK)
+                setSingleLine(true)
+                ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            }
+            info.addView(profileAccount)
+            profileSub = TextView(this@AccountActivity).apply {
+                textSize = 11f
+                setTextColor(Ui.SLATE)
+                setPadding(0, Ui.dp(this@AccountActivity, 2), 0, 0)
+            }
+            info.addView(profileSub)
+            row.addView(
+                info,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            addView(row)
+            val pills = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, Ui.dp(this@AccountActivity, 10), 0, 0)
+            }
+            sessionPillSlot = LinearLayout(this@AccountActivity)
+            pairingPillSlot = LinearLayout(this@AccountActivity)
+            pills.addView(sessionPillSlot)
+            pills.addView(
+                pairingPillSlot,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { leftMargin = Ui.dp(this@AccountActivity, 8) }
+            )
+            addView(pills)
+        })
+
+        // ---- account form card
         col.addView(Ui.cardBlock(this) {
             addView(Ui.sectionTitle(this@AccountActivity, "账号"))
             serverInput = Ui.field(this@AccountActivity, "账号服务地址")
@@ -252,8 +348,8 @@ class AccountActivity : Activity() {
             addView(
                 Ui.subText(
                     this@AccountActivity,
-                    "开发阶段说明：默认地址 10.200.0.1 只有在手机连上自用组网时可达；" +
-                        "正式版将提供公网 HTTPS 地址。"
+                    "说明：默认是公网服务地址，未组网也能登录（测试期为明文 HTTP，" +
+                        "正式版将换成域名 + HTTPS）。"
                 ),
                 Ui.spaced(Ui.matchWrap(), 4, this@AccountActivity)
             )
@@ -262,11 +358,12 @@ class AccountActivity : Activity() {
             passwordInput = Ui.field(this@AccountActivity, "密码", password = true)
             addView(passwordInput, Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity))
             accountStatus = Ui.bodyText(this@AccountActivity)
+            accountStatus.textSize = 13f
             addView(accountStatus, Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity))
             loginButtons = LinearLayout(this@AccountActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
-            loginButtons.addView(Ui.primaryButton(this@AccountActivity, "注册").apply {
+            loginButtons.addView(Ui.ghostButton(this@AccountActivity, "注册").apply {
                 setOnClickListener { onRegisterOrLogin(register = true) }
             })
             loginButtons.addView(Ui.primaryButton(this@AccountActivity, "登录").apply {
@@ -276,33 +373,30 @@ class AccountActivity : Activity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { leftMargin = Ui.dp(this@AccountActivity, 8) })
             addView(loginButtons, Ui.spaced(Ui.matchWrap(), 10, this@AccountActivity))
-            val row2 = LinearLayout(this@AccountActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-            }
-            row2.addView(Ui.ghostButton(this@AccountActivity, "刷新配对状态").apply {
-                setOnClickListener { onRefreshPairing() }
-            })
-            row2.addView(Ui.ghostButton(this@AccountActivity, "退出登录").apply {
-                setOnClickListener { onLogout() }
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { leftMargin = Ui.dp(this@AccountActivity, 8) })
-            addView(row2, Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity))
         })
 
-        // ---- device info card
+        // ---- device & pairing card
         col.addView(Ui.cardBlock(this) {
-            addView(Ui.sectionTitle(this@AccountActivity, "设备信息"))
+            addView(Ui.sectionTitle(this@AccountActivity, "设备与配对"))
             deviceInfo = Ui.bodyText(this@AccountActivity)
+            deviceInfo.textSize = 13f
             addView(deviceInfo)
+            addView(Ui.ghostButton(this@AccountActivity, "刷新配对状态").apply {
+                setOnClickListener { onRefreshPairing() }
+            }, Ui.spaced(Ui.matchWrap(), 10, this@AccountActivity))
         })
 
         // ---- settings card
         col.addView(Ui.cardBlock(this) {
             addView(Ui.sectionTitle(this@AccountActivity, "设置"))
+            addView(
+                Ui.subText(
+                    this@AccountActivity,
+                    "自动备份条件：充电 + WiFi + 空闲 + 直连时（开关在「备份」页）"
+                )
+            )
             portInput = Ui.field(this@AccountActivity, "电脑备份端口（默认 28741）")
-            addView(portInput, Ui.spaced(Ui.matchWrap(), 2, this@AccountActivity))
+            addView(portInput, Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity))
         })
 
         // ---- developer overrides card
@@ -326,16 +420,19 @@ class AccountActivity : Activity() {
                 Button(this@AccountActivity).apply {
                     text = "保存设置"
                     setAllCaps(false)
+                    typeface = Ui.font(700)
+                    setTextColor(Ui.BRAND_700)
+                    background = Ui.rounded(this@AccountActivity, Ui.MIST, Ui.R_BTN)
                     setOnClickListener {
                         persistSettings()
                         AppLog.log("设置已保存")
                     }
                 },
-                Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity)
+                Ui.spaced(Ui.matchWrap(), 10, this@AccountActivity)
             )
         })
 
-        // ---- about card
+        // ---- about card (wordmark lockup)
         val version = try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
         } catch (t: Throwable) {
@@ -343,14 +440,58 @@ class AccountActivity : Activity() {
         }
         col.addView(Ui.cardBlock(this) {
             addView(Ui.sectionTitle(this@AccountActivity, "关于"))
-            addView(Ui.bodyText(this@AccountActivity, "牛备 NiuBackup v$version"))
+            val row = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(Ui.brandTile(this@AccountActivity, 42))
+            val info = LinearLayout(this@AccountActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(Ui.dp(this@AccountActivity, 12), 0, 0, 0)
+            }
+            info.addView(TextView(this@AccountActivity).apply {
+                text = "牛备"
+                textSize = 17f
+                typeface = Ui.font(900)
+                setTextColor(Ui.INK)
+            })
+            info.addView(TextView(this@AccountActivity).apply {
+                text = "NIUBACKUP · v$version"
+                textSize = 10.5f
+                setTextColor(Ui.BRAND_600)
+                typeface = Ui.font(800)
+                letterSpacing = 0.18f
+            })
+            row.addView(info)
+            addView(row)
             addView(
                 Ui.subText(
                     this@AccountActivity,
                     "把手机照片和文件自动备份到你自己的电脑——不经云端，记录只存本地。"
                 ),
-                Ui.spaced(Ui.matchWrap(), 4, this@AccountActivity)
+                Ui.spaced(Ui.matchWrap(), 8, this@AccountActivity)
             )
+        })
+
+        // ---- logout (standalone, low-saturation red — mockup)
+        val logout = Button(this).apply {
+            text = "退出登录"
+            textSize = 13f
+            setAllCaps(false)
+            typeface = Ui.font(700)
+            setTextColor(Ui.LOGOUT_TEXT)
+            background = Ui.rounded(this@AccountActivity, Ui.LOGOUT_BG, Ui.R_BTN)
+            stateListAnimator = null
+            setPadding(0, Ui.dp(this@AccountActivity, 10), 0, Ui.dp(this@AccountActivity, 10))
+            setOnClickListener { onLogout() }
+        }
+        col.addView(logout, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            leftMargin = Ui.dp(this@AccountActivity, 16)
+            rightMargin = Ui.dp(this@AccountActivity, 16)
+            topMargin = Ui.dp(this@AccountActivity, 11)
+            bottomMargin = Ui.dp(this@AccountActivity, 16)
         })
     }
 }

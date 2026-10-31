@@ -1,13 +1,15 @@
 package net.machang.backup
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.text.TextUtils
 import android.util.LruCache
 import android.view.Gravity
 import android.view.View
@@ -20,23 +22,38 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /**
- * Backup records page (design §6.2): the PC's record DB, fetched live via
- * fs LIST with THUMB thumbnails (memory + disk LRU). When the PC is
- * unreachable, the last fetched copy is shown and labeled 「记录截至 HH:MM」.
- * Tapping a record plays it (video/audio) or downloads it back (§6.3).
+ * Backup records page (design §6.2 + approved mockup v1.1): the PC's record
+ * DB, fetched live via fs LIST with THUMB thumbnails (memory + disk LRU).
+ *
+ * Layout per the mockup: header title + connection pill, a persistent
+ * freshness strip （记录截至 HH:MM when showing the offline cache), then ONE
+ * card holding day-grouped rows — 42dp radius-9 thumb, filename + meta
+ * (size · time · 回执已验证 ✓ when a verified receipt covers the path),
+ * and inline ghost actions 播放 / 下载回来. Tapping an image row opens the
+ * full-screen photo preview; tapping a video row plays it.
+ * When the PC is unreachable, the last fetched copy is shown and labeled.
  */
 class RecordsActivity : Activity() {
 
+    private sealed class Row {
+        data class Day(val label: String) : Row()
+        data class Entry(val record: FsClient.Record) : Row()
+    }
+
     private val main = Handler(Looper.getMainLooper())
-    private lateinit var statusView: TextView
+    private lateinit var connPill: LinearLayout
+    private lateinit var stripText: TextView
     private lateinit var listView: ListView
     private var records: List<FsClient.Record> = emptyList()
+    private var rows: List<Row> = emptyList()
+    private var receiptPaths: Set<String> = emptySet()
     private val io = Executors.newFixedThreadPool(3)
     private val memCache = object : LruCache<String, Bitmap>(24 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
@@ -46,24 +63,53 @@ class RecordsActivity : Activity() {
         super.onCreate(savedInstanceState)
         val page = Ui.page(this, Ui.Page.RECORDS)
         val col = page.content
-        col.addView(Ui.header(this, "记录", "电脑上的备份记录"))
-        statusView = TextView(this).apply {
-            text = "正在读取电脑上的备份记录…"
-            textSize = 13.5f
-            setTextColor(Ui.TEXT_SUB)
-            setPadding(Ui.dp(this@RecordsActivity, 16), 4, Ui.dp(this@RecordsActivity, 16), 8)
+        connPill = Ui.pill(this, "连接中…", Ui.StatusKind.NONE)
+        col.addView(Ui.header(this, "备份记录", right = connPill))
+
+        // Freshness strip (brand-50 card, always visible on this page).
+        val strip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = Ui.rounded(this@RecordsActivity, Ui.BRAND_50, Ui.R_TILE, Ui.BRAND_100, 1)
+            setPadding(
+                Ui.dp(this@RecordsActivity, 11), Ui.dp(this@RecordsActivity, 8),
+                Ui.dp(this@RecordsActivity, 11), Ui.dp(this@RecordsActivity, 8)
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                leftMargin = Ui.dp(this@RecordsActivity, 16)
+                rightMargin = Ui.dp(this@RecordsActivity, 16)
+                topMargin = Ui.dp(this@RecordsActivity, 8)
+            }
         }
+        stripText = TextView(this).apply {
+            text = "正在读取电脑上的备份记录…"
+            textSize = 11.5f
+            setTextColor(Ui.BRAND_800)
+        }
+        strip.addView(stripText)
+        col.addView(strip)
+
+        // The record card wraps the grouped list (mockup: single card).
+        val card = Ui.cardBlock(this) { }
+        card.setPadding(
+            Ui.dp(this, 14), Ui.dp(this, 6), Ui.dp(this, 14), Ui.dp(this, 10)
+        )
         listView = ListView(this).apply {
             adapter = RecordAdapter()
-            setOnItemClickListener { _, _, pos, _ -> onRecordTap(records[pos]) }
+            divider = null
+            setOnItemClickListener { _, _, pos, _ ->
+                (rows.getOrNull(pos) as? Row.Entry)?.let { onRecordTap(it.record) }
+            }
         }
-        col.addView(statusView)
-        col.addView(
+        card.addView(
             listView,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
         )
+        col.addView(card)
         createdOnce = true
         loadRecords()
     }
@@ -84,6 +130,12 @@ class RecordsActivity : Activity() {
 
     private fun loadRecords() {
         thread(name = "records-load") {
+            // Receipt coverage powers the 回执已验证 meta (verified locally).
+            val receipts = try {
+                ReceiptStore.loadMerged(filesDir).keys
+            } catch (t: Throwable) {
+                emptySet()
+            }
             var live: List<FsClient.Record>? = null
             try {
                 val fs = PcConn.createFsClient(this)
@@ -98,30 +150,72 @@ class RecordsActivity : Activity() {
             if (live != null) {
                 val list = live
                 RecordsCache.save(this, list)
-                main.post { show(list, null) }
+                main.post { show(list, null, receipts) }
             } else {
                 val cached = RecordsCache.load(this)
                 main.post {
                     if (cached != null) {
-                        show(cached.records, cached.fetchedAt)
+                        show(cached.records, cached.fetchedAt, receipts)
                     } else {
-                        statusView.text = "电脑不可达，且暂无缓存记录。先组网并完成一次备份。"
+                        records = emptyList()
+                        rows = emptyList()
+                        receiptPaths = receipts
+                        (listView.adapter as BaseAdapter).notifyDataSetChanged()
+                        Ui.setPill(connPill, "电脑离线", Ui.StatusKind.PC)
+                        stripText.text = "电脑不可达，且暂无缓存记录。先组网并完成一次备份。"
                     }
                 }
             }
         }
     }
 
-    private fun show(list: List<FsClient.Record>, staleAt: Long?) {
+    private fun show(list: List<FsClient.Record>, staleAt: Long?, receipts: Set<String>) {
         records = list
-        val label = when {
-            list.isEmpty() -> "电脑上暂无备份记录。先在「备份」页完成一次备份。"
-            staleAt == null -> "实时记录 · 共 ${list.size} 个文件"
-            else -> "电脑离线 · 记录截至 ${fmtTime(staleAt)} · 共 ${list.size} 个文件"
+        receiptPaths = receipts
+        rows = buildRows(list)
+        if (staleAt == null) {
+            Ui.setPill(connPill, "直连中", Ui.StatusKind.OK)
+            stripText.text = if (list.isEmpty()) {
+                "电脑上暂无备份记录。先在「备份」页完成一次备份。"
+            } else {
+                "实时记录 · 共 ${list.size} 个文件 · 刚刚从电脑更新"
+            }
+        } else {
+            Ui.setPill(connPill, "电脑离线", Ui.StatusKind.PC)
+            stripText.text = "记录截至 ${fmtTime(staleAt)} · 离线时显示缓存 · 共 ${list.size} 个文件"
         }
-        statusView.text = label
         (listView.adapter as BaseAdapter).notifyDataSetChanged()
         for (r in list) if (r.thumb) prefetchThumb(r)
+    }
+
+    private fun buildRows(list: List<FsClient.Record>): List<Row> {
+        val out = ArrayList<Row>()
+        var lastDay: String? = null
+        for (r in list) {
+            val day = dayLabel(r.backedAt)
+            if (day != lastDay) {
+                out += Row.Day(day)
+                lastDay = day
+            }
+            out += Row.Entry(r)
+        }
+        return out
+    }
+
+    private fun dayLabel(ms: Long): String {
+        if (ms <= 0) return "更早"
+        val cal = Calendar.getInstance().apply { timeInMillis = ms }
+        val now = Calendar.getInstance()
+        val yday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+        fun sameDay(a: Calendar, b: Calendar) =
+            a.get(Calendar.YEAR) == b.get(Calendar.YEAR) &&
+                a.get(Calendar.DAY_OF_YEAR) == b.get(Calendar.DAY_OF_YEAR)
+        val md = SimpleDateFormat("M月d日", Locale.CHINA).format(Date(ms))
+        return when {
+            sameDay(cal, now) -> "今天 · $md"
+            sameDay(cal, yday) -> "昨天 · $md"
+            else -> SimpleDateFormat("yyyy年M月d日", Locale.CHINA).format(Date(ms))
+        }
     }
 
     private fun thumbFile(r: FsClient.Record): File {
@@ -166,23 +260,56 @@ class RecordsActivity : Activity() {
 
     private fun onRecordTap(r: FsClient.Record) {
         val name = r.path.substringAfterLast('/')
-        val options = mutableListOf<String>()
-        if (MediaStoreHelper.isPlayableName(name)) options += "播放（流式）"
-        options += "下载回手机"
-        AlertDialog.Builder(this)
-            .setTitle(name)
-            .setItems(options.toTypedArray()) { _, which ->
-                if (options[which].startsWith("播放")) {
-                    startActivity(
-                        Intent(this, PlayerActivity::class.java)
-                            .putExtra(PlayerActivity.EXTRA_PATH, r.path)
-                            .putExtra(PlayerActivity.EXTRA_SIZE, r.size)
-                    )
-                } else {
-                    downloadBack(r)
-                }
+        when {
+            MediaStoreHelper.isImageName(name) -> openPreview(r)
+            MediaStoreHelper.isPlayableName(name) -> play(r)
+            else -> downloadBack(r)
+        }
+    }
+
+    private fun play(r: FsClient.Record) {
+        startActivity(
+            Intent(this, PlayerActivity::class.java)
+                .putExtra(PlayerActivity.EXTRA_PATH, r.path)
+                .putExtra(PlayerActivity.EXTRA_SIZE, r.size)
+        )
+    }
+
+    private fun openPreview(tapped: FsClient.Record) {
+        val images = records.filter {
+            MediaStoreHelper.isImageName(it.path.substringAfterLast('/'))
+        }
+        val idx = images.indexOfFirst { it.path == tapped.path }
+        if (idx < 0) return
+        val paths = ArrayList<String>()
+        val sizes = LongArray(images.size)
+        val dates = LongArray(images.size)
+        val locals = BooleanArray(images.size)
+        val statuses = IntArray(images.size)
+        val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+        images.forEachIndexed { i, r ->
+            paths += r.path
+            sizes[i] = r.size
+            dates[i] = r.backedAt
+            locals[i] = File(dcim, r.path).isFile
+            statuses[i] = if ("ok" == r.integrity) {
+                PhotoPreviewActivity.ST_BACKED
+            } else {
+                PhotoPreviewActivity.ST_SUSPECT
             }
-            .show()
+        }
+        startActivity(
+            Intent(this, PhotoPreviewActivity::class.java)
+                .putStringArrayListExtra(PhotoPreviewActivity.EXTRA_PATHS, paths)
+                .putExtra(PhotoPreviewActivity.EXTRA_INDEX, idx)
+                .putExtra(PhotoPreviewActivity.EXTRA_SIZES, sizes)
+                .putExtra(PhotoPreviewActivity.EXTRA_DATES, dates)
+                .putExtra(PhotoPreviewActivity.EXTRA_LOCALS, locals)
+                .putExtra(PhotoPreviewActivity.EXTRA_STATUSES, statuses)
+                .putExtra(PhotoPreviewActivity.EXTRA_KIND, PhotoPreviewActivity.KIND_RECORDS)
+                .putExtra(PhotoPreviewActivity.EXTRA_SHAS,
+                    ArrayList(images.map { it.sha256 ?: "" }))
+        )
     }
 
     private fun downloadBack(r: FsClient.Record) {
@@ -212,41 +339,108 @@ class RecordsActivity : Activity() {
     }
 
     private inner class RecordAdapter : BaseAdapter() {
-        override fun getCount(): Int = records.size
-        override fun getItem(position: Int): Any = records[position]
+        override fun getCount(): Int = rows.size
+        override fun getItem(position: Int): Any = rows[position]
         override fun getItemId(position: Int): Long = position.toLong()
+        override fun getViewTypeCount(): Int = 2
+        override fun getItemViewType(position: Int): Int =
+            if (rows[position] is Row.Day) 0 else 1
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val r = records[position]
-            val root = (convertView as? LinearLayout) ?: LinearLayout(this@RecordsActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(16, 10, 16, 10)
-                addView(
-                    ImageView(this@RecordsActivity),
-                    LinearLayout.LayoutParams(140, 140)
-                )
-                addView(
-                    TextView(this@RecordsActivity).apply {
-                        setPadding(20, 0, 0, 0)
-                    },
-                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                )
+            return when (val row = rows[position]) {
+                is Row.Day -> dayView(row.label, convertView)
+                is Row.Entry -> entryView(row.record, convertView, position)
             }
+        }
+
+        private fun dayView(label: String, convertView: View?): View {
+            val tv = (convertView as? TextView) ?: TextView(this@RecordsActivity).apply {
+                textSize = 11.5f
+                setTextColor(Ui.SLATE)
+                typeface = Ui.font(900)
+                letterSpacing = 0.06f
+                setPadding(0, Ui.dp(this@RecordsActivity, 12), 0, Ui.dp(this@RecordsActivity, 2))
+            }
+            tv.text = label
+            return tv
+        }
+
+        private fun entryView(r: FsClient.Record, convertView: View?, position: Int): View {
+            val root = (convertView as? LinearLayout) ?: buildRow()
             val img = root.getChildAt(0) as ImageView
-            val txt = root.getChildAt(1) as TextView
+            val info = root.getChildAt(1) as LinearLayout
+            val name = info.getChildAt(0) as TextView
+            val meta = info.getChildAt(1) as TextView
+            val actions = root.getChildAt(2) as LinearLayout
+            val playBtn = actions.getChildAt(0) as TextView
+            val dlBtn = actions.getChildAt(1) as TextView
+
             val bmp = if (r.thumb) thumbBitmap(r) else null
             if (bmp != null) {
                 img.setImageBitmap(bmp)
             } else {
                 img.setImageResource(android.R.drawable.ic_menu_gallery)
             }
+            val fname = r.path.substringAfterLast('/')
+            name.text = fname
             val integrity = when (r.integrity) {
                 "ok" -> "完整"
                 "suspect" -> "存疑"
                 else -> r.integrity ?: ""
             }
-            txt.text = "${r.path}\n${fmtSize(r.size)} · ${fmtDate(r.backedAt)} · $integrity"
+            val receipt = if (r.path in receiptPaths) " · 回执已验证 ✓" else ""
+            meta.text = "${fmtSize(r.size)} · ${fmtTimeHM(r.backedAt)} · $integrity$receipt"
+            val playable = MediaStoreHelper.isPlayableName(fname)
+            playBtn.visibility = if (playable) View.VISIBLE else View.GONE
+            playBtn.setOnClickListener { play(r) }
+            dlBtn.setOnClickListener { downloadBack(r) }
+            return root
+        }
+
+        private fun buildRow(): LinearLayout {
+            val root = LinearLayout(this@RecordsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, Ui.dp(this@RecordsActivity, 8), 0, Ui.dp(this@RecordsActivity, 8))
+            }
+            val img = ImageView(this@RecordsActivity).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = Ui.rounded(this@RecordsActivity, Ui.SLATE_BG, Ui.R_THUMB)
+                clipToOutline = true
+            }
+            root.addView(img, LinearLayout.LayoutParams(
+                Ui.dp(this@RecordsActivity, 42), Ui.dp(this@RecordsActivity, 42)
+            ))
+            val info = LinearLayout(this@RecordsActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(Ui.dp(this@RecordsActivity, 10), 0, Ui.dp(this@RecordsActivity, 8), 0)
+            }
+            info.addView(TextView(this@RecordsActivity).apply {
+                textSize = 12.5f
+                typeface = Ui.font(700)
+                setTextColor(Ui.INK)
+                setSingleLine(true)
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            info.addView(TextView(this@RecordsActivity).apply {
+                textSize = 11f
+                setTextColor(Ui.SLATE)
+                setSingleLine(true)
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            root.addView(info, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            ))
+            val actions = LinearLayout(this@RecordsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            actions.addView(Ui.xsButton(this@RecordsActivity, "播放"))
+            actions.addView(Ui.xsButton(this@RecordsActivity, "下载回来").apply {
+                (layoutParams as? LinearLayout.LayoutParams)?.leftMargin =
+                    Ui.dp(this@RecordsActivity, 6)
+            })
+            root.addView(actions)
             return root
         }
     }
@@ -254,8 +448,8 @@ class RecordsActivity : Activity() {
     private fun fmtTime(ms: Long): String =
         SimpleDateFormat("HH:mm", Locale.US).format(Date(ms))
 
-    private fun fmtDate(ms: Long): String =
-        if (ms <= 0) "" else SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(ms))
+    private fun fmtTimeHM(ms: Long): String =
+        if (ms <= 0) "" else SimpleDateFormat("HH:mm", Locale.US).format(Date(ms))
 
     private fun fmtSize(bytes: Long): String = when {
         bytes < 0 -> "?"

@@ -49,6 +49,9 @@
         <activity
             android:name=".PlayerActivity"
             android:exported="false" />
+        <activity
+            android:name=".PhotoPreviewActivity"
+            android:exported="false" />
 
         <activity
             android:name=".MainActivity"
