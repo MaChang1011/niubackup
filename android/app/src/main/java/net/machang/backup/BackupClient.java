@@ -48,6 +48,16 @@ import java.util.function.IntSupplier;
  * the whole session before it even connects. Skipped files are simply
  * absent from the manifest (no record, no receipt implications).
  *
+ * Batch sessions (protocol v2 extension): when the receiver's HELLO_ACK
+ * advertises {@code "batch":1}, the client enumerates once and then loops —
+ * hash up to the batch limit (200 files / 256 MiB), offer that batch,
+ * transfer its files — so the first files land while the rest of the
+ * library is still hashing. A wanted file that cannot be opened when its
+ * turn comes is reported as FILE-ERROR instead of the FILE header and
+ * counts failed without aborting the session. Receivers without the
+ * token get the pre-batch flow byte-for-byte (full scan before the
+ * backup connection; capability is probed on a throwaway fs-mode HELLO).
+ *
  * M4a (protocol v2): when user_id / device_id / device token are configured,
  * the client speaks protocol v2 — HELLO carries the identity plus the
  * EasyTier route cost to the PC (1 = p2p direct, &gt;=2 relay, -1 unknown;
@@ -124,69 +134,187 @@ public class BackupClient {
 
     public int runBackup(String host, int port, String device, File rootDir,
                          ProgressListener progress) {
-        List<Entry> entries;
-        try {
-            entries = scan(rootDir);
-        } catch (IOException e) {
-            logger.log("扫描目录失败: " + e.getMessage());
-            return 1;
-        }
-        logger.log("已扫描 " + entries.size() + " 个文件 (" + rootDir.getAbsolutePath() + ")");
-        if (lastSkippedCount > 0) {
-            logger.log("已跳过 " + lastSkippedCount + " 个无法读取的文件（逐条见上方扫描日志）");
-        }
-        if (entries.isEmpty()) {
-            logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
-            return 0;
-        }
-
-        int failures = 0;
-        Socket rawSocket = new Socket();
-        try (Socket s = rawSocket) {
-            rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
-            s.setSoTimeout(120_000);
-            InputStream in = s.getInputStream();
-            OutputStream out = new BufferedOutputStream(s.getOutputStream());
-
-            if (v2()) {
-                int routeCost = -1;
-                try {
-                    routeCost = routeCostSupplier.getAsInt();
-                } catch (Exception ignore) { /* best effort; -1 = unknown */ }
-                Wire.writeLine(out, "HELLO {\"version\":2,\"user_id\":\"" + MiniJson.esc(userId)
-                        + "\",\"device_id\":\"" + MiniJson.esc(deviceId)
-                        + "\",\"device_token\":\"" + MiniJson.esc(deviceToken)
-                        + "\",\"route_cost\":" + routeCost + ",\"mode\":\"backup\"}");
-                String resp = Wire.readLine(in);
-                if (resp == null || !resp.startsWith("HELLO_ACK")) {
-                    logger.log("v2 握手被拒绝: " + resp);
-                    return 1;
-                }
-                logger.log("协议 v2 握手成功（直连 cost=" + routeCost + "）");
-            } else {
+        if (!v2()) {
+            // Legacy v1 (the still-running M1 receiver): unchanged flow —
+            // full scan first, then the single-manifest session.
+            List<Entry> entries;
+            try {
+                entries = scan(rootDir);
+            } catch (IOException e) {
+                logger.log("扫描目录失败: " + e.getMessage());
+                return 1;
+            }
+            logScanSummary(rootDir, entries.size());
+            if (entries.isEmpty()) {
+                logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
+                return 0;
+            }
+            Socket rawSocket = new Socket();
+            try (Socket s = rawSocket) {
+                rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
+                s.setSoTimeout(120_000);
+                InputStream in = s.getInputStream();
+                OutputStream out = new BufferedOutputStream(s.getOutputStream());
                 Wire.writeLine(out, "HELLO " + device + " " + PROTO);
                 String ok = Wire.readLine(in);
                 if (ok == null || !ok.startsWith("OK")) {
                     logger.log("握手被拒绝: " + ok);
                     return 1;
                 }
+                return runSingleManifest(in, out, rootDir, entries, progress);
+            } catch (IOException e) {
+                logger.log("连接/传输失败: " + e.getMessage());
+                return 1;
             }
+        }
 
+        // ---- protocol v2 ----
+        // Phase 1 (cheap metadata walk) happens before any connection, so
+        // an empty library keeps today's no-session behavior.
+        List<File> files = enumerateFiles(rootDir);
+        if (files.isEmpty()) {
+            lastSkippedCount = 0;
+            logger.log("已扫描 0 个文件 (" + rootDir.getAbsolutePath() + ")");
+            logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
+            return 0;
+        }
+        // Batching is used only when the receiver advertises it (HELLO_ACK
+        // "batch":1). A non-batch receiver must see today's flow unchanged —
+        // in particular the full scan BEFORE the backup connection, because
+        // a connection that sits silent through a long first hash would be
+        // killed by the receiver's session read timeout. Capability is
+        // therefore probed on a throwaway fs-mode HELLO, which writes no
+        // backup session state on the receiver.
+        boolean batchCapable = probeBatchCapable(host, port);
+        HashSession hs = new HashSession(rootDir, files.size());
+        List<Entry> entries = null;
+        if (!batchCapable) {
+            entries = hs.hashAll(rootDir, files);
+            hs.finish();
+            lastSkippedCount = hs.skippedCount;
+            logScanSummary(rootDir, entries.size());
+            if (entries.isEmpty()) {
+                logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
+                return 0;
+            }
+        }
+        Socket rawSocket = new Socket();
+        try (Socket s = rawSocket) {
+            rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
+            s.setSoTimeout(120_000);
+            InputStream in = s.getInputStream();
+            OutputStream out = new BufferedOutputStream(s.getOutputStream());
+            int routeCost = -1;
+            try {
+                routeCost = routeCostSupplier.getAsInt();
+            } catch (Exception ignore) { /* best effort; -1 = unknown */ }
+            Wire.writeLine(out, "HELLO {\"version\":2,\"user_id\":\"" + MiniJson.esc(userId)
+                    + "\",\"device_id\":\"" + MiniJson.esc(deviceId)
+                    + "\",\"device_token\":\"" + MiniJson.esc(deviceToken)
+                    + "\",\"route_cost\":" + routeCost + ",\"mode\":\"backup\"}");
+            String resp = Wire.readLine(in);
+            if (resp == null || !resp.startsWith("HELLO_ACK")) {
+                logger.log("v2 握手被拒绝: " + resp);
+                return 1;
+            }
+            logger.log("协议 v2 握手成功（直连 cost=" + routeCost + "）");
+            if (batchCapable && MiniJson.num(resp, "batch", 0) == 1) {
+                return runBatchSession(in, out, rootDir, files, hs, progress);
+            }
+            if (entries == null) {
+                // The probe advertised batch but this HELLO_ACK does not:
+                // fall back to the single-manifest flow on this connection.
+                entries = hs.hashAll(rootDir, files);
+                hs.finish();
+                lastSkippedCount = hs.skippedCount;
+                logScanSummary(rootDir, entries.size());
+                if (entries.isEmpty()) {
+                    // Nothing to offer; close gracefully with an empty
+                    // manifest instead of leaving the receiver waiting.
+                    Wire.writeLine(out, "MANIFEST-END");
+                    readDecisions(in);
+                    Wire.writeLine(out, "BYE");
+                    String receipt = Wire.readLine(in);
+                    logger.log("回执: " + receipt);
+                    if (receipt != null && receipt.startsWith("RECEIPT ")) {
+                        handleSignedReceipt(receipt.substring("RECEIPT ".length()));
+                    }
+                    logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
+                    return 0;
+                }
+            }
+            return runSingleManifest(in, out, rootDir, entries, progress);
+        } catch (IOException e) {
+            logger.log("连接/传输失败: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    private void logScanSummary(File rootDir, int entryCount) {
+        logger.log("已扫描 " + entryCount + " 个文件 (" + rootDir.getAbsolutePath() + ")");
+        if (lastSkippedCount > 0) {
+            logger.log("已跳过 " + lastSkippedCount + " 个无法读取的文件（逐条见上方扫描日志）");
+        }
+    }
+
+    /**
+     * Capability probe on a throwaway fs-mode connection: true when the
+     * receiver's HELLO_ACK advertises {@code "batch":1}. fs sessions write
+     * no backup session state on the receiver, so probing is side-effect
+     * free apart from one session log pair. Any failure → false.
+     */
+    private boolean probeBatchCapable(String host, int port) {
+        Socket rawSocket = new Socket();
+        try (Socket s = rawSocket) {
+            rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
+            s.setSoTimeout(30_000);
+            InputStream in = s.getInputStream();
+            OutputStream out = new BufferedOutputStream(s.getOutputStream());
+            int routeCost = -1;
+            try {
+                routeCost = routeCostSupplier.getAsInt();
+            } catch (Exception ignore) { /* best effort; -1 = unknown */ }
+            Wire.writeLine(out, "HELLO {\"version\":2,\"user_id\":\"" + MiniJson.esc(userId)
+                    + "\",\"device_id\":\"" + MiniJson.esc(deviceId)
+                    + "\",\"device_token\":\"" + MiniJson.esc(deviceToken)
+                    + "\",\"route_cost\":" + routeCost + ",\"mode\":\"fs\"}");
+            String resp = Wire.readLine(in);
+            return resp != null && resp.startsWith("HELLO_ACK")
+                    && MiniJson.num(resp, "batch", 0) == 1;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Decision lines up to READY: {path -> resume offset} for the files to send. */
+    private Map<String, Long> readDecisions(InputStream in) throws IOException {
+        Map<String, Long> wanted = new LinkedHashMap<>();
+        String line;
+        while ((line = Wire.readLine(in)) != null) {
+            if (line.equals("READY")) break;
+            String p = MiniJson.str(line, "path");
+            long off = MiniJson.num(line, "offset", -1);
+            if (p != null && off >= 0) wanted.put(p, off);
+        }
+        return wanted;
+    }
+
+    /**
+     * The pre-batch session body on an established connection: one
+     * manifest, the receiver's decisions, stop-and-wait transfers, BYE,
+     * and the RECEIPT (verified + stored when signed, v2 only).
+     */
+    private int runSingleManifest(InputStream in, OutputStream out, File rootDir,
+                                  List<Entry> entries, ProgressListener progress) {
+        int failures = 0;
+        try {
             for (Entry e : entries) {
                 Wire.writeLine(out, "{\"path\":\"" + MiniJson.esc(e.path) + "\",\"size\":" + e.size
                         + ",\"mtime\":" + e.mtime + ",\"sha256\":\"" + e.sha + "\"}");
             }
             Wire.writeLine(out, "MANIFEST-END");
 
-            // Receiver replies: one {"path":...,"offset":N} per wanted file, then READY.
-            Map<String, Long> wanted = new LinkedHashMap<>();
-            String line;
-            while ((line = Wire.readLine(in)) != null) {
-                if (line.equals("READY")) break;
-                String p = MiniJson.str(line, "path");
-                long off = MiniJson.num(line, "offset", -1);
-                if (p != null && off >= 0) wanted.put(p, off);
-            }
+            Map<String, Long> wanted = readDecisions(in);
             int skipped = entries.size() - wanted.size();
             logger.log("接收端需要 " + wanted.size() + " 个文件，跳过 " + skipped + " 个");
 
@@ -228,6 +356,156 @@ public class BackupClient {
             logger.log("回执: " + receipt);
             if (v2() && receipt != null && receipt.startsWith("RECEIPT ")) {
                 handleSignedReceipt(receipt.substring("RECEIPT ".length()));
+            }
+        } catch (IOException e) {
+            logger.log("连接/传输失败: " + e.getMessage());
+            return Math.max(failures, 1);
+        }
+        String tail = lastSkippedCount > 0
+                ? "，另跳过 " + lastSkippedCount + " 个无法读取的文件" : "";
+        logger.log((failures == 0 ? "全部文件已就位 ✔" : failures + " 个文件失败") + tail);
+        return failures;
+    }
+
+    // ------------------------------------------------------------- batch mode
+
+    static final int DEFAULT_BATCH_FILES = 200;
+    static final long DEFAULT_BATCH_BYTES = 256L * 1024 * 1024;
+
+    /** Batch file-count limit (-Dnb.batch.files wins; default 200). */
+    static int batchFilesLimit() {
+        String v = System.getProperty("nb.batch.files");
+        if (v != null) {
+            try {
+                int n = Integer.parseInt(v.trim());
+                if (n > 0) return n;
+            } catch (NumberFormatException ignore) { }
+        }
+        return DEFAULT_BATCH_FILES;
+    }
+
+    /** Batch byte limit (-Dnb.batch.bytes wins; default 256 MiB). */
+    static long batchBytesLimit() {
+        String v = System.getProperty("nb.batch.bytes");
+        if (v != null) {
+            try {
+                long n = Long.parseLong(v.trim());
+                if (n > 0) return n;
+            } catch (NumberFormatException ignore) { }
+        }
+        return DEFAULT_BATCH_BYTES;
+    }
+
+    /**
+     * Batch session (v2 + the receiver advertised "batch":1): hash up to
+     * the batch limit, offer that batch (BATCH-END), transfer its files,
+     * and continue — the first files land while the rest of the library
+     * is still hashing. BYE closes the session; the receiver answers
+     * with ONE signed receipt over the whole session. A wanted file that
+     * cannot be opened when its turn comes is reported as FILE-ERROR
+     * instead of the FILE header (it may have vanished between scan and
+     * send); it counts failed and the session continues. The progress
+     * total is the bytes decided SO FAR, so it grows as later batches
+     * are decided — the UI percentage can step back when a new batch
+     * lands; that is expected, not a regression.
+     */
+    private int runBatchSession(InputStream in, OutputStream out, File rootDir,
+                                List<File> files, HashSession hs, ProgressListener progress) {
+        int failures = 0;
+        try {
+            int filesLimit = batchFilesLimit();
+            long bytesLimit = batchBytesLimit();
+            logger.log("分批备份模式：每批最多 " + filesLimit + " 个文件 / "
+                    + (bytesLimit / (1024 * 1024)) + " MiB，扫一批传一批");
+            int idx = 0, batchNo = 0, okCount = 0, receiverSkipped = 0, offered = 0;
+            long decidedTotal = 0;
+            long[] sentBytes = {0};
+            while (idx < files.size()) {
+                List<Entry> batch = new ArrayList<>();
+                long batchBytes = 0;
+                while (idx < files.size() && batch.size() < filesLimit
+                        && (batch.isEmpty() || batchBytes < bytesLimit)) {
+                    Entry e = hs.hashOne(rootDir, files.get(idx++));
+                    if (e != null) {
+                        batch.add(e);
+                        batchBytes += e.size;
+                    }
+                }
+                if (batch.isEmpty()) continue; // this slice was all unreadable skips
+                batchNo++;
+                offered += batch.size();
+                for (Entry e : batch) {
+                    Wire.writeLine(out, "{\"path\":\"" + MiniJson.esc(e.path) + "\",\"size\":" + e.size
+                            + ",\"mtime\":" + e.mtime + ",\"sha256\":\"" + e.sha + "\"}");
+                }
+                Wire.writeLine(out, "BATCH-END");
+
+                Map<String, Long> wanted = readDecisions(in);
+                int skippedHere = batch.size() - wanted.size();
+                receiverSkipped += skippedHere;
+                Map<String, Entry> byPath = new HashMap<>();
+                for (Entry e : batch) byPath.put(e.path, e);
+                for (Map.Entry<String, Long> w : wanted.entrySet()) {
+                    Entry e = byPath.get(w.getKey());
+                    if (e != null) decidedTotal += e.size - w.getValue();
+                }
+                logger.log("批次 " + batchNo + "：本批 " + batch.size() + " 个文件，接收端需要 "
+                        + wanted.size() + " 个，跳过 " + skippedHere + " 个");
+                for (Map.Entry<String, Long> w : wanted.entrySet()) {
+                    Entry e = byPath.get(w.getKey());
+                    long offset = w.getValue();
+                    long bytes = e.size - offset;
+                    InputStream fis;
+                    try {
+                        fis = new FileInputStream(new File(rootDir, e.path));
+                        try {
+                            skipFully(fis, offset);
+                        } catch (IOException skipErr) {
+                            try { fis.close(); } catch (IOException ignore) { }
+                            throw skipErr;
+                        }
+                    } catch (IOException openErr) {
+                        // Open BEFORE the FILE header: a file deleted or made
+                        // unreadable since its hash degrades to FILE-ERROR —
+                        // the receiver expects no bytes and no reply is awaited.
+                        Wire.writeLine(out, "FILE-ERROR {\"path\":\"" + MiniJson.esc(e.path)
+                                + "\",\"error\":\"" + MiniJson.esc(String.valueOf(openErr.getMessage())) + "\"}");
+                        failures++;
+                        logger.log("  文件无法打开，本次跳过 " + e.path + " (" + openErr.getMessage() + ")");
+                        continue;
+                    }
+                    Wire.writeLine(out, "FILE {\"path\":\"" + MiniJson.esc(e.path)
+                            + "\",\"bytes\":" + bytes + "}");
+                    try (InputStream f = fis) {
+                        copyN(f, out, bytes, progress, sentBytes, decidedTotal, e.path);
+                    }
+                    out.flush();
+                    String res = Wire.readLine(in);
+                    if (res != null && res.startsWith("DONE")) {
+                        okCount++;
+                        logger.log("  已发送 " + e.path + " (" + bytes + " 字节，偏移 " + offset + ")");
+                    } else {
+                        failures++;
+                        logger.log("  失败 " + e.path + " -> " + res);
+                    }
+                }
+            }
+            hs.finish();
+            lastSkippedCount = hs.skippedCount;
+            lastOkCount = okCount + receiverSkipped;
+            lastFailCount = failures;
+            lastBytesSent = sentBytes[0];
+            logScanSummary(rootDir, offered);
+
+            Wire.writeLine(out, "BYE");
+            String receipt = Wire.readLine(in);
+            logger.log("回执: " + receipt);
+            if (receipt != null && receipt.startsWith("RECEIPT ")) {
+                handleSignedReceipt(receipt.substring("RECEIPT ".length()));
+            }
+            if (offered == 0) {
+                logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
+                return 0;
             }
         } catch (IOException e) {
             logger.log("连接/传输失败: " + e.getMessage());
@@ -287,56 +565,91 @@ public class BackupClient {
         }
     }
 
-    public List<Entry> scan(File root) throws IOException {
-        lastSkippedCount = 0;
-        List<String> skipped = new ArrayList<>();
-        // Phase 1: collect files only (cheap metadata walk; unreadable dirs
-        // under scoped storage are skipped silently, as before).
+    /** Phase 1 of the scan: collect candidate files (cheap metadata walk only). */
+    private List<File> enumerateFiles(File root) {
         List<File> files = new ArrayList<>();
         collectFiles(root, files);
         Collections.sort(files, (a, b) -> relPath(root, a).compareTo(relPath(root, b)));
-        // Phase 2: hash only what the persistent cache cannot vouch for.
-        // Per-file failures land here: stat/open/read of ONE file (an
-        // EACCES .trashed-* entry, a file deleted after the walk) skips
-        // just that file — it must never abort the whole scan/session.
-        // Only scan-level failures (the root itself, the cache load) throw.
-        File cacheFile = cacheDir != null
-                ? new File(cacheDir, HashCache.FILE_NAME)
-                : new File(root, HashCache.FILE_NAME);
-        HashCache cache = HashCache.load(cacheFile);
-        List<Entry> list = new ArrayList<>(files.size());
-        int total = files.size(), done = 0;
-        for (File f : files) {
+        return files;
+    }
+
+    /**
+     * Phase 2 state: hashes enumerated files on demand against the
+     * persistent cache. Per-file failures skip just that file (see the
+     * class doc) — a file that cannot be stat'ed / opened / read is
+     * counted in {@link #skippedCount} and never aborts the scan. Used
+     * all-at-once by {@link #scan} and incrementally by the batch
+     * session, so both paths share the exact skip logging.
+     */
+    private final class HashSession {
+        final HashCache cache;
+        final int total;
+        int done;
+        int skippedCount;
+
+        HashSession(File root, int total) {
+            this.total = total;
+            File cacheFile = cacheDir != null
+                    ? new File(cacheDir, HashCache.FILE_NAME)
+                    : new File(root, HashCache.FILE_NAME);
+            this.cache = HashCache.load(cacheFile);
+        }
+
+        /** Hash one enumerated file; null when it was skipped as unreadable. */
+        Entry hashOne(File root, File f) {
             String path = relPath(root, f);
+            Entry e = null;
             try {
-                Entry e = new Entry();
+                e = new Entry();
                 e.path = path;
                 e.size = f.length();
                 e.mtime = f.lastModified();
                 e.sha = cache.sha256(e.path, f, e.size, e.mtime);
-                list.add(e);
             } catch (Exception ex) { // per-file stat/open/read failure -> skip
-                skipped.add(path);
+                skippedCount++;
                 logger.log("跳过无法读取的文件: " + path + " (" + ex.getMessage() + ")");
+                e = null;
             }
             done++;
             if (done % 200 == 0 || done == total) {
                 logger.log("哈希进度: " + done + "/" + total
                         + "，新算 " + cache.hashedCount() + "，命中缓存 " + cache.hitCount());
             }
+            return e;
         }
-        try {
-            cache.persistIfDirty();
-        } catch (IOException e) {
-            // Cache persistence is bookkeeping: the hashes are all computed
-            // in memory already, so losing the flush must not fail the scan.
-            logger.log("哈希缓存保存失败（不影响本次备份）: " + e.getMessage());
+
+        List<Entry> hashAll(File root, List<File> files) {
+            List<Entry> list = new ArrayList<>(files.size());
+            for (File f : files) {
+                Entry e = hashOne(root, f);
+                if (e != null) list.add(e);
+            }
+            return list;
         }
-        logger.log("哈希缓存: 命中 " + cache.hitCount() + "，新算 " + cache.hashedCount());
-        lastSkippedCount = skipped.size();
-        if (!skipped.isEmpty()) {
+
+        /** Flush the cache (best effort) and log the cache summary line. */
+        void finish() {
+            try {
+                cache.persistIfDirty();
+            } catch (IOException e) {
+                // Cache persistence is bookkeeping: the hashes are all
+                // computed in memory already, so losing the flush must
+                // not fail the scan.
+                logger.log("哈希缓存保存失败（不影响本次备份）: " + e.getMessage());
+            }
+            logger.log("哈希缓存: 命中 " + cache.hitCount() + "，新算 " + cache.hashedCount());
+        }
+    }
+
+    public List<Entry> scan(File root) throws IOException {
+        List<File> files = enumerateFiles(root);
+        HashSession hs = new HashSession(root, files.size());
+        List<Entry> list = hs.hashAll(root, files);
+        hs.finish();
+        lastSkippedCount = hs.skippedCount;
+        if (hs.skippedCount > 0) {
             logger.log("扫描完成: " + list.size() + " 个文件可备份，已跳过 "
-                    + skipped.size() + " 个无法读取的文件");
+                    + hs.skippedCount + " 个无法读取的文件");
         }
         return list;
     }

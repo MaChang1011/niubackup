@@ -704,7 +704,7 @@ public class BackupReceiver {
             Wire.writeLine(out, "HELLO_ERR {\"code\":\"" + err + "\"}");
             return;
         }
-        Wire.writeLine(out, "HELLO_ACK {\"ok\":true}");
+        Wire.writeLine(out, "HELLO_ACK {\"ok\":true,\"batch\":1}");
         log("v2 session start: user=" + auth.userId + " device=" + auth.deviceId + " mode=" + auth.mode);
         if (auth.mode.equals("fs")) {
             handleFs(in, out, auth);
@@ -736,33 +736,103 @@ public class BackupReceiver {
     // ------------------------------------------------------------------ backup session (v1 flow, v2-aware)
 
     /**
-     * The v1 manifest/decision/transfer flow. When {@code auth} is non-null
-     * (v2), decisions consult the files table, verified files are recorded,
-     * thumbnails are generated, a session row is written and the RECEIPT
-     * carries a signed completion receipt. Legacy v1 (auth == null) behaves
-     * exactly like the M1 receiver.
+     * The manifest/decision/transfer flow, round-based since the batch
+     * extension (protocol v2): a backup session is one or more manifest
+     * rounds over one connection. Legacy clients send exactly one round
+     * terminated by MANIFEST-END; batch-capable clients (the HELLO_ACK
+     * advertised {@code "batch":1}) send rounds terminated by BATCH-END
+     * and close the session with BYE, so the first files land while the
+     * client is still hashing the rest of the library. Each round is
+     * decided and transferred with the established logic; session totals
+     * accumulate across rounds, ONE session row is written and the
+     * RECEIPT carries a signed completion receipt over the whole session.
+     * When {@code auth} is non-null (v2), decisions consult the files
+     * table, verified files are recorded and thumbnails are generated.
+     * Legacy v1 (auth == null) behaves exactly like the M1 receiver.
+     *
+     * <p>Batch rounds also carry the FILE-ERROR escape: a client that
+     * cannot open a wanted file when its turn comes (deleted/unreadable
+     * between scan and send) sends {@code FILE-ERROR {path,error}}
+     * instead of the FILE header; the file counts failed for the session
+     * and the batch continues. In legacy single-manifest rounds the same
+     * line is a protocol violation, exactly like any other unexpected
+     * header.
      */
     void runBackupSession(InputStream in, OutputStream out, Path deviceDir, Auth auth) throws Exception {
-        // ---- manifest ----
-        List<Entry> manifest = new ArrayList<>();
-        String line;
-        while ((line = Wire.readLine(in)) != null) {
-            if (line.equals("MANIFEST-END")) break;
-            Entry e = new Entry();
-            e.path = MiniJson.str(line, "path");
-            e.size = MiniJson.num(line, "size", -1);
-            e.mtime = MiniJson.num(line, "mtime", 0);
-            e.sha = MiniJson.str(line, "sha256");
-            if (e.path != null && e.size >= 0 && e.sha != null) manifest.add(e);
-        }
-
-        // ---- decide ----
-        List<Entry> toSend = new ArrayList<>();
         List<String> ok = new ArrayList<>();
         List<String> skipped = new ArrayList<>();
         List<String> failed = new ArrayList<>();
-        Map<String, Entry> byPath = new HashMap<>();
+        List<Entry> allEntries = new ArrayList<>(); // every round, for the signed receipt
         long sessionBytes = 0;
+        boolean byeConsumed = false;
+        int rounds = 0;
+        while (true) {
+            // ---- read one manifest round ----
+            List<Entry> round = new ArrayList<>();
+            String terminator = null;
+            String line;
+            while ((line = Wire.readLine(in)) != null) {
+                if (line.equals("BATCH-END") || line.equals("MANIFEST-END") || line.equals("BYE")) {
+                    terminator = line;
+                    break;
+                }
+                Entry e = new Entry();
+                e.path = MiniJson.str(line, "path");
+                e.size = MiniJson.num(line, "size", -1);
+                e.mtime = MiniJson.num(line, "mtime", 0);
+                e.sha = MiniJson.str(line, "sha256");
+                if (e.path != null && e.size >= 0 && e.sha != null) round.add(e);
+            }
+            if ("BYE".equals(terminator)) { byeConsumed = true; break; }
+            rounds++;
+            boolean batchRound = "BATCH-END".equals(terminator);
+            RoundResult rr = runManifestRound(in, out, deviceDir, auth, round, batchRound,
+                    ok, skipped, failed);
+            sessionBytes += rr.bytes;
+            allEntries.addAll(round);
+            if (terminator == null || "MANIFEST-END".equals(terminator) || rr.senderGone) break;
+            // BATCH-END: the sender either starts another round or sends BYE.
+        }
+
+        if (!byeConsumed) Wire.readLine(in); // BYE (best effort)
+        String receipt = receiptJson(ok, skipped, failed);
+        if (auth != null) {
+            String signedDoc = buildSignedReceipt(auth, allEntries, ok);
+            String signed = ",\"signed\":{\"receipt\":\"" + MiniJson.esc(signedDoc)
+                    + "\",\"signature\":\"" + sign(signedDoc)
+                    + "\",\"pubkey\":\"" + pubkeyB64() + "\"}";
+            receipt = receipt.substring(0, receipt.length() - 1) + signed + "}";
+            String result = failed.isEmpty() ? "ok" : (ok.isEmpty() && skipped.isEmpty() ? "failed" : "partial");
+            store.insertSession(auth.deviceId, ok.size(), sessionBytes, result);
+        }
+        try {
+            Wire.writeLine(out, "RECEIPT " + receipt);
+        } catch (IOException ignore) { }
+        log("session done: ok=" + ok.size() + " skipped=" + skipped.size() + " failed=" + failed.size()
+                + (rounds > 1 ? " rounds=" + rounds : ""));
+    }
+
+    /** Outcome of one manifest round: bytes received + whether the sender vanished mid-transfer. */
+    static final class RoundResult {
+        long bytes;
+        boolean senderGone;
+    }
+
+    /**
+     * Decide + transfer ONE manifest round (the pre-batch session body):
+     * decision lines for the files to receive, READY, then the
+     * stop-and-wait transfer. Session accumulators (ok/skipped/failed)
+     * are appended to; returns the round's byte count. When
+     * {@code batchRound} is set, a {@code FILE-ERROR} line in place of a
+     * FILE header counts that file failed and the round continues.
+     */
+    RoundResult runManifestRound(InputStream in, OutputStream out, Path deviceDir, Auth auth,
+                                 List<Entry> manifest, boolean batchRound,
+                                 List<String> ok, List<String> skipped, List<String> failed) throws Exception {
+        RoundResult rr = new RoundResult();
+        // ---- decide ----
+        List<Entry> toSend = new ArrayList<>();
+        Map<String, Entry> byPath = new HashMap<>();
         for (Entry e : manifest) {
             Path dest = safeResolve(deviceDir, e.path);
             if (dest == null) {
@@ -825,14 +895,38 @@ public class BackupReceiver {
         }
         Wire.writeLine(out, "READY");
         log("manifest: " + manifest.size() + " files, " + skipped.size() + " skipped, "
-                + toSend.size() + " to receive");
+                + toSend.size() + " to receive" + (batchRound ? " (batch round)" : ""));
 
         // ---- transfer, stop-and-wait per file ----
         for (int i = 0; i < toSend.size(); i++) {
             String hdr = Wire.readLine(in);
-            if (hdr == null || !hdr.startsWith("FILE ")) {
+            if (hdr == null) {
                 for (int j = i; j < toSend.size(); j++) failed.add(toSend.get(j).path);
                 log("sender stopped early");
+                rr.senderGone = true;
+                break;
+            }
+            if (batchRound && hdr.startsWith("FILE-ERROR ")) {
+                // The sender cannot open this file (deleted/unreadable since
+                // the scan). No bytes follow and no reply is expected — the
+                // sender has already moved on to the next file.
+                String fjson = hdr.substring("FILE-ERROR ".length());
+                String fpath = MiniJson.str(fjson, "path");
+                if (fpath == null || !fpath.equals(toSend.get(i).path)) {
+                    for (int j = i; j < toSend.size(); j++) failed.add(toSend.get(j).path);
+                    log("protocol violation in FILE-ERROR header: " + hdr);
+                    rr.senderGone = true;
+                    break;
+                }
+                failed.add(fpath);
+                log("sender could not open " + fpath + " (" + MiniJson.str(fjson, "error")
+                        + ") — counted failed, batch continues");
+                continue;
+            }
+            if (!hdr.startsWith("FILE ")) {
+                for (int j = i; j < toSend.size(); j++) failed.add(toSend.get(j).path);
+                log("sender stopped early");
+                rr.senderGone = true;
                 break;
             }
             String fjson = hdr.substring(5);
@@ -842,6 +936,7 @@ public class BackupReceiver {
             if (e == null || bytes < 0 || bytes != e.size - e.offset) {
                 for (int j = i; j < toSend.size(); j++) failed.add(toSend.get(j).path);
                 log("protocol violation in FILE header: " + hdr);
+                rr.senderGone = true;
                 break;
             }
             Files.createDirectories(e.dest.getParent());
@@ -854,7 +949,7 @@ public class BackupReceiver {
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
                 copyN(in, fos, bytes);
             }
-            sessionBytes += bytes;
+            rr.bytes += bytes;
             if (Hash.sha256(e.part).equals(e.sha)) {
                 promote(e);
                 Files.deleteIfExists(e.meta);
@@ -871,22 +966,7 @@ public class BackupReceiver {
                 log("FAILED (sha256 mismatch): " + e.path);
             }
         }
-
-        Wire.readLine(in); // BYE (best effort)
-        String receipt = receiptJson(ok, skipped, failed);
-        if (auth != null) {
-            String signedDoc = buildSignedReceipt(auth, manifest, ok);
-            String signed = ",\"signed\":{\"receipt\":\"" + MiniJson.esc(signedDoc)
-                    + "\",\"signature\":\"" + sign(signedDoc)
-                    + "\",\"pubkey\":\"" + pubkeyB64() + "\"}";
-            receipt = receipt.substring(0, receipt.length() - 1) + signed + "}";
-            String result = failed.isEmpty() ? "ok" : (ok.isEmpty() && skipped.isEmpty() ? "failed" : "partial");
-            store.insertSession(auth.deviceId, ok.size(), sessionBytes, result);
-        }
-        try {
-            Wire.writeLine(out, "RECEIPT " + receipt);
-        } catch (IOException ignore) { }
-        log("session done: ok=" + ok.size() + " skipped=" + skipped.size() + " failed=" + failed.size());
+        return rr;
     }
 
     /** Files-table write for a file whose stored copy is verified (transferred or already present). */

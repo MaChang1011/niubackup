@@ -24,6 +24,14 @@ import java.util.stream.Stream;
  * --fs-thumb &lt;path&gt; (binary outputs saved to --out or a derived name).
  * Without v2 credentials it falls back to the legacy v1 HELLO.
  *
+ * Batch mode: when the receiver's HELLO_ACK advertises "batch":1, a backup
+ * session is incremental — enumerate once, then hash a batch (default 200
+ * files / 256 MiB; override with -Dnb.batch.files / -Dnb.batch.bytes or env
+ * NB_BATCH_FILES / NB_BATCH_BYTES), send that batch (BATCH-END), transfer
+ * its files, continue. A wanted file that cannot be opened at its turn is
+ * reported as FILE-ERROR (counts failed, session continues). Receivers
+ * without the token get the single-manifest flow, unchanged.
+ *
  * Usage:
  *   java BackupSender --host 10.200.0.2 [--port 28742] --dir &lt;sourceDir&gt;
  *       --user &lt;id&gt; --device-id &lt;id&gt; --token &lt;hex&gt; [--route-cost 1]
@@ -112,71 +120,219 @@ public class BackupSender {
         return s;
     }
 
-    /** v2 HELLO for the given mode; returns false (after printing) when refused. */
-    static boolean helloV2(InputStream in, OutputStream out, String mode) throws IOException {
+    /** v2 HELLO for the given mode; returns the HELLO_ACK line, or null (after printing) when refused. */
+    static String helloV2(InputStream in, OutputStream out, String mode) throws IOException {
         Wire.writeLine(out, "HELLO {\"version\":2,\"user_id\":\"" + MiniJson.esc(optUser)
                 + "\",\"device_id\":\"" + MiniJson.esc(optDeviceId)
                 + "\",\"device_token\":\"" + MiniJson.esc(optToken)
                 + "\",\"route_cost\":" + optRouteCost
                 + ",\"mode\":\"" + mode + "\"}");
         String resp = Wire.readLine(in);
-        if (resp != null && resp.startsWith("HELLO_ACK")) return true;
+        if (resp != null && resp.startsWith("HELLO_ACK")) return resp;
         System.err.println("handshake refused: " + resp);
-        return false;
+        return null;
     }
 
     // ---------------------------------------------------------------- backup
 
     static int runBackup(String host, int port, String v1Device, Path dir, boolean v2) throws Exception {
+        if (v2) {
+            // HELLO first: the HELLO_ACK decides the session shape. When it
+            // advertises "batch":1 the scan runs incrementally (enumerate,
+            // then hash a batch -> send that batch -> continue) so the first
+            // files land while the rest of the library is still hashing.
+            // Otherwise the pre-batch single-manifest flow runs unchanged.
+            try (Socket s = connect(host, port)) {
+                InputStream in = s.getInputStream();
+                OutputStream out = new BufferedOutputStream(s.getOutputStream());
+                System.out.println("protocol v2: user=" + optUser + " device=" + optDeviceId
+                        + " route_cost=" + optRouteCost);
+                String ack = helloV2(in, out, "backup");
+                if (ack == null) return 1;
+                if (MiniJson.num(ack, "batch", 0) == 1) {
+                    return runBatchBackup(in, out, dir);
+                }
+                List<Entry> entries = scan(dir);
+                System.out.println("scanned " + entries.size() + " files under " + dir);
+                return singleManifestBackup(in, out, dir, entries, true);
+            }
+        }
         List<Entry> entries = scan(dir);
         System.out.println("scanned " + entries.size() + " files under " + dir);
-
-        int failures = 0;
         try (Socket s = connect(host, port)) {
             InputStream in = s.getInputStream();
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
+            Wire.writeLine(out, "HELLO " + v1Device + " " + PROTO_V1);
+            String ok = Wire.readLine(in);
+            if (ok == null || !ok.startsWith("OK")) {
+                System.err.println("handshake refused: " + ok);
+                return 1;
+            }
+            return singleManifestBackup(in, out, dir, entries, false);
+        }
+    }
 
-            if (v2) {
-                System.out.println("protocol v2: user=" + optUser + " device=" + optDeviceId
-                        + " route_cost=" + optRouteCost);
-                if (!helloV2(in, out, "backup")) return 1;
+    /** The pre-batch session body: one manifest, decisions, transfers, BYE, receipt. */
+    static int singleManifestBackup(InputStream in, OutputStream out, Path dir,
+                                    List<Entry> entries, boolean v2) throws Exception {
+        int failures = 0;
+        for (Entry e : entries) {
+            Wire.writeLine(out, "{\"path\":\"" + MiniJson.esc(e.path) + "\",\"size\":" + e.size
+                    + ",\"mtime\":" + e.mtime + ",\"sha256\":\"" + e.sha + "\"}");
+        }
+        Wire.writeLine(out, "MANIFEST-END");
+
+        Map<String, Long> wanted = readDecisions(in);
+        int skipped = entries.size() - wanted.size();
+        System.out.println("receiver wants " + wanted.size() + " files, skips " + skipped);
+
+        Map<String, Entry> byPath = new HashMap<>();
+        for (Entry e : entries) byPath.put(e.path, e);
+        for (Map.Entry<String, Long> w : wanted.entrySet()) {
+            Entry e = byPath.get(w.getKey());
+            long offset = w.getValue();
+            long bytes = e.size - offset;
+            Wire.writeLine(out, "FILE {\"path\":\"" + MiniJson.esc(e.path)
+                    + "\",\"bytes\":" + bytes + "}");
+            try (InputStream fis = Files.newInputStream(dir.resolve(e.path))) {
+                skipFully(fis, offset);
+                copyN(fis, out, bytes);
+            }
+            out.flush();
+            String res = Wire.readLine(in);
+            if (res != null && res.startsWith("DONE")) {
+                System.out.println("  sent " + e.path + " (" + bytes + " bytes from offset " + offset + ")");
             } else {
-                Wire.writeLine(out, "HELLO " + v1Device + " " + PROTO_V1);
-                String ok = Wire.readLine(in);
-                if (ok == null || !ok.startsWith("OK")) {
-                    System.err.println("handshake refused: " + ok);
-                    return 1;
+                failures++;
+                System.out.println("  FAILED " + e.path + " -> " + res);
+            }
+        }
+
+        Wire.writeLine(out, "BYE");
+        String receipt = Wire.readLine(in);
+        System.out.println("receipt: " + receipt);
+        if (v2 && receipt != null && receipt.startsWith("RECEIPT ")) {
+            if (!handleSignedReceipt(receipt.substring(8))) failures++;
+        }
+        System.out.println(failures == 0 ? "all files in place" : failures + " file(s) failed");
+        return failures == 0 ? 0 : 1;
+    }
+
+    /** Decision lines up to READY: {path -> resume offset} for the files to send. */
+    static Map<String, Long> readDecisions(InputStream in) throws IOException {
+        Map<String, Long> wanted = new LinkedHashMap<>();
+        String line;
+        while ((line = Wire.readLine(in)) != null) {
+            if (line.equals("READY")) break;
+            String p = MiniJson.str(line, "path");
+            long off = MiniJson.num(line, "offset", -1);
+            if (p != null && off >= 0) wanted.put(p, off);
+        }
+        return wanted;
+    }
+
+    // ------------------------------------------------------- batch mode (v2)
+
+    static final int DEFAULT_BATCH_FILES = 200;
+    static final long DEFAULT_BATCH_BYTES = 256L * 1024 * 1024;
+
+    /** Batch file-count limit: -Dnb.batch.files > env NB_BATCH_FILES > default. */
+    static int batchFilesLimit() {
+        String v = System.getProperty("nb.batch.files");
+        if (v == null) v = env("NB_BATCH_FILES");
+        if (v != null) {
+            try {
+                int n = Integer.parseInt(v.trim());
+                if (n > 0) return n;
+            } catch (NumberFormatException ignore) { }
+        }
+        return DEFAULT_BATCH_FILES;
+    }
+
+    /** Batch byte limit: -Dnb.batch.bytes > env NB_BATCH_BYTES > default. */
+    static long batchBytesLimit() {
+        String v = System.getProperty("nb.batch.bytes");
+        if (v == null) v = env("NB_BATCH_BYTES");
+        if (v != null) {
+            try {
+                long n = Long.parseLong(v.trim());
+                if (n > 0) return n;
+            } catch (NumberFormatException ignore) { }
+        }
+        return DEFAULT_BATCH_BYTES;
+    }
+
+    /**
+     * Batch session (v2 + receiver advertised "batch":1): enumerate once,
+     * then loop — hash up to the batch limit, send that batch's manifest
+     * (BATCH-END), read its decisions, send its files — until the library
+     * is exhausted; BYE closes the session and the receiver answers with
+     * ONE signed receipt over the whole session. A wanted file that cannot
+     * be opened when its turn comes is reported as FILE-ERROR instead of
+     * the FILE header (it may have vanished between scan and send) and
+     * counts failed without aborting the session.
+     */
+    static int runBatchBackup(InputStream in, OutputStream out, Path dir) throws Exception {
+        List<Path> files = enumerate(dir);
+        System.out.println("batch mode: enumerated " + files.size() + " files under " + dir
+                + " (batch limit " + batchFilesLimit() + " files / " + batchBytesLimit() + " bytes)");
+        ScanState st = new ScanState(dir, files.size());
+        int filesLimit = batchFilesLimit();
+        long bytesLimit = batchBytesLimit();
+        int idx = 0, batchNo = 0, failures = 0;
+        while (idx < files.size()) {
+            List<Entry> batch = new ArrayList<>();
+            long batchBytes = 0;
+            while (idx < files.size() && batch.size() < filesLimit
+                    && (batch.isEmpty() || batchBytes < bytesLimit)) {
+                Entry e = st.hashOne(files.get(idx++));
+                if (e != null) {
+                    batch.add(e);
+                    batchBytes += e.size;
                 }
             }
-
-            for (Entry e : entries) {
+            if (batch.isEmpty()) continue; // every file in this slice was skipped as unreadable
+            batchNo++;
+            for (Entry e : batch) {
                 Wire.writeLine(out, "{\"path\":\"" + MiniJson.esc(e.path) + "\",\"size\":" + e.size
                         + ",\"mtime\":" + e.mtime + ",\"sha256\":\"" + e.sha + "\"}");
             }
-            Wire.writeLine(out, "MANIFEST-END");
+            Wire.writeLine(out, "BATCH-END");
 
-            Map<String, Long> wanted = new LinkedHashMap<>();
-            String line;
-            while ((line = Wire.readLine(in)) != null) {
-                if (line.equals("READY")) break;
-                String p = MiniJson.str(line, "path");
-                long off = MiniJson.num(line, "offset", -1);
-                if (p != null && off >= 0) wanted.put(p, off);
-            }
-            int skipped = entries.size() - wanted.size();
-            System.out.println("receiver wants " + wanted.size() + " files, skips " + skipped);
+            Map<String, Long> wanted = readDecisions(in);
+            System.out.println("batch " + batchNo + ": " + batch.size() + " files, receiver wants "
+                    + wanted.size() + ", skips " + (batch.size() - wanted.size()));
 
             Map<String, Entry> byPath = new HashMap<>();
-            for (Entry e : entries) byPath.put(e.path, e);
+            for (Entry e : batch) byPath.put(e.path, e);
             for (Map.Entry<String, Long> w : wanted.entrySet()) {
                 Entry e = byPath.get(w.getKey());
                 long offset = w.getValue();
                 long bytes = e.size - offset;
+                InputStream fis;
+                try {
+                    fis = Files.newInputStream(dir.resolve(e.path));
+                    try {
+                        skipFully(fis, offset);
+                    } catch (IOException skipErr) {
+                        try { fis.close(); } catch (IOException ignore) { }
+                        throw skipErr;
+                    }
+                } catch (IOException openErr) {
+                    // Open BEFORE the FILE header is written, so a file that
+                    // vanished since the scan degrades to FILE-ERROR and the
+                    // batch continues (the receiver expects no bytes and no
+                    // reply is awaited).
+                    Wire.writeLine(out, "FILE-ERROR {\"path\":\"" + MiniJson.esc(e.path)
+                            + "\",\"error\":\"" + MiniJson.esc(String.valueOf(openErr.getMessage())) + "\"}");
+                    failures++;
+                    System.out.println("  FILE-ERROR " + e.path + " -> " + openErr.getMessage());
+                    continue;
+                }
                 Wire.writeLine(out, "FILE {\"path\":\"" + MiniJson.esc(e.path)
                         + "\",\"bytes\":" + bytes + "}");
-                try (InputStream fis = Files.newInputStream(dir.resolve(e.path))) {
-                    skipFully(fis, offset);
-                    copyN(fis, out, bytes);
+                try (InputStream f = fis) {
+                    copyN(f, out, bytes);
                 }
                 out.flush();
                 String res = Wire.readLine(in);
@@ -187,13 +343,14 @@ public class BackupSender {
                     System.out.println("  FAILED " + e.path + " -> " + res);
                 }
             }
+        }
+        st.finish();
 
-            Wire.writeLine(out, "BYE");
-            String receipt = Wire.readLine(in);
-            System.out.println("receipt: " + receipt);
-            if (v2 && receipt != null && receipt.startsWith("RECEIPT ")) {
-                if (!handleSignedReceipt(receipt.substring(8))) failures++;
-            }
+        Wire.writeLine(out, "BYE");
+        String receipt = Wire.readLine(in);
+        System.out.println("receipt: " + receipt);
+        if (receipt != null && receipt.startsWith("RECEIPT ")) {
+            if (!handleSignedReceipt(receipt.substring(8))) failures++;
         }
         System.out.println(failures == 0 ? "all files in place" : failures + " file(s) failed");
         return failures == 0 ? 0 : 1;
@@ -239,7 +396,7 @@ public class BackupSender {
         try (Socket s = connect(host, port)) {
             InputStream in = s.getInputStream();
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
-            if (!helloV2(in, out, "fs")) return 1;
+            if (helloV2(in, out, "fs") == null) return 1;
 
             if (fsList) {
                 Wire.writeLine(out, "{\"op\":\"LIST\"}");
@@ -295,11 +452,8 @@ public class BackupSender {
 
     // ---------------------------------------------------------------- scan (M3.5)
 
-    // Per-file tolerance (2026-10-31, mirrored from the Android client): a
-    // file that cannot be stat'ed / opened / read (unreadable entry, file
-    // deleted mid-scan) is SKIPPED and counted instead of aborting the
-    // whole scan. Skipped files are simply absent from the manifest.
-    static List<Entry> scan(Path root) throws IOException {
+    /** Phase 1 of the scan: the sorted metadata walk (cheap; no file content is read). */
+    static List<Path> enumerate(Path root) throws IOException {
         List<Path> files = new ArrayList<>();
         try (Stream<Path> walk = Files.walk(root)) {
             walk.filter(Files::isRegularFile)
@@ -307,41 +461,80 @@ public class BackupSender {
                 .sorted()
                 .forEach(files::add);
         }
-        HashCache cache = HashCache.load(root.resolve(HashCache.FILE_NAME));
-        List<Entry> list = new ArrayList<>(files.size());
-        int total = files.size(), done = 0, skippedCount = 0;
-        for (Path p : files) {
+        return files;
+    }
+
+    /**
+     * Phase 2 state: hashes files on demand against the persistent cache.
+     * Per-file tolerance (2026-10-31, mirrored from the Android client): a
+     * file that cannot be stat'ed / opened / read (unreadable entry, file
+     * deleted mid-scan) is SKIPPED and counted instead of aborting the
+     * whole scan. Skipped files are simply absent from the manifest.
+     * Used all-at-once by {@link #scan} and incrementally by batch mode.
+     */
+    static final class ScanState {
+        final Path root;
+        final HashCache cache;
+        final int total;
+        int done;
+        int skippedCount;
+
+        ScanState(Path root, int total) {
+            this.root = root;
+            this.total = total;
+            this.cache = HashCache.load(root.resolve(HashCache.FILE_NAME));
+        }
+
+        /** Hash one enumerated file; null when it was skipped as unreadable. */
+        Entry hashOne(Path p) {
             String rel = root.relativize(p).toString().replace(File.separatorChar, '/');
+            Entry e = null;
             try {
-                Entry e = new Entry();
+                e = new Entry();
                 e.path = rel;
                 e.size = Files.size(p);
                 e.mtime = Files.getLastModifiedTime(p).toMillis();
                 e.sha = cache.sha256(e.path, p, e.size, e.mtime);
-                list.add(e);
             } catch (Exception ex) { // per-file stat/open/read failure -> skip
                 skippedCount++;
                 System.out.println("  skipped unreadable file: " + rel
                         + " (" + ex.getMessage() + ")");
+                e = null;
             }
             done++;
             if (done % 200 == 0 || done == total) {
                 System.out.println("  hash progress: " + done + "/" + total
                         + ", hashed " + cache.hashedCount() + ", cache hits " + cache.hitCount());
             }
+            return e;
         }
-        try {
-            cache.persistIfDirty();
-        } catch (IOException ex) {
-            // Bookkeeping only — the in-memory hashes are unaffected.
-            System.out.println("hash cache persist failed (backup continues): "
-                    + ex.getMessage());
+
+        /** Flush the cache and print the scan summary lines. */
+        void finish() {
+            try {
+                cache.persistIfDirty();
+            } catch (IOException ex) {
+                // Bookkeeping only — the in-memory hashes are unaffected.
+                System.out.println("hash cache persist failed (backup continues): "
+                        + ex.getMessage());
+            }
+            System.out.println("hash cache: " + cache.hitCount() + " hits, "
+                    + cache.hashedCount() + " newly hashed (" + cache.file() + ")");
+            if (skippedCount > 0) {
+                System.out.println("scan skipped " + skippedCount + " unreadable file(s)");
+            }
         }
-        System.out.println("hash cache: " + cache.hitCount() + " hits, "
-                + cache.hashedCount() + " newly hashed (" + cache.file() + ")");
-        if (skippedCount > 0) {
-            System.out.println("scan skipped " + skippedCount + " unreadable file(s)");
+    }
+
+    static List<Entry> scan(Path root) throws IOException {
+        List<Path> files = enumerate(root);
+        ScanState st = new ScanState(root, files.size());
+        List<Entry> list = new ArrayList<>(files.size());
+        for (Path p : files) {
+            Entry e = st.hashOne(p);
+            if (e != null) list.add(e);
         }
+        st.finish();
         return list;
     }
 

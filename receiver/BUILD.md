@@ -79,6 +79,24 @@ java -cp out BackupSender --host ... --fs-thumb photo.jpg [--out thumb.jpg]
 # legacy v1 mode: omit --user/--device-id/--token
 ```
 
+## Batch sessions (protocol v2 extension)
+
+When the receiver answers HELLO with `HELLO_ACK {"ok":true,"batch":1}`,
+a v2 backup session runs in rounds: the client enumerates once, then per
+batch hashes up to the batch limit (default 200 files / 256 MiB; sender
+override `-Dnb.batch.files` / `-Dnb.batch.bytes` or env `NB_BATCH_FILES` /
+`NB_BATCH_BYTES`), sends the batch manifest terminated by `BATCH-END`,
+reads that batch's decisions + `READY`, and transfers its files. `BYE`
+ends the session; the receiver writes ONE session row and returns ONE
+signed receipt over all rounds. A wanted file the client cannot open at
+its turn is reported as `FILE-ERROR {"path":...,"error":...}` instead of
+the FILE header — it counts failed and the batch continues (in legacy
+single-manifest rounds the same line is a protocol violation). Clients
+that don't see the token (and receivers that don't send it) run the
+pre-batch single-manifest flow unchanged; v1 is untouched. The Android
+client probes capability on a throwaway fs-mode HELLO so non-batch
+receivers keep seeing the full scan before the backup connection.
+
 ## Account mode (M4c) — receiver bound to the account service
 
 ```bash
