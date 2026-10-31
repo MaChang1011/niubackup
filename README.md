@@ -1,133 +1,59 @@
 # 牛备 NiuBackup
 
-手机文件自动备份到自己 PC 的多用户产品（开发中）：组网直连、不经云端、记录只存本地。
-当前进度：M1 协议与接收端、M2 安卓客户端（内嵌 EasyTier 组网）、M3.5 哈希缓存均已实测通过。
-产品与架构设计见 `docs/product-design.md`，早期方案见 `docs/route-b-design.md`。
+手机照片/文件自动备份到你自己的 PC：组网直连、不经云端、文件级记录只存 PC 本地。
+多用户产品，开源免费（自有代码 MIT；组网组件 EasyTier 为 LGPL-3.0，见 `NOTICE`）。
 
----
+## 当前状态（2026-10-31）
 
-以下为 M1 骨架说明（历史）：自研同步协议 + Java 接收端 + Java 测试发送端，零第三方依赖（只用 JDK 标准库）。
+- M4 全线落地：账户服务 + 管理后台、协议 v2（边传边算 + 逐文件签名回执）、安卓客户端
+  （内嵌 EasyTier 组网）、Tauri 桌面端（本机控制 API 驱动 Java 接收引擎）。
+- 产品规则定版：**登录即入网**（无人工批准）、**扫码登录**（手机扫 PC 一次性票据）、
+  **稳定设备编码**（device_uuid，重复登录不换号）、**开源免费、无授权期限**、
+  存储呈现按磁盘真实容量（不用配额口径）。
+- 2026-10-31 晚完成一次彻底从零重置：旧账号与全部测试数据注销清空、双端重装，
+  已以真实账号重新注册启用，处于单用户实机运行阶段；下一步 M4d 小范围试运行。
+- **接手开发先读 `docs/DEVELOPMENT.md`**（环境地图、构建命令、已知陷阱、待办清单）。
 
-> **构建状态：已编译通过 ✅ / 运行时端到端待在真机验证 ⏳**
-> 已在本机用 OpenJDK 21（javac 21.0.12.1）实际编译：两个文件零错误、零警告通过
-> （2026-10-30）。但写这份骨架的沙箱环境禁止直连 TCP（权限策略 other_tcp=Deny），
-> 发送端的 localhost 连接在到达接收端之前就被策略拦截，所以**协议的运行时端到端
-> （全量/跳过/续传）还没实测过**。部署前请先在普通机器（笔记本/台式机）上按下面
-> "本机自测"一节跑一遍再上组网。
-> 笔记本上已有 OpenJDK 25 JRE、缺 `javac`：补装 JDK 后即可编译
-> （或在台式机/任意有 JDK 的机器上编译，把 `out/` 里的 .class 拷过去用 JRE 跑）。
+## 仓库结构
 
-## 文件
-
-| 文件 | 作用 |
+| 目录 | 内容 |
 |---|---|
-| `receiver/BackupReceiver.java` | PC 接收端：监听 TCP、清单比对、断点续传接收、SHA-256 校验、原子落盘、回执 |
-| `sender/BackupSender.java` | 测试发送端（CLI）：扫目录、算哈希、按接收端要求增量发送。M2 时这套逻辑搬进 Android 客户端 |
+| `android/` | 安卓客户端（Kotlin + EasyTier JNI），构建说明见 `android/BUILD-NOTES.md` |
+| `receiver/` | PC 接收端引擎（Java 21，零框架），构建纪律见 `receiver/BUILD.md` |
+| `desktop/` | 桌面壳（Tauri v2：`src/` 前端 + `src-tauri/` Rust 壳） |
+| `server/` | 账户服务 + 管理后台（Spring Boot 3.4.5 + PostgreSQL） |
+| `sender/` | CLI 测试发送端（协议联调/验收 harness 用） |
+| `lib/` | 接收端运行时 jar（sqlite-jdbc、slf4j-api） |
+| `deploy/` | 服务端部署物料（systemd unit、`deploy.sh`、Maven 设置） |
+| `packaging/` | PC 端打包与自启脚本 |
+| `brand/` | 应用图标与品牌素材 |
+| `docs/` | 设计与交接文档（见下方索引） |
 
-## 协议（一页版）
+## 文档索引
 
-一条 TCP 连接 = 一次备份会话。控制行是 UTF-8 文本行，文件内容是原始字节：
+- `docs/product-design.md` — 产品与架构设计（定版口径，含协议 v2、数据模型、里程碑）
+- `docs/DEVELOPMENT.md` — **开发交接手册**：环境地图、构建/部署命令、已知陷阱、当前生产状态、待办
+- `docs/prototype/index.html` — 界面设计稿 v1.5（原型基准，浏览器直接打开；实现已对齐）
+- `docs/session-persistence.md` — 双端登录会话保持的设计与实现
+- `docs/tauri-shell.md` — 桌面壳与本机控制 API 说明
+- `docs/m4a-notes.md`、`docs/m4b-notes.md`、`docs/m4c-notes.md` — 各里程碑实现与验收记录
+- `docs/route-b-design.md` — 早期单用户方案（历史）
+
+## 协议一页版（v2 要点）
+
+一条 TCP 连接 = 一次备份会话，跑在 EasyTier 组网直连隧道上（中继路径不传文件）：
 
 ```
-C->S  HELLO <device> <protoVersion>            当前版本 = 1；device 为单个 token
-S->C  OK 1                                     （或 ERR ...）
-C->S  {"path":"DCIM/a.jpg","size":N,"mtime":N,"sha256":"..."}   每文件一行
-C->S  MANIFEST-END
-S->C  {"path":"...","offset":N}                只回需要传的文件；offset = 已有 .part 长度
-S->C  READY
-C->S  FILE {"path":"...","bytes":N} + N 字节原始数据    逐文件停等（stop-and-wait）
-S->C  DONE {"path":"..."}  /  FAIL {"path":"...","error":"..."}
-C->S  BYE
-S->C  RECEIPT {"ok":[...],"skipped":[...],"failed":[...]}
+HELLO（user_id + device_id + 设备令牌）→ 身份/状态校验 + 直连门（对端路由 cost==1）
+批清单（每轮 200 文件 / 256 MiB，纯元数据）→ 接收端逐文件决策（跳过 / 从偏移续传）
+边传边算：流式传输中双方同步算 SHA-256 → DONE 校验一致才原子落盘
+逐文件签名回执（ECDSA P-256，落盘即签发）+ 整场回执 → BYE 收尾
+断点续传：.part 长度即进度（断线/被杀/重启可续）；源文件 size/mtime 变化即失效重传
+fs 模式：LIST / ranged READ / THUMB —— 支撑记录查看、下载回传与在线播放
 ```
 
-接收端落盘规则：
+细节见 `docs/product-design.md` §5、§14.7 与 `docs/m4a-notes.md`。
 
-- 落盘路径 `<目标目录>/<设备名>/<相对路径>`；拒绝绝对路径和 `..` 穿越。
-- 先写 `<文件名>.part`，收齐后校验 SHA-256，通过才原子改名（`ATOMIC_MOVE`）为正式文件，
-  并把正式文件的 mtime 恢复为源文件 mtime。
-- 跳过判定：正式文件已存在且大小相同 **且哈希相同** → 跳过（M1 为求正确，每次都会
-  对同大小的已存文件重算哈希；文件量大后应在 M3 前换成接收端本地清单索引）。
-- 续传判定：`.part` 长度 < 文件大小 → 从该偏移续传；`.part` 恰好完整且哈希对 →
-  直接转正、零传输；长度超标或完整但哈希错 → 删掉重传。
-- 已知小毛病：源文件内容变了但接收端还留着旧内容的 `.part` 时，会先按旧偏移续传、
-  哈希校验失败、删 `.part`，下一次会话自动全量重传（自愈，不丢数据）。
+## 许可
 
-## 编译
-
-```bash
-cd ~/workspace/easytier-backup
-javac -d out receiver/BackupReceiver.java
-javac -d out sender/BackupSender.java
-```
-
-（两个文件各自带了一份相同的 Wire/Hash/MiniJson 辅助类，所以必须分开编译，
-不要把两个文件写在同一条 javac 命令里——同包同名类会冲突。）
-
-## 运行
-
-接收端（家里笔记本，10.200.0.2；建议绑组网地址，只对组网内提供服务）：
-
-```bash
-java -cp out BackupReceiver --bind 10.200.0.2 --port 28741 --target ~/PhoneBackup
-```
-
-参数都有缺省：`--port 28741`、`--target ~/PhoneBackup`、`--bind` 缺省为全部网卡；
-也可用环境变量 `BACKUP_PORT` / `BACKUP_DIR` / `BACKUP_BIND`（命令行优先）。
-
-发送端（任意一台组网内的机器）：
-
-```bash
-java -cp out BackupSender --host 10.200.0.2 --port 28741 --device testpc --dir /path/to/DCIM
-```
-
-退出码：全部文件就位 = 0，有失败 = 1，用法错误 = 2。
-
-## PC 间联调示例（M1 验收路径）
-
-公司台式机（10.200.0.4）→ 家里笔记本（10.200.0.2），先在台式机上备一个测试目录：
-
-```bash
-mkdir -p /tmp/dcim-test/sub
-echo "hello" > /tmp/dcim-test/a.txt
-dd if=/dev/urandom of=/tmp/dcim-test/sub/b.bin bs=1024 count=300
-```
-
-1. 笔记本上启动接收端（绑 10.200.0.2，目标 ~/PhoneBackup）。
-2. 台式机上跑发送端（`--device office-pc --dir /tmp/dcim-test`）→ 两个文件应全部传输、
-   回执 `failed:[]`；笔记本上出现 `~/PhoneBackup/office-pc/{a.txt,sub/b.bin}`。
-3. 再跑一次发送端 → 接收端应全部跳过（`receiver wants 0 files`）。
-4. 验续传：删掉笔记本上的 `sub/b.bin`，再手动放一个半截的
-   `head -c 100000 /tmp/dcim-test/sub/b.bin > ~/PhoneBackup/office-pc/sub/b.bin.part`，
-   重跑发送端 → 日志应显示 b.bin 从 offset 100000 续传，收齐后 `cmp` 两边文件一致。
-
-## 本机自测（部署前先在任意有 JDK 的机器上跑一遍）
-
-```bash
-javac -d out receiver/BackupReceiver.java
-javac -d out sender/BackupSender.java
-java -cp out BackupReceiver --port 28741 --target /tmp/PhoneBackup &   # 终端 A 日志
-java -cp out BackupSender --host 127.0.0.1 --device testpc --dir /tmp/dcim-test
-```
-
-重复第 4 步的跳过/续传检查，确认无误后再上组网地址。
-
-## 有意留到 M3 的事
-
-- **应用层令牌**：v1 信任边界 = EasyTier 组网成员身份（私有网络 + 网络密钥），协议里只有
-  设备名标识、没有鉴权。M3 在 HELLO 阶段加共享令牌校验。
-- **TLS**：v1 明文传输，机密性靠组网隧道本身。M3 评估 TLS 或至少令牌 + HMAC。
-- 其他 M3 项（见设计文档）：接收端服务化/托盘、省电调度、多目录、失败重试与通知、
-  跳过判定的清单索引（替代每次重算哈希）。
-
----
-
-## M4a 更新（2026-10-31）：协议 v2 已落地
-
-接收端/发送端已升级到协议 v2：设备令牌鉴权（哈希存储）+ 授权校验 + 直连门槛
-（§5.5）、多用户隔离目录、files 表决策索引、`.part.meta` 源变更失效、ECDSA
-P-256 签名回执、PC 文件服务（LIST/READ/THUMB）、缩略图生成、`--verify` 自检、
-`--seed` 种子工具。安卓端同步升级 v2（设置页三字段、机内验签、回执落盘）。
-
-- 构建与运行命令：`receiver/BUILD.md`
-- 数据模型、协议要点与验收实测记录：`docs/m4a-notes.md`
+自有代码 MIT（见 `LICENSE`）；EasyTier 以动态链接方式使用，LGPL-3.0 义务见 `NOTICE`。

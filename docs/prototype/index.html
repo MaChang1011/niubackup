@@ -1,0 +1,1399 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:," />
+    <title>牛备 NiuBackup 界面设计稿</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Noto+Sans+SC:wght@400;500;700;900&display=swap" rel="stylesheet" />
+    <style>
+      /* ============ 提案设计令牌（手机端 + 桌面端共用同一套） ============ */
+      :root{
+        --brand-900:#06303B;
+        --brand-800:#0A4757;
+        --brand-700:#0B5563;
+        --brand-600:#0E6B7E;
+        --brand-500:#12809A;
+        --brand-100:#D9EDF1;
+        --brand-50:#EBF5F7;
+        --accent-600:#DE6A08;
+        --accent-500:#F07F13;
+        --accent-100:#FDEBD3;
+        --ink:#16242C;
+        --ink-2:#41545F;
+        --slate:#64798A;
+        --slate-bg:#E7EDF0;
+        --line:#DCE6EA;
+        --mist:#EEF4F5;
+        --paper:#FFFFFF;
+        --ok:#1E9E66;      --ok-bg:#E1F4EA;
+        --run:#2470D8;     --run-bg:#E2EDFC;
+        --wait:#C77400;    --wait-bg:#FBEED2;
+        --r-card:16px; --r-btn:12px; --r-tile:10px;
+        --shadow-card:0 1px 2px rgba(10,50,63,.05),0 8px 24px -12px rgba(10,50,63,.18);
+        --shadow-pop:0 2px 6px rgba(10,50,63,.08),0 20px 44px -16px rgba(10,50,63,.28);
+        --font:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+        --font-num:"Manrope","Noto Sans SC",system-ui,sans-serif;
+      }
+      /* ============ 稿件页面外壳（评审页，随系统明暗） ============ */
+      :root{
+        --page-bg:#E9F0F1;
+        --page-surface:#FFFFFF;
+        --page-ink:#12242C;
+        --page-ink2:#4A5F6B;
+        --page-line:#D3DEE2;
+        --page-chip:#FFFFFF;
+      }
+      @media (prefers-color-scheme: dark){
+        :root{
+          --page-bg:#0A1418;
+          --page-surface:#102027;
+          --page-ink:#E7F1F3;
+          --page-ink2:#9DB4BD;
+          --page-line:#22383F;
+          --page-chip:#15292F;
+        }
+      }
+      *{box-sizing:border-box}
+      html{-webkit-text-size-adjust:100%}
+      body{
+        margin:0;background:var(--page-bg);color:var(--page-ink);
+        font-family:var(--font);font-size:15px;line-height:1.65;
+      }
+      .wrap{max-width:1240px;margin:0 auto;padding:0 24px 96px}
+      h1,h2,h3{margin:0;line-height:1.3}
+      p{margin:0}
+      .num{font-family:var(--font-num);font-variant-numeric:tabular-nums}
+
+      /* ---------- 稿件页眉 ---------- */
+      .masthead{padding:56px 0 8px}
+      .mast-row{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap}
+      .mast-brand{display:flex;align-items:center;gap:16px}
+      .mast-title{font-size:30px;font-weight:900;letter-spacing:.01em}
+      .mast-title .en{font-family:var(--font-num);font-weight:800}
+      .mast-sub{color:var(--page-ink2);max-width:640px;margin-top:10px;font-size:14.5px}
+      .draft-tag{
+        flex:none;display:inline-flex;align-items:center;gap:8px;max-width:100%;white-space:normal;line-height:1.5;
+        background:var(--accent-100);color:#8A4B00;border:1px solid #F3CE9A;
+        font-size:12.5px;font-weight:700;padding:6px 12px;border-radius:999px;margin-top:6px;
+      }
+      @media (prefers-color-scheme: dark){ .draft-tag{color:#F5B96B;border-color:#5C4318;background:#2A2110} }
+      .draft-tag .dot{width:7px;height:7px;border-radius:50%;background:var(--accent-500)}
+
+      /* ---------- 章节 ---------- */
+      section{margin-top:64px}
+      .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:8px}
+      .sec-no{font-family:var(--font-num);font-weight:800;font-size:13px;color:var(--brand-500);letter-spacing:.14em}
+      .sec-title{font-size:22px;font-weight:900}
+      .sec-desc{color:var(--page-ink2);font-size:14px;max-width:760px;margin-bottom:28px}
+
+      /* ---------- 标志 ---------- */
+      .mark{
+        flex:none;display:grid;place-items:center;border-radius:26%;
+        background:linear-gradient(145deg,var(--brand-500),var(--brand-800));
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.25),0 6px 16px -6px rgba(10,71,87,.55);
+      }
+      .mark svg{display:block}
+      .mark.mono{background:var(--brand-900);box-shadow:none}
+      .mark.line{background:transparent;box-shadow:none;border:2px solid var(--brand-700)}
+      .wordmark{display:flex;align-items:center;gap:12px}
+      .wordmark .wm-cn{font-size:26px;font-weight:900;letter-spacing:.06em;line-height:1}
+      .wordmark .wm-en{font-family:var(--font-num);font-weight:800;font-size:13px;letter-spacing:.22em;color:var(--brand-600)}
+
+      .panel{
+        background:var(--page-surface);border:1px solid var(--page-line);
+        border-radius:20px;padding:28px;box-shadow:var(--shadow-card);
+      }
+      .panel h3{font-size:15px;font-weight:900;margin-bottom:4px}
+      .panel .hint{font-size:12.5px;color:var(--page-ink2);margin-bottom:18px}
+      .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+      .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+      @media (max-width:900px){ .grid-2,.grid-3{grid-template-columns:1fr} }
+
+      .logo-row{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+      .logo-cell{text-align:center}
+      .logo-cell .cap{font-size:12px;color:var(--page-ink2);margin-top:10px}
+      .logo-stage{
+        display:grid;place-items:center;height:118px;border-radius:14px;padding:16px;
+      }
+      .logo-stage.light{background:var(--mist)}
+      .logo-stage.dark{background:var(--brand-900)}
+      .logo-stage.dark .wm-cn{color:#fff}
+      .logo-stage.dark .wm-en{color:#9FD3DE}
+
+      /* ---------- 色板 ---------- */
+      .swatches{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:12px}
+      .sw{border-radius:12px;overflow:hidden;border:1px solid var(--page-line)}
+      .sw .fill{height:56px}
+      .sw .meta{padding:8px 10px;background:var(--page-chip)}
+      .sw .name{font-size:12.5px;font-weight:700}
+      .sw .hex{font-family:var(--font-num);font-size:11.5px;color:var(--page-ink2);letter-spacing:.04em}
+
+      /* ---------- 令牌表 ---------- */
+      .tokens{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:20px 28px}
+      .token h4{margin:0 0 8px;font-size:13px;font-weight:900;color:var(--brand-600)}
+      .token ul{margin:0;padding:0;list-style:none;font-size:13px;color:var(--page-ink2)}
+      .token li{padding:3px 0;display:flex;justify-content:space-between;gap:12px;border-bottom:1px dashed var(--page-line)}
+      .token li:last-child{border-bottom:none}
+      .token b{color:var(--page-ink);font-weight:700;white-space:nowrap}
+      .type-spec .t-display{font-size:26px;font-weight:900;color:var(--page-ink)}
+      .type-spec .t-body{font-size:14px;color:var(--page-ink2)}
+      .type-spec .t-cap{font-size:12px;color:var(--page-ink2)}
+      .radii{display:flex;gap:14px;align-items:flex-end}
+      .radii figure{margin:0;text-align:center}
+      .radii .box{background:var(--brand-100);border:1.5px solid var(--brand-500)}
+      .radii figcaption{font-size:11.5px;color:var(--page-ink2);margin-top:6px;font-family:var(--font-num)}
+
+      /* ---------- 状态语义 ---------- */
+      .status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}
+      .status-cell{display:flex;gap:12px;align-items:flex-start;background:var(--page-chip);border:1px solid var(--page-line);border-radius:14px;padding:14px 16px}
+      .status-cell p{font-size:12.5px;color:var(--page-ink2);line-height:1.55}
+      .status-cell .st-name{font-size:13.5px;font-weight:900;color:var(--page-ink)}
+
+      /* 通用徽标 / 药丸（产品内） */
+      .badge{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:700;line-height:1;padding:4px 7px;border-radius:6px;white-space:nowrap}
+      .badge svg{width:11px;height:11px;flex:none}
+      .b-ok{background:var(--ok-bg);color:#0E7046}
+      .b-run{background:var(--run-bg);color:#174E9E}
+      .b-wait{background:var(--wait-bg);color:#8A5200}
+      .b-pc{background:var(--slate-bg);color:#43586A}
+      .b-pause{background:var(--slate-bg);color:#43586A}
+      .b-none{background:#EFF2F3;color:#71828D;border:1px solid var(--line)}
+      .pill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;padding:5px 10px;border-radius:999px;white-space:nowrap}
+      .pill .dot{width:7px;height:7px;border-radius:50%;flex:none}
+      .pill-ok{background:var(--ok-bg);color:#0E7046}.pill-ok .dot{background:var(--ok)}
+      .pill-run{background:var(--run-bg);color:#174E9E}.pill-run .dot{background:var(--run)}
+      .pill-wait{background:var(--wait-bg);color:#8A5200}.pill-wait .dot{background:var(--accent-500)}
+
+      /* ---------- 画框与说明 ---------- */
+      .frame-col{display:flex;flex-direction:column}
+      .caption{margin-top:14px;font-size:13px;color:var(--page-ink2);line-height:1.6;max-width:340px}
+      .caption b{color:var(--page-ink);font-weight:900}
+      .caption .dec{display:block;margin-top:4px}
+      .caption .dec::before{content:"设计决定 · ";font-weight:700;color:var(--brand-600)}
+
+      /* ============ 手机样机 ============ */
+      .phones{display:grid;grid-template-columns:repeat(auto-fit,minmax(292px,1fr));gap:36px 28px;justify-items:center}
+      .phone{
+        width:296px;height:712px;background:#0B151B;border-radius:46px;padding:11px;
+        box-shadow:0 30px 60px -24px rgba(6,30,40,.5),0 4px 14px rgba(6,30,40,.25),inset 0 0 0 2px #26363F;
+      }
+      .screen{
+        height:100%;background:#F3F7F8;border-radius:36px;overflow:hidden;
+        display:flex;flex-direction:column;color:var(--ink);position:relative;
+        font-size:13px;
+      }
+      .notch{position:absolute;top:9px;left:50%;transform:translateX(-50%);width:86px;height:22px;background:#0B151B;border-radius:12px;z-index:5}
+      .statusbar{display:flex;justify-content:space-between;align-items:center;padding:12px 22px 2px;font-family:var(--font-num);font-weight:700;font-size:12px}
+      .statusbar .sic{display:flex;gap:5px;align-items:center;color:var(--ink)}
+      .statusbar svg{width:15px;height:15px}
+      .app-body{flex:1;padding:10px 16px 8px;display:flex;flex-direction:column;gap:11px;overflow:hidden}
+      .app-body>*{flex:none}
+      .app-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+      .app-title{font-size:19px;font-weight:900}
+      .app-head .mark{width:30px;height:30px}
+      .card{background:var(--paper);border:1px solid var(--line);border-radius:var(--r-card);padding:14px;box-shadow:var(--shadow-card)}
+      .card.tight{padding:12px 14px}
+      .card.tight h5{margin-bottom:6px}
+      .card.tight .kv{padding:3px 0}
+      .card h5{margin:0 0 8px;font-size:12px;font-weight:700;color:var(--slate);letter-spacing:.02em}
+      .kv{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:5px 0;font-size:12.5px}
+      .kv .k{color:var(--ink-2)}
+      .kv .v{font-weight:700;text-align:right}
+      .kv .v .sub{display:block;font-weight:400;color:var(--slate);font-size:11px}
+      .btn{
+        display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap;
+        border:none;cursor:default;font-family:var(--font);font-weight:700;border-radius:var(--r-btn);
+      }
+      .btn svg{width:15px;height:15px}
+      .btn-primary{background:var(--brand-600);color:#fff;box-shadow:0 8px 18px -8px rgba(14,107,126,.7)}
+      .btn-accent{background:var(--accent-500);color:#fff;box-shadow:0 8px 18px -8px rgba(240,127,19,.7)}
+      .btn-ghost{background:var(--mist);color:var(--brand-700)}
+      .btn-big{width:100%;padding:15px;font-size:16px;border-radius:14px}
+      .btn-sm{padding:7px 12px;font-size:12px}
+      .btn-xs{padding:5px 10px;font-size:11.5px;border-radius:8px}
+      .prog{height:8px;border-radius:99px;background:var(--slate-bg);overflow:hidden}
+      .prog i{display:block;height:100%;border-radius:99px;background:var(--run)}
+      .prog.brand i{background:var(--brand-500)}
+      .prog.paused i{background:var(--slate)}
+      .prog.storage i{background:linear-gradient(90deg,var(--brand-600),var(--brand-500))}
+      .log{font-family:var(--font-num);font-size:10.5px;line-height:1.75;color:var(--slate);letter-spacing:.01em}
+      .log b{color:var(--ink-2);font-weight:600}
+      .log .ok{color:var(--ok);font-weight:700}
+
+      .tabbar{
+        flex:none;display:grid;grid-template-columns:repeat(4,1fr);
+        background:rgba(255,255,255,.96);border-top:1px solid var(--line);padding:8px 6px 16px;
+      }
+      .tab{display:flex;flex-direction:column;align-items:center;gap:3px;font-size:10.5px;font-weight:500;color:#8496A1}
+      .tab svg{width:21px;height:21px}
+      .tab.on{color:var(--brand-600);font-weight:700}
+      .tab .tdot{width:4px;height:4px;border-radius:50%;background:transparent}
+      .tab.on .tdot{background:var(--accent-500)}
+
+      /* 文件库网格 */
+      .selbar{display:flex;align-items:center;justify-content:space-between;gap:8px}
+      .selbar .n{font-size:14px;font-weight:900}
+      .selbar .n span{color:var(--brand-600)}
+      .chips{display:flex;gap:6px}
+      .chip{font-size:11.5px;font-weight:600;padding:5px 11px;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--ink-2)}
+      .chip.on{background:var(--brand-600);border-color:var(--brand-600);color:#fff}
+      .grid-photos{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+      .tile{position:relative;aspect-ratio:1;border-radius:var(--r-tile);overflow:hidden}
+      .tile .fillbg{position:absolute;inset:0}
+      .tile .glyph{position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.85);font-family:var(--font-num);font-weight:800;font-size:12px;letter-spacing:.06em}
+      .tile .badge{position:absolute;left:5px;bottom:5px;box-shadow:0 1px 4px rgba(0,0,0,.18)}
+      .tile .dur{position:absolute;right:5px;bottom:5px;font-family:var(--font-num);font-size:9.5px;font-weight:700;color:#fff;background:rgba(8,24,30,.55);padding:2px 5px;border-radius:5px}
+      .tile .tick{position:absolute;top:5px;right:5px;width:19px;height:19px;border-radius:50%;background:var(--brand-600);color:#fff;display:grid;place-items:center;box-shadow:0 1px 5px rgba(0,0,0,.3)}
+      .tile .tick svg{width:11px;height:11px}
+      .tile.sel{outline:2.5px solid var(--brand-600);outline-offset:-2.5px}
+      .tile .pc-only{position:absolute;inset:0;background:rgba(38,54,66,.34);display:grid;place-items:center;color:#fff}
+      .tile .pc-only svg{width:20px;height:20px;opacity:.95}
+      .g1{background:linear-gradient(135deg,#7FB3C8,#3E7FA6)}
+      .g2{background:linear-gradient(135deg,#E8B06A,#C97B2D)}
+      .g3{background:linear-gradient(135deg,#8FC1A9,#4E8A6D)}
+      .g4{background:linear-gradient(135deg,#B39DDB,#6E5AA8)}
+      .g5{background:linear-gradient(135deg,#E59AA5,#B4546B)}
+      .g6{background:linear-gradient(135deg,#5E7E95,#2E4356)}
+      .g7{background:linear-gradient(135deg,#A8C686,#6E9448)}
+      .g8{background:linear-gradient(135deg,#EAC9A0,#B98A4E)}
+      .g9{background:linear-gradient(135deg,#6FB7C9,#2F7E99)}
+
+      /* 记录列表 */
+      .rec{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
+      .rec:last-child{border-bottom:none;padding-bottom:2px}
+      .rec .thumb{width:42px;height:42px;border-radius:9px;flex:none;position:relative;overflow:hidden;display:grid;place-items:center;color:rgba(255,255,255,.9)}
+      .rec .thumb svg{width:18px;height:18px}
+      .rec .info{flex:1;min-width:0}
+      .rec .nm{font-size:12.5px;font-weight:700;font-family:var(--font-num);letter-spacing:.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .rec .mt{font-size:11px;color:var(--slate)}
+      .rec .acts{display:flex;gap:6px;flex:none}
+      .day-label{font-size:11.5px;font-weight:900;color:var(--slate);letter-spacing:.06em;margin:2px 0 -4px}
+
+      /* 分页器（文件库 / 记录共用：只渲染当前页，治卡顿） */
+      .pager{display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:6px 7px;box-shadow:var(--shadow-card)}
+      .pager .pinfo{font-size:11px;color:var(--slate);white-space:nowrap}
+      .pager .pinfo b{color:var(--ink);font-weight:800}
+      .pbtn{display:inline-flex;align-items:center;gap:3px;font-size:11.5px;font-weight:700;color:var(--brand-700);background:var(--mist);border:1px solid var(--line);padding:5px 9px;border-radius:8px;white-space:nowrap}
+      .pbtn svg{width:13px;height:13px}
+      .pbtn.off{color:#A7B7BF;background:#F2F5F6}
+      .pagenums{display:flex;align-items:center;gap:4px}
+      .pnum{min-width:26px;height:26px;padding:0 6px;display:grid;place-items:center;font-family:var(--font-num);font-size:11.5px;font-weight:700;color:var(--ink-2);background:#fff;border:1px solid var(--line);border-radius:7px}
+      .pnum.on{background:var(--brand-600);border-color:var(--brand-600);color:#fff}
+      .pnum.ellipsis{border:none;background:transparent;color:var(--slate);min-width:16px}
+      .pager.mob{padding:5px 6px}
+      .pager.mob .pbtn{padding:5px 8px}
+      .pager.mob .pinfo{font-size:10.5px}
+      .pager-plain{background:transparent;border:none;box-shadow:none;padding:6px 2px 0}
+      .perpage{font-size:11px;color:var(--slate);white-space:nowrap}
+      .perpage b{color:var(--brand-700);background:var(--brand-50);border:1px solid var(--brand-100);padding:2px 7px;border-radius:99px;font-weight:800}
+
+      /* 我的 */
+      .profile{display:flex;gap:12px;align-items:center}
+      .avatar{width:50px;height:50px;border-radius:50%;flex:none;display:grid;place-items:center;color:#fff;font-size:20px;font-weight:900;background:linear-gradient(140deg,var(--brand-500),var(--brand-800))}
+      .menu{background:var(--paper);border:1px solid var(--line);border-radius:var(--r-card);box-shadow:var(--shadow-card);overflow:hidden}
+      .mrow{display:flex;align-items:center;gap:11px;padding:11px 14px;border-bottom:1px solid var(--line)}
+      .mrow:last-child{border-bottom:none}
+      .mrow .ic{width:32px;height:32px;border-radius:9px;background:var(--brand-50);color:var(--brand-700);display:grid;place-items:center;flex:none}
+      .mrow .ic svg{width:17px;height:17px}
+      .mrow .tx{flex:1;min-width:0}
+      .mrow .t1{font-size:13.5px;font-weight:700}
+      .mrow .t2{font-size:11px;color:var(--slate)}
+      .mrow .chev{color:#A7B7BF;flex:none}
+      .mrow .chev svg{width:16px;height:16px;display:block}
+
+      /* ---------- 播放器 / 照片查看器（深色沉浸屏） ---------- */
+      .screen.dark{background:#0C1A21;color:#EAF3F5}
+      .screen.dark .statusbar{color:#EAF3F5}
+      .viewer-top{
+        display:flex;align-items:center;gap:10px;padding:10px 14px 10px;
+      }
+      .viewer-top .vback{
+        width:32px;height:32px;border-radius:50%;flex:none;display:grid;place-items:center;
+        background:rgba(255,255,255,.10);color:#fff;
+      }
+      .viewer-top .vback svg{width:17px;height:17px}
+      .viewer-top .vt{flex:1;min-width:0}
+      .viewer-top .vt .t1{font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .viewer-top .vt .t2{font-size:11px;color:#9DB8C1}
+      .video-stage{
+        position:relative;aspect-ratio:16/9;flex:none;overflow:hidden;
+        background:linear-gradient(135deg,#35586E 0%,#1D3A4D 46%,#0E2A38 100%);
+      }
+      .video-stage::after{
+        content:"";position:absolute;inset:0;
+        background:radial-gradient(120% 90% at 78% 12%,rgba(126,196,214,.34),transparent 52%),linear-gradient(0deg,rgba(4,16,22,.42),transparent 46%);
+      }
+      .video-stage .vscene{
+        position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,.5);
+        font-family:var(--font-num);font-weight:800;letter-spacing:.16em;font-size:12px;z-index:1;
+      }
+      .play-big{
+        position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;
+        width:64px;height:64px;border-radius:50%;display:grid;place-items:center;color:#fff;
+        background:rgba(14,107,126,.92);box-shadow:0 14px 30px -10px rgba(0,0,0,.65),0 0 0 8px rgba(255,255,255,.12);
+      }
+      .play-big svg{width:27px;height:27px;margin-left:3px}
+      .video-stage .vdur{
+        position:absolute;right:10px;bottom:10px;z-index:2;font-family:var(--font-num);
+        font-size:10.5px;font-weight:700;background:rgba(5,18,24,.62);padding:3px 7px;border-radius:6px;
+      }
+      .player-body{flex:1;padding:16px 16px 10px;display:flex;flex-direction:column;gap:13px;overflow:hidden}
+      .player-body>*{flex:none}
+      .p-title{font-size:15.5px;font-weight:900;font-family:var(--font-num);letter-spacing:.01em;word-break:break-all}
+      .p-meta{font-size:11.5px;color:#9DB8C1;margin-top:3px}
+      .stream-note{
+        display:flex;gap:10px;align-items:flex-start;background:rgba(18,128,154,.16);
+        border:1px solid rgba(126,196,214,.28);border-radius:12px;padding:10px 12px;
+      }
+      .stream-note p{font-size:11.5px;line-height:1.6;color:#C6DEE5}
+      .stream-note p b{color:#fff}
+      .chip-stream{
+        flex:none;display:inline-flex;align-items:center;gap:5px;background:var(--brand-500);color:#fff;
+        font-size:11px;font-weight:800;padding:5px 9px;border-radius:999px;white-space:nowrap;
+      }
+      .chip-stream .dot{width:6px;height:6px;border-radius:50%;background:#7EE2B0}
+      .seek{padding:2px 0 0}
+      .seek-track{position:relative;height:22px;display:flex;align-items:center}
+      .seek-track::before{content:"";position:absolute;left:0;right:0;height:5px;border-radius:99px;background:rgba(255,255,255,.18)}
+      .seek-fill{position:absolute;left:0;height:5px;border-radius:99px;background:var(--accent-500)}
+      .seek-knob{
+        position:absolute;width:15px;height:15px;border-radius:50%;background:#fff;
+        box-shadow:0 1px 5px rgba(0,0,0,.55);transform:translateX(-50%);
+      }
+      .seek-times{display:flex;justify-content:space-between;font-family:var(--font-num);font-size:11px;color:#9DB8C1;margin-top:1px}
+      .seek-times b{color:#EAF3F5;font-weight:700}
+      .transport{display:flex;align-items:center;justify-content:center;gap:26px;padding:2px 0}
+      .transport .tbtn{color:#D8E8EC;display:grid;place-items:center}
+      .transport .tbtn svg{width:24px;height:24px}
+      .transport .tmain{
+        width:52px;height:52px;border-radius:50%;background:#fff;color:var(--brand-800);
+        display:grid;place-items:center;box-shadow:0 10px 22px -8px rgba(0,0,0,.6);
+      }
+      .transport .tmain svg{width:23px;height:23px}
+      .viewer-actions{
+        flex:none;display:flex;gap:10px;padding:12px 16px 20px;border-top:1px solid rgba(255,255,255,.10);
+        background:rgba(255,255,255,.03);
+      }
+      .btn-download{flex:1;background:var(--accent-500);color:#fff;padding:12px;font-size:13.5px;box-shadow:0 10px 20px -10px rgba(240,127,19,.8)}
+      .btn-dark-ghost{background:rgba(255,255,255,.09);color:#EAF3F5;padding:12px 14px;font-size:13px}
+      /* 照片查看器 */
+      .photo-top{
+        position:absolute;top:0;left:0;right:0;z-index:4;
+        background:linear-gradient(180deg,rgba(5,17,22,.66),rgba(5,17,22,.28) 72%,transparent);
+        padding:40px 14px 18px;
+      }
+      .photo-top .viewer-top{padding:0}
+      .photo-stage{position:relative;flex:1;overflow:hidden;background:linear-gradient(150deg,#7FB3C8 0%,#4A86A3 42%,#28536B 100%)}
+      .photo-stage::after{
+        content:"";position:absolute;inset:0;
+        background:radial-gradient(90% 60% at 24% 18%,rgba(255,255,255,.35),transparent 52%),linear-gradient(0deg,rgba(7,25,33,.34),transparent 42%);
+      }
+      .photo-stage .pscene{
+        position:absolute;inset:0;display:grid;place-items:center;z-index:1;color:rgba(255,255,255,.72);
+        font-family:var(--font-num);font-weight:800;letter-spacing:.14em;font-size:12px;text-align:center;line-height:1.9;
+      }
+      .pinch-chip{
+        position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:3;
+        display:inline-flex;align-items:center;gap:6px;background:rgba(6,24,31,.62);color:#EAF3F5;
+        font-size:11px;font-weight:700;padding:6px 11px;border-radius:999px;white-space:nowrap;
+      }
+      .pinch-chip svg{width:14px;height:14px}
+      .swipe-hint{
+        position:absolute;left:0;right:0;bottom:58px;z-index:3;display:flex;align-items:center;justify-content:space-between;
+        padding:0 14px;color:rgba(255,255,255,.9);pointer-events:none;
+      }
+      .swipe-hint .sarrow{
+        width:30px;height:30px;border-radius:50%;background:rgba(6,24,31,.42);display:grid;place-items:center;
+      }
+      .swipe-hint .sarrow svg{width:16px;height:16px}
+      .pager-dots{display:flex;gap:5px;align-items:center}
+      .pager-dots i{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.42)}
+      .pager-dots i.on{width:16px;border-radius:99px;background:#fff}
+      .photo-actions{
+        flex:none;display:grid;grid-template-columns:repeat(3,1fr);background:#0A161C;
+        border-top:1px solid rgba(255,255,255,.10);padding:10px 8px 20px;
+      }
+      .pact{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:11px;font-weight:600;color:#C6DEE5}
+      .pact svg{width:20px;height:20px}
+      .pact.accent{color:#F5A54B}
+
+      /* ============ 桌面样机 ============ */
+      .desk-col{display:flex;flex-direction:column}
+      .win{
+        background:#EDF3F4;border-radius:14px;overflow:hidden;color:var(--ink);
+        box-shadow:var(--shadow-pop);border:1px solid #C9D6DB;font-size:13px;
+      }
+      .titlebar{
+        display:flex;align-items:center;gap:8px;background:#fff;border-bottom:1px solid var(--line);
+        padding:9px 14px;
+      }
+      .tl{width:11px;height:11px;border-radius:50%}
+      .tl.r{background:#F0685E}.tl.y{background:#F5BE4F}.tl.g{background:#3EC96F}
+      .titlebar .wt{margin-left:8px;font-size:12px;color:var(--slate);font-weight:500}
+      .titlebar .wt b{color:var(--ink);font-weight:700}
+      .win-body{display:flex;min-height:0}
+      .sidebar{
+        width:196px;flex:none;background:linear-gradient(180deg,var(--brand-900),#08404F);
+        color:#C9DFE4;display:flex;flex-direction:column;padding:18px 12px 14px;gap:4px;
+      }
+      .sidebar .wordmark{padding:2px 8px 16px}
+      .sidebar .wm-cn{color:#fff;font-size:21px}
+      .sidebar .wm-en{color:#8FC3CF;font-size:10.5px}
+      .sidebar .mark{width:34px;height:34px}
+      .nav-item{
+        display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:9px;
+        font-size:13px;font-weight:500;color:#B9D2D9;
+      }
+      .nav-item svg{width:17px;height:17px;flex:none}
+      .nav-item.on{background:rgba(255,255,255,.12);color:#fff;font-weight:700;box-shadow:inset 3px 0 0 var(--accent-500)}
+      .nav-item .cnt{margin-left:auto;background:var(--accent-500);color:#fff;font-size:10.5px;font-weight:800;font-family:var(--font-num);padding:1px 7px;border-radius:99px}
+      .side-user{margin-top:auto;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:10px 12px;font-size:11.5px}
+      .side-user .em{color:#fff;font-weight:700;font-size:12px;word-break:break-all}
+      .side-user .lc{color:#9FC6CF}
+      .main{flex:1;padding:20px 22px;display:flex;flex-direction:column;gap:14px;min-width:0}
+      .main-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+      .main-head h4{margin:0;font-size:17px;font-weight:900}
+      .main-head .sub{font-size:12px;color:var(--slate)}
+      .banner{
+        display:flex;align-items:center;gap:12px;border-radius:var(--r-card);padding:13px 16px;
+        background:#FDF3DF;border:1px solid #F0D49A;
+      }
+      .banner .bic{width:36px;height:36px;border-radius:10px;background:var(--wait-bg);color:var(--wait);display:grid;place-items:center;flex:none}
+      .banner .bic svg{width:19px;height:19px}
+      .banner .bt{flex:1;min-width:0}
+      .banner .bt b{font-size:13.5px}
+      .banner .bt p{font-size:12px;color:#7A5B16}
+      .cards-3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+      @media (max-width:760px){ .cards-3{grid-template-columns:1fr} .sidebar{width:158px} }
+      .stat{background:#fff;border:1px solid var(--line);border-radius:var(--r-card);padding:14px 16px;box-shadow:var(--shadow-card)}
+      .stat .lab{font-size:11.5px;font-weight:700;color:var(--slate);display:flex;align-items:center;gap:6px}
+      .stat .big{font-size:16.5px;font-weight:900;margin-top:5px;display:flex;align-items:center;gap:8px}
+      .stat .small{font-size:11.5px;color:var(--slate);margin-top:2px}
+      .sdot{width:9px;height:9px;border-radius:50%;flex:none}
+      .sdot.ok{background:var(--ok);box-shadow:0 0 0 4px var(--ok-bg)}
+      table.dev{width:100%;border-collapse:collapse;font-size:12.5px}
+      table.dev th{text-align:left;font-size:11.5px;color:var(--slate);font-weight:700;padding:8px 10px;border-bottom:1px solid var(--line)}
+      table.dev td{padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+      table.dev tr:last-child td{border-bottom:none}
+      table.dev tr.pending td{background:#FDF6E3}
+      .devcell{display:flex;align-items:center;gap:10px}
+      .devcell .dic{width:34px;height:34px;border-radius:9px;background:var(--brand-50);color:var(--brand-700);display:grid;place-items:center;flex:none}
+      .devcell .dic svg{width:18px;height:18px}
+      .devcell .dn{font-weight:700}
+      .devcell .dm{font-size:11px;color:var(--slate);font-family:var(--font-num)}
+      .sess{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+      .sess:last-child{border-bottom:none}
+      .sess .sic2{width:32px;height:32px;border-radius:9px;background:var(--ok-bg);color:#0E7046;display:grid;place-items:center;flex:none}
+      .sess .sic2 svg{width:16px;height:16px}
+      .sess .st{flex:1;min-width:0}
+      .sess .st b{font-weight:700}
+      .sess .st span{display:block;color:var(--slate);font-size:11.5px}
+      .desk-2col{display:grid;grid-template-columns:1.55fr 1fr;gap:28px;align-items:start;margin-top:36px}
+      @media (max-width:980px){ .desk-2col{grid-template-columns:1fr} }
+      .desk-full{margin-top:36px}
+      /* 备份记录 · 列表 + 预览 */
+      .records-split{display:grid;grid-template-columns:352px 1fr;gap:14px;align-items:start}
+      @media (max-width:760px){ .records-split{grid-template-columns:1fr} }
+      .rec-list{background:#fff;border:1px solid var(--line);border-radius:var(--r-card);box-shadow:var(--shadow-card);padding:8px 10px 10px}
+      .rec-list .day-label{margin:8px 4px 2px}
+      .drec{display:flex;gap:10px;align-items:center;padding:7px 6px;border-radius:10px}
+      .drec .thumb{width:44px;height:44px;border-radius:9px;flex:none;position:relative;overflow:hidden;display:grid;place-items:center;color:rgba(255,255,255,.92)}
+      .drec .thumb svg{width:17px;height:17px}
+      .drec .info{flex:1;min-width:0}
+      .drec .nm{font-size:12.5px;font-weight:700;font-family:var(--font-num);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .drec .mt{font-size:11px;color:var(--slate)}
+      .drec.sel{background:var(--brand-50);box-shadow:inset 0 0 0 1.5px var(--brand-500)}
+      .preview-card{background:#fff;border:1px solid var(--line);border-radius:var(--r-card);box-shadow:var(--shadow-card);overflow:hidden}
+      .preview-stage{position:relative;aspect-ratio:16/9.4;background:linear-gradient(150deg,#7FB3C8 0%,#4A86A3 42%,#28536B 100%);display:grid;place-items:center}
+      .preview-stage::after{content:"";position:absolute;inset:0;background:radial-gradient(90% 60% at 24% 18%,rgba(255,255,255,.32),transparent 52%),linear-gradient(0deg,rgba(7,25,33,.26),transparent 44%)}
+      .preview-stage .pscene{position:relative;z-index:1;color:rgba(255,255,255,.78);font-family:var(--font-num);font-weight:800;letter-spacing:.14em;font-size:12px;text-align:center;line-height:1.9}
+      .preview-stage .pv-badge{position:absolute;left:12px;top:12px;z-index:2}
+      .preview-meta{padding:14px 16px 16px}
+      .meta-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px 14px;margin:10px 0 14px}
+      @media (max-width:760px){ .meta-grid{grid-template-columns:repeat(2,1fr)} }
+      .meta-grid .mk{font-size:11px;color:var(--slate);font-weight:700}
+      .meta-grid .mv{font-size:12.5px;font-weight:800;margin-top:2px}
+
+      /* 登录框 */
+      .login-stage{
+        background:linear-gradient(150deg,var(--brand-900),#0A4A5A 60%,#0D5A66);
+        border-radius:14px;min-height:430px;display:grid;place-items:center;padding:30px 18px;
+        box-shadow:var(--shadow-pop);
+      }
+      .login-card{background:#fff;border-radius:18px;padding:28px 26px 24px;width:300px;max-width:100%;box-shadow:0 24px 48px -16px rgba(0,0,0,.45);color:var(--ink)}
+      .login-card .wordmark{justify-content:center;margin-bottom:6px}
+      .login-card .wm-cn{font-size:22px}
+      .login-card .tag{text-align:center;font-size:12px;color:var(--slate);margin-bottom:20px}
+      .field{margin-bottom:13px}
+      .field label{display:block;font-size:12px;font-weight:700;margin-bottom:5px}
+      .field .inp{
+        display:flex;align-items:center;gap:8px;border:1.5px solid var(--line);border-radius:10px;
+        padding:9px 11px;font-size:12.5px;color:var(--ink-2);background:#FBFDFD;font-family:var(--font-num);
+      }
+      .field .inp svg{width:15px;height:15px;color:#93A8B1;flex:none}
+      .field .inp.focus{border-color:var(--brand-500);box-shadow:0 0 0 3px var(--brand-100);color:var(--ink)}
+      .login-card .foot{display:flex;justify-content:space-between;align-items:center;margin-top:14px;font-size:11.5px;color:var(--slate)}
+      /* 扫码登录 */
+      .login-tabs{display:flex;background:var(--mist);border-radius:10px;padding:3px;gap:3px;margin-bottom:16px}
+      .login-tabs span{flex:1;text-align:center;font-size:12.5px;font-weight:700;padding:7px 4px;border-radius:8px;color:var(--slate)}
+      .login-tabs span.on{background:#fff;color:var(--brand-700);box-shadow:0 1px 4px rgba(10,50,63,.12)}
+      .qr-wrap{display:flex;flex-direction:column;align-items:center;text-align:center}
+      .qr-box{width:168px;height:168px;background:#fff;border:1.5px solid var(--line);border-radius:14px;padding:10px;position:relative;box-shadow:0 6px 18px -8px rgba(10,50,63,.18)}
+      .qr-box svg{width:100%;height:100%;display:block}
+      .qr-center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34px;height:34px;border-radius:9px;background:#fff;display:grid;place-items:center;box-shadow:0 0 0 3px #fff}
+      .qr-meta{font-size:11.5px;color:var(--slate);margin-top:10px;line-height:1.6}
+      .qr-meta b{color:var(--ink)}
+      .or-div{display:flex;align-items:center;gap:10px;margin:16px 0 12px;font-size:11px;color:var(--slate)}
+      .or-div::before,.or-div::after{content:"";flex:1;height:1px;background:var(--line)}
+      /* 手机扫码屏 */
+      .scan-stage{position:relative;flex:1;background:#101E25;overflow:hidden;display:flex;flex-direction:column}
+      .scan-view{position:relative;margin:18px 22px 0;aspect-ratio:1;border-radius:18px;background:linear-gradient(150deg,#2C4A58,#162E39);overflow:hidden;display:grid;place-items:center}
+      .scan-view::after{content:"";position:absolute;left:12%;right:12%;top:50%;height:2px;background:var(--accent-500);border-radius:99px;box-shadow:0 0 14px rgba(240,127,19,.9);opacity:.95}
+      .corner{position:absolute;width:28px;height:28px;border-color:#fff;border-style:solid;z-index:2}
+      .corner.tl{left:12px;top:12px;border-width:3px 0 0 3px;border-top-left-radius:10px}
+      .corner.tr{right:12px;top:12px;border-width:3px 3px 0 0;border-top-right-radius:10px}
+      .corner.bl{left:12px;bottom:12px;border-width:0 0 3px 3px;border-bottom-left-radius:10px}
+      .corner.br{right:12px;bottom:12px;border-width:0 3px 3px 0;border-bottom-right-radius:10px}
+      .confirm-sheet{margin:14px 14px 0;background:#fff;color:var(--ink);border-radius:16px;padding:14px;box-shadow:var(--shadow-pop)}
+      .confirm-sheet h6{margin:0 0 4px;font-size:13.5px;font-weight:900}
+      .confirm-sheet p{font-size:11.5px;color:var(--ink-2);line-height:1.6}
+      .flow-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+      @media (max-width:700px){ .flow-steps{grid-template-columns:1fr} }
+      .flow-step{background:var(--page-chip);border:1px solid var(--page-line);border-radius:14px;padding:14px 16px}
+      .flow-step .n{width:26px;height:26px;border-radius:50%;background:var(--brand-600);color:#fff;display:grid;place-items:center;font-family:var(--font-num);font-weight:800;font-size:13px;margin-bottom:8px}
+      .flow-step b{font-size:13.5px}
+      .flow-step p{font-size:12.5px;color:var(--page-ink2);line-height:1.6;margin-top:3px}
+
+      footer{margin-top:72px;border-top:1px solid var(--page-line);padding-top:20px;color:var(--page-ink2);font-size:12.5px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+      @media (max-width:640px){
+        .wrap{padding:0 16px 72px}
+        .mast-title{font-size:25px}
+        .panel{padding:20px}
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+
+      <!-- ================= 页眉 ================= -->
+      <header class="masthead">
+        <div class="mast-row">
+          <div>
+            <div class="mast-brand">
+              <div class="mark" style="width:54px;height:54px">
+                <svg width="36" height="36" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="21.6" cy="31.6" r="1.15" fill="#0A4757" opacity=".5"/><circle cx="26.4" cy="31.6" r="1.15" fill="#0A4757" opacity=".5"/></svg>
+              </div>
+              <h1 class="mast-title">牛备 <span class="en">NiuBackup</span> · 界面设计稿</h1>
+            </div>
+            <p class="mast-sub">手机照片与文件，经私有组网直连备份到自己电脑的产品。这一稿先定视觉语言，再给手机端与桌面端的样机——<b>本页全部为静态样机，无真实功能</b>，确认方向后再照此写代码。本轮修订五点：备份新增<b>暂停 / 继续</b>，组网改为<b>全自动</b>、界面只显示网络状态，文件库与记录改为<b>分页加载</b>，新增<b>扫码登录</b>——手机已登录时扫电脑端二维码即可登录电脑，<b>同账号设备自动组同一网络</b>、无需再填网络参数或手动配对；并<b>取消授权期限</b>——产品<b>开源免费</b>，注册即永久可用，不设试用与到期。</p>
+          </div>
+          <span class="draft-tag"><span class="dot"></span>设计稿 v1.5 · 开源免费 · 无授权期限 / 扫码登录 / 同账号自动组网 / 分页 / 暂停 / 自动组网</span>
+        </div>
+      </header>
+
+      <!-- ================= 01 设计语言 ================= -->
+      <section>
+        <div class="sec-head"><span class="sec-no">01</span><h2 class="sec-title">设计语言</h2></div>
+        <p class="sec-desc">一套令牌（颜色、字阶、圆角、间距）同时驱动手机端和桌面端，两端看起来必须是同一个产品。主色取深青蓝——沉稳、可信、像「保管」；点缀用牛系的琥珀橙，只出现在行动按钮、进度高点和待处理提醒上，不铺张。</p>
+
+        <div class="grid-2">
+          <div class="panel">
+            <h3>标志与字标</h3>
+            <p class="hint">几何牛头：双角 + 盾形脸，额头嵌一枚向上的琥珀色箭头——「牛」与「向上备份」合为一形。圆角方砖底，深青蓝渐变。</p>
+            <div class="logo-row">
+              <div class="logo-cell">
+                <div class="logo-stage light">
+                  <div class="wordmark">
+                    <div class="mark" style="width:46px;height:46px">
+                      <svg width="31" height="31" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="21.6" cy="31.6" r="1.15" fill="#0A4757" opacity=".5"/><circle cx="26.4" cy="31.6" r="1.15" fill="#0A4757" opacity=".5"/></svg>
+                    </div>
+                    <div><div class="wm-cn">牛备</div><div class="wm-en">NIUBACKUP</div></div>
+                  </div>
+                </div>
+                <div class="cap">主字标 · 浅底</div>
+              </div>
+              <div class="logo-cell">
+                <div class="logo-stage dark">
+                  <div class="wordmark">
+                    <div class="mark" style="width:46px;height:46px">
+                      <svg width="31" height="31" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="21.6" cy="31.6" r="1.15" fill="#0A4757" opacity=".5"/><circle cx="26.4" cy="31.6" r="1.15" fill="#0A4757" opacity=".5"/></svg>
+                    </div>
+                    <div><div class="wm-cn">牛备</div><div class="wm-en">NIUBACKUP</div></div>
+                  </div>
+                </div>
+                <div class="cap">主字标 · 深底（侧边栏 / 登录页）</div>
+              </div>
+              <div class="logo-cell">
+                <div class="logo-stage light">
+                  <div class="mark mono" style="width:46px;height:46px">
+                    <svg width="31" height="31" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#06303B"/><circle cx="27.4" cy="24.6" r="1.7" fill="#06303B"/><circle cx="21.6" cy="31.6" r="1.15" fill="#06303B" opacity=".5"/><circle cx="26.4" cy="31.6" r="1.15" fill="#06303B" opacity=".5"/></svg>
+                  </div>
+                </div>
+                <div class="cap">应用图标 · 单色版</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>字体与规格</h3>
+            <p class="hint">中文用思源黑体 / 苹方，数字与英文用 Manrope 并开启等宽数字——进度、容量、时间戳不对齐是旧界面最显廉价的地方。</p>
+            <div class="type-spec" style="margin-bottom:18px">
+              <div class="t-display">备份完成 · 128 个文件</div>
+              <div class="t-body" style="margin-top:4px">正文 14–15px / 行高 1.6。上次备份 今天 09:17 · 新增 3.4 GB · 全程直连。</div>
+              <div class="t-cap" style="margin-top:4px"><span class="num">2026-10-31 10:42:03 · 1,024.6 MB · route=p2p-direct</span>（说明与日志 11–12px）</div>
+            </div>
+            <div class="tokens">
+              <div class="token">
+                <h4>圆角</h4>
+                <div class="radii">
+                  <figure><div class="box" style="width:44px;height:44px;border-radius:16px"></div><figcaption>卡片 16</figcaption></figure>
+                  <figure><div class="box" style="width:44px;height:36px;border-radius:12px"></div><figcaption>按钮 12</figcaption></figure>
+                  <figure><div class="box" style="width:36px;height:36px;border-radius:10px"></div><figcaption>缩略图 10</figcaption></figure>
+                  <figure><div class="box" style="width:40px;height:22px;border-radius:99px"></div><figcaption>药丸 全圆</figcaption></figure>
+                </div>
+              </div>
+              <div class="token">
+                <h4>间距 · 8pt 网格</h4>
+                <ul>
+                  <li><span>页面边距</span><b>16 / 24</b></li>
+                  <li><span>卡片内边距</span><b>14–16</b></li>
+                  <li><span>区块间距</span><b>12 / 16 / 24</b></li>
+                  <li><span>阴影</span><b>双层柔和 · 青色调</b></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:20px">
+          <h3>调色板</h3>
+          <p class="hint">品牌青蓝五阶 + 琥珀橙点缀 + 中性灰阶。橙色是稀缺资源：只给主行动、待处理提醒、存储高点用，其余一律青蓝与灰。</p>
+          <div class="swatches">
+            <div class="sw"><div class="fill" style="background:#06303B"></div><div class="meta"><div class="name">品牌 900 · 深渊</div><div class="hex">#06303B</div></div></div>
+            <div class="sw"><div class="fill" style="background:#0B5563"></div><div class="meta"><div class="name">品牌 700</div><div class="hex">#0B5563</div></div></div>
+            <div class="sw"><div class="fill" style="background:#0E6B7E"></div><div class="meta"><div class="name">品牌 600 · 主色</div><div class="hex">#0E6B7E</div></div></div>
+            <div class="sw"><div class="fill" style="background:#12809A"></div><div class="meta"><div class="name">品牌 500</div><div class="hex">#12809A</div></div></div>
+            <div class="sw"><div class="fill" style="background:#D9EDF1"></div><div class="meta"><div class="name">品牌 100 · 浅染</div><div class="hex">#D9EDF1</div></div></div>
+            <div class="sw"><div class="fill" style="background:#F07F13"></div><div class="meta"><div class="name">点缀 500 · 牛橙</div><div class="hex">#F07F13</div></div></div>
+            <div class="sw"><div class="fill" style="background:#DE6A08"></div><div class="meta"><div class="name">点缀 600</div><div class="hex">#DE6A08</div></div></div>
+            <div class="sw"><div class="fill" style="background:#16242C"></div><div class="meta"><div class="name">墨色 · 正文</div><div class="hex">#16242C</div></div></div>
+            <div class="sw"><div class="fill" style="background:#64798A"></div><div class="meta"><div class="name">石板 · 次要</div><div class="hex">#64798A</div></div></div>
+            <div class="sw"><div class="fill" style="background:#EEF4F5"></div><div class="meta"><div class="name">雾面 · 底色</div><div class="hex">#EEF4F5</div></div></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:20px">
+          <h3>状态色语义（全产品统一）</h3>
+          <p class="hint">四个状态色在手机徽标、桌面表格、日志里含义完全一致，用户只需要学一次。</p>
+          <div class="status-grid">
+            <div class="status-cell"><span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>已备份</span><div><div class="st-name">已备份 · 绿 <span class="num">#1E9E66</span></div><p>文件已在 PC 上落盘且完整性校验通过，凭签收回执可安全删本地。</p></div></div>
+            <div class="status-cell"><span class="badge b-run">备份中 62%</span><div><div class="st-name">备份中 · 蓝 <span class="num">#2470D8</span></div><p>正在传输或校验。蓝色专属「进行中」，与品牌青蓝刻意区分，避免误读为可点击。</p></div></div>
+            <div class="status-cell"><span class="badge b-wait">等待直连</span><div><div class="st-name">等待直连 · 琥珀 <span class="num">#C77400</span></div><p>组网已通但尚未打洞成功。牛备只走直连、不经中转，所以这是一个需要等待（或换网络）的状态，而非错误。</p></div></div>
+            <div class="status-cell"><span class="badge b-pc">仅 PC 有</span><div><div class="st-name">仅 PC 有 · 石板灰 <span class="num">#64798A</span></div><p>本地已删除、只剩 PC 副本。用中性灰而非警示色——这是正常状态，不是丢失。</p></div></div>
+            <div class="status-cell"><span class="badge b-pause">已暂停 62%</span><div><div class="st-name">已暂停 · 石板灰 <span class="num">#64798A</span></div><p>用户主动暂停备份：传输真的停下，当前文件断点与已签回执都保留，点「继续备份」从断点续传。同样用中性灰——既不是错误，也不是还在传。</p></div></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:20px">
+          <h3>分页规则（文件库与记录统一 · 本轮新增）</h3>
+          <p class="hint">卡顿的根源是一次把几千条全渲染出来。改为分页后：列表只向本地 SQLite 索引按页查询（LIMIT / OFFSET），首屏只建当前页的视图，翻页才换下一批；总数与页码常驻，筛选条件变化时回到第 1 页。</p>
+          <div class="status-grid">
+            <div class="status-cell"><span class="badge b-ok">文件库</span><div><div class="st-name">手机文件库 · 每页 <span class="num">48</span> 项</div><p>3 列网格一页 48 项（约 16 行缩略图），6,269 项共 131 页。翻页只解码本页缩略图，不预加载全库。</p></div></div>
+            <div class="status-cell"><span class="badge b-ok">记录</span><div><div class="st-name">手机记录 · 每页 <span class="num">20</span> 条</div><p>按日分组在页内呈现，跨页时日期组头在新页重复出现，不出现「半组」记录。5,412 条共 271 页。</p></div></div>
+            <div class="status-cell"><span class="badge b-ok">桌面记录</span><div><div class="st-name">桌面备份记录 · 每页 <span class="num">50</span> 条</div><p>左列列表分页、右列预览只跟随当前页的选中项；支持页码直跳与每页条数标识。5,412 条共 109 页。</p></div></div>
+            <div class="status-cell"><span class="badge b-wait">翻页行为</span><div><div class="st-name">不做无限滚动 · 不一次全量加载</div><p>用明确的上一页 / 页码 / 下一页，而不是滑到底自动灌入——页数可预期、滚动位置可恢复，低端机也不会越滑越卡。</p></div></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:20px">
+          <h3>扫码登录与同账号组网（本轮新增）</h3>
+          <p class="hint">核心规则只有一句：<b>账号即网络</b>。不再让用户记网络名、密钥或服务地址——谁登录了同一个账号，谁就自动进同一个专属网络（nb-xxxx），登录完成即组网完成。</p>
+          <div class="flow-steps">
+            <div class="flow-step"><div class="n">1</div><b>电脑端出码</b><p>电脑端打开登录页默认就是「扫码登录」：显示一次性二维码（2 分钟有效、过期自动刷新），旁边写清用哪台手机扫。密码登录收进同一张卡的页签，随时可切。</p></div>
+            <div class="flow-step"><div class="n">2</div><b>手机扫码确认</b><p>手机已登录时，从「我的 → 扫码登录电脑」或备份页扫码入口打开扫码框；扫到后不直接放行，先弹确认页：显示电脑名称 / 系统 / 申请时间，核对无误点「确认登录」才放行。</p></div>
+            <div class="flow-step"><div class="n">3</div><b>同账号自动同网</b><p>确认后电脑端以同一账号完成登录并登记为该账号的设备，服务端下发该账号的专属网络凭证，两端自动加入同一网络并开始发现彼此——全程不出现网络名、密钥、IP 输入框。</p></div>
+          </div>
+          <div class="status-grid" style="margin-top:14px">
+            <div class="status-cell"><span class="badge b-ok">安全边界</span><div><div class="st-name">二维码一次性 · 手机端二次确认</div><p>二维码只含一次性登录票据，不含账号密码；截图转发无效、用过即废。手机不在手边时，电脑端仍可用账号密码登录，两条路登录的是同一个账号、进同一个网络。</p></div></div>
+            <div class="status-cell"><span class="badge b-ok">与旧配对的关系</span><div><div class="st-name">同账号 = 已信任，取消批准环节</div><p>扫码登录本身就是账号持有者在手机上的确认，这台电脑直接以同账号入网，不再走任何批准步骤；未登录同账号的设备根本进不了这个网络，也就不存在待批准队列。</p></div></div>
+            <div class="status-cell"><span class="badge b-wait">状态可见</span><div><div class="st-name">电脑端三态：待扫码 → 已扫码待确认 → 已登录</div><p>手机一扫，电脑端二维码立刻变「已扫码，请在手机上确认」；手机点确认后电脑端自动进主界面，不用刷新、不用再点登录。</p></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 02 手机端 ================= -->
+      <section>
+        <div class="sec-head"><span class="sec-no">02</span><h2 class="sec-title">手机端 · 四个页面 + 暂停状态、播放预览与扫码确认</h2></div>
+        <p class="sec-desc">底部导航固定四页，与功能一一对应，不再把所有东西堆在一个调试屏上。每页只做一件事：备份页管「现在传」，文件库管「哪些已备、哪些能删」，记录页管「PC 上有什么」，我的页管账号与设置。本轮修订四点：<b>一、备份可暂停</b>——备份中进度卡下常驻「暂停备份」大按钮，暂停后进入已暂停状态（另附一屏），点「继续备份」从断点续传；<b>二、组网全自动</b>——App 自己完成组网，界面任何一页都不给组网开关和参数入口，只常驻展示网络状态（已连接 · 直连 / 等待直连）；<b>三、文件库与记录分页</b>——文件库每页 48 项、记录每页 20 条，列表底部常驻分页器（上一页 / 当前页·总页数 / 下一页），只渲染当前页，不再一口气铺满几千条；<b>四、扫码登录电脑</b>——「我的」页新增「扫码登录电脑」入口，手机已登录时扫电脑端二维码、在手机上确认一次，电脑端即以同一账号登录并自动加入同一网络（另附扫码确认一屏）。另有从记录与文件库点开的<b>视频播放页</b>与<b>照片预览页</b>两屏沉浸页，不占底部导航，是内容的详情层。</p>
+
+        <div class="phones">
+          <!-- ===== 手机 1：备份 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen">
+              <div class="notch"></div>
+              <div class="statusbar"><span>10:42</span><span class="sic">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div class="app-body" style="gap:10px">
+                <div class="app-head">
+                  <span class="app-title">备份</span>
+                  <span class="pill pill-ok"><span class="dot"></span>网络已连接 · 直连</span>
+                </div>
+                <div class="card tight">
+                  <h5>账户与网络</h5>
+                  <div class="kv"><span class="k">账号</span><span class="v num" style="font-size:12px">shouji@niubackup.test</span></div>
+                  <div class="kv"><span class="k">组网状态</span><span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>已同网 · 同账号</span></div>
+                  <div class="kv"><span class="k">备份目标</span><span class="v">家里的笔记本<span class="sub num" style="display:inline"> · 10.99.0.2</span></span></div>
+                </div>
+                <button class="btn btn-primary btn-big" style="padding:13px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V5M7.5 9.5 12 5l4.5 4.5"/><path d="M4 19.5h16"/></svg>立即备份</button>
+                <div class="card tight">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                    <h5 style="margin:0">本次进度</h5><span class="badge b-run">备份中 · <span class="num">62%</span></span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+                    <span class="num" style="font-weight:800;font-size:13.5px">IMG_2041.mp4</span>
+                    <span class="num" style="font-size:11.5px;color:var(--slate)">1.18 / 1.90 GB</span>
+                  </div>
+                  <div class="prog"><i style="width:62%"></i></div>
+                  <div style="font-size:11.5px;color:var(--slate);margin-top:7px"><span class="num">8.4 MB/s</span> · 剩余约 3 分钟</div>
+                  <div style="display:flex;gap:8px;margin-top:10px">
+                    <span class="btn btn-ghost" style="flex:1;padding:10px;font-size:13px"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="5.5" width="4" height="13" rx="1.2"/><rect x="13.5" y="5.5" width="4" height="13" rx="1.2"/></svg>暂停备份</span>
+                    <span class="btn" style="padding:10px 14px;font-size:13px;color:#B3402E;background:#F9ECE9">取消备份</span>
+                  </div>
+                </div>
+                <div class="card tight">
+                  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+                    <div>
+                      <div style="font-size:11.5px;font-weight:700;color:var(--slate)">上次备份 · 今天 <span class="num">09:17</span></div>
+                      <div style="font-size:13px;font-weight:800;margin-top:2px;white-space:nowrap"><span class="num">128</span> 个文件 · <span class="num">3.4 GB</span></div>
+                    </div>
+                    <span class="badge b-ok" style="flex:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>校验通过</span>
+                  </div>
+                </div>
+                <div class="card" style="padding:10px 12px">
+                  <div class="log" style="font-size:10px;line-height:1.7">
+                    <b>10:42:04</b> 路由 p2p 直连 · 延迟 <span class="num">46ms</span><br/>
+                    <b>10:42:05</b> 身份认证通过 <span class="ok">OK</span><br/>
+                    <b>10:42:06</b> 断点续传 · 从 <span class="num">62%</span> 处继续
+                  </div>
+                </div>
+              </div>
+              <nav class="tabbar">
+                <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17.5a4.3 4.3 0 0 1-.5-8.56A5.6 5.6 0 0 1 17.3 10 3.9 3.9 0 0 1 17 17.5"/><path d="M12 12.5v7M9.6 14.6 12 12.2l2.4 2.4"/></svg>备份<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/></svg>文件库<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>记录<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="8.2" r="3.6"/><path d="M5 19.6c1.4-3 4-4.4 7-4.4s5.6 1.4 7 4.4"/></svg>我的<span class="tdot"></span></div>
+              </nav>
+            </div></div>
+            <p class="caption"><b>备份页 · 备份中</b> —— 首屏即答案：网络状态药丸常驻标题栏，连接质量（直连/等待直连）不用点进日志才知道。<span class="dec">「暂停备份」是进度卡下方的全宽大按钮，与「取消备份」并排分开：暂停 = 停在安全点保留断点，取消 = 放弃本次。不跳页、不弹窗；日志只保留最近几行人话，完整日志在记录页。</span></p>
+          </div>
+
+          <!-- ===== 手机 1b：备份 · 已暂停 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen">
+              <div class="notch"></div>
+              <div class="statusbar"><span>10:47</span><span class="sic">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div class="app-body" style="gap:10px">
+                <div class="app-head">
+                  <span class="app-title">备份</span>
+                  <span class="pill pill-ok"><span class="dot"></span>网络已连接 · 直连</span>
+                </div>
+                <div class="card tight">
+                  <h5>账户与网络</h5>
+                  <div class="kv"><span class="k">账号</span><span class="v num" style="font-size:12px">shouji@niubackup.test</span></div>
+                  <div class="kv"><span class="k">组网状态</span><span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>已同网 · 同账号</span></div>
+                  <div class="kv"><span class="k">备份目标</span><span class="v">家里的笔记本<span class="sub num" style="display:inline"> · 10.99.0.2</span></span></div>
+                </div>
+                <div class="card tight">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                    <h5 style="margin:0">本次进度</h5><span class="badge b-pause">已暂停</span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+                    <span class="num" style="font-weight:800;font-size:13.5px">IMG_2041.mp4</span>
+                    <span class="num" style="font-size:11.5px;color:var(--slate)">1.18 / 1.90 GB</span>
+                  </div>
+                  <div class="prog paused"><i style="width:62%"></i></div>
+                  <div style="font-size:11.5px;color:var(--slate);margin-top:7px">已停在安全点 · 当前文件的断点保留在电脑上</div>
+                </div>
+                <button class="btn btn-accent btn-big" style="padding:13px"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.8v12.4c0 .9 1 1.5 1.8 1L20 13a1.2 1.2 0 0 0 0-2L9.8 4.9C9 4.4 8 5 8 5.8Z"/></svg>继续备份</button>
+                <div class="card tight">
+                  <h5>暂停期间</h5>
+                  <div class="kv"><span class="k">本次已完成</span><span class="v"><span class="num">37</span> 个文件 · 回执已保存</span></div>
+                  <div class="kv"><span class="k">继续时</span><span class="v">跳过已完成 · 从断点续传</span></div>
+                  <div class="kv"><span class="k">传输状态</span><span class="v">已停止 · 不占流量</span></div>
+                </div>
+                <span class="btn" style="padding:10px;font-size:13px;color:#B3402E;background:#F9ECE9">取消本次备份</span>
+              </div>
+              <nav class="tabbar">
+                <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17.5a4.3 4.3 0 0 1-.5-8.56A5.6 5.6 0 0 1 17.3 10 3.9 3.9 0 0 1 17 17.5"/><path d="M12 12.5v7M9.6 14.6 12 12.2l2.4 2.4"/></svg>备份<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/></svg>文件库<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>记录<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="8.2" r="3.6"/><path d="M5 19.6c1.4-3 4-4.4 7-4.4s5.6 1.4 7 4.4"/></svg>我的<span class="tdot"></span></div>
+              </nav>
+            </div></div>
+            <p class="caption"><b>备份页 · 已暂停（新增）</b> —— 点「暂停备份」后的同一页：进度条冻结并转石板灰，徽标变「已暂停」，主按钮原地换成橙色「继续备份」。<span class="dec">暂停不是假停：传输真停、不占流量；已完成文件的回执已逐个落袋，当前大文件停在断点，继续时跳过已完成、从断点续传，一格不重传。</span></p>
+          </div>
+
+          <!-- ===== 手机 2：文件库 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen">
+              <div class="notch"></div>
+              <div class="statusbar"><span>10:42</span><span class="sic">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div class="app-body">
+                <div class="selbar">
+                  <span style="font-size:12.5px;font-weight:600;color:var(--brand-600)">取消</span>
+                  <span class="n">已选 <span>12</span> 项</span>
+                  <span class="btn btn-accent btn-xs">释放空间</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <div class="chips"><span class="chip on">全部</span><span class="chip">照片</span><span class="chip">视频</span><span class="chip">未备份</span></div>
+                  <span style="font-size:11px;color:var(--slate)" class="num">6,269 项</span>
+                </div>
+                <div class="grid-photos">
+                  <div class="tile sel"><div class="fillbg g1"></div><span class="glyph">IMG</span><span class="badge b-ok">已备份</span><span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span></div>
+                  <div class="tile sel"><div class="fillbg g2"></div><span class="glyph">IMG</span><span class="badge b-ok">已备份</span><span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span></div>
+                  <div class="tile"><div class="fillbg g6"></div><span class="glyph">▶ MP4</span><span class="badge b-run">备份中 62%</span><span class="dur">02:31</span></div>
+                  <div class="tile"><div class="fillbg g3"></div><span class="glyph">IMG</span><span class="badge b-ok">已备份</span></div>
+                  <div class="tile"><div class="fillbg g4"></div><span class="pc-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9.5 20.5h5"/></svg></span><span class="badge b-pc">仅 PC 有</span></div>
+                  <div class="tile sel"><div class="fillbg g5"></div><span class="glyph">IMG</span><span class="badge b-ok">已备份</span><span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span></div>
+                  <div class="tile"><div class="fillbg g7"></div><span class="glyph">IMG</span><span class="badge b-none">未备份</span></div>
+                  <div class="tile"><div class="fillbg g8"></div><span class="glyph">IMG</span><span class="badge b-wait">等待直连</span></div>
+                  <div class="tile"><div class="fillbg g9"></div><span class="pc-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9.5 20.5h5"/></svg></span><span class="badge b-pc">仅 PC 有</span></div>
+                  <div class="tile"><div class="fillbg g2"></div><span class="glyph">▶ MP4</span><span class="badge b-ok">已备份</span><span class="dur">00:48</span></div>
+                  <div class="tile"><div class="fillbg g3"></div><span class="glyph">IMG</span><span class="badge b-none">未备份</span></div>
+                  <div class="tile"><div class="fillbg g1"></div><span class="glyph">IMG</span><span class="badge b-ok">已备份</span></div>
+                </div>
+                <div class="pager mob" role="navigation" aria-label="文件库分页">
+                  <span class="pbtn off" aria-label="上一页"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg>上一页</span>
+                  <span class="pinfo"><b class="num">1</b> / <span class="num">131</span> 页 · <span class="num">48</span>/页</span>
+                  <span class="pbtn" aria-label="下一页">下一页<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5.5 6.5 6.5L9 18.5"/></svg></span>
+                </div>
+                <div class="card" style="padding:11px 14px;display:flex;gap:10px;align-items:center">
+                  <span class="badge b-ok" style="flex:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.2c0 4.6 3 7.7 7 9.3 4-1.6 7-4.7 7-9.3V6l-7-2.5Z"/><path d="M9 11.8l2.2 2.2 4-4.2"/></svg>可安全释放</span>
+                  <p style="font-size:11.5px;color:var(--ink-2);line-height:1.55">所选 12 项均已备份且校验通过，预计释放 <b class="num">2.1 GB</b>。未通过校验的文件不会出现在可选项里。</p>
+                </div>
+              </div>
+              <nav class="tabbar">
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17.5a4.3 4.3 0 0 1-.5-8.56A5.6 5.6 0 0 1 17.3 10 3.9 3.9 0 0 1 17 17.5"/><path d="M12 12.5v7M9.6 14.6 12 12.2l2.4 2.4"/></svg>备份<span class="tdot"></span></div>
+                <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/></svg>文件库<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>记录<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="8.2" r="3.6"/><path d="M5 19.6c1.4-3 4-4.4 7-4.4s5.6 1.4 7 4.4"/></svg>我的<span class="tdot"></span></div>
+              </nav>
+            </div></div>
+            <p class="caption"><b>文件库 · 选择模式（已分页）</b> —— 长按进入选择，顶栏原地切换为「已选 N 项 + 释放空间」，橙色按钮只在此出现。<span class="dec">网格下方新增分页器：每页 48 项、共 131 页，只渲染当前页的缩略图，翻页才向本地索引取下一页，6,269 项不再一次性铺满；切换「全部 / 照片 / 视频 / 未备份」筛选后回到第 1 页，跨页选择保留已选计数。每块瓷砖左下角常驻状态徽标；「仅 PC 有」的瓷砖压暗并盖显示器标记。释放空间前有一道校验说明卡，删文件这件事必须显得郑重。</span></p>
+          </div>
+
+          <!-- ===== 手机 3：记录 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen">
+              <div class="notch"></div>
+              <div class="statusbar"><span>10:42</span><span class="sic">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div class="app-body">
+                <div class="app-head">
+                  <span class="app-title">备份记录</span>
+                  <span class="pill pill-ok"><span class="dot"></span>直连中</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;background:var(--brand-50);border:1px solid var(--brand-100);border-radius:10px;padding:8px 11px">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--brand-700)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
+                  <span style="font-size:11.5px;color:var(--brand-800)">记录截至 <b class="num">10:42</b> · 离线时显示缓存</span>
+                </div>
+                <div class="card" style="padding:6px 14px 10px">
+                  <div class="day-label" style="margin-top:6px">今天 · 10月31日</div>
+                  <div class="rec">
+                    <div class="thumb g6"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 7.8v8.4c0 .8.9 1.3 1.6.9l6.8-4.2c.6-.4.6-1.4 0-1.8L10.6 6.9c-.7-.4-1.6.1-1.6.9Z"/></svg></div>
+                    <div class="info"><div class="nm">VID_20261031_0917.mp4</div><div class="mt num">1.90 GB · 09:17 · 回执已验证 ✓</div></div>
+                    <div class="acts"><span class="btn btn-ghost btn-xs">播放</span><span class="btn btn-ghost btn-xs">下载回来</span></div>
+                  </div>
+                  <div class="rec">
+                    <div class="thumb g1"><span style="font-family:var(--font-num);font-weight:800;font-size:10px">IMG</span></div>
+                    <div class="info"><div class="nm">IMG_2038.jpg</div><div class="mt num">4.2 MB · 09:17 · 回执已验证 ✓</div></div>
+                    <div class="acts"><span class="btn btn-ghost btn-xs">下载回来</span></div>
+                  </div>
+                  <div class="rec">
+                    <div class="thumb g5"><span style="font-family:var(--font-num);font-weight:800;font-size:10px">IMG</span></div>
+                    <div class="info"><div class="nm">IMG_2037.jpg</div><div class="mt num">3.8 MB · 09:16 · 回执已验证 ✓</div></div>
+                    <div class="acts"><span class="btn btn-ghost btn-xs">下载回来</span></div>
+                  </div>
+                  <div class="day-label" style="margin-top:6px">昨天 · 10月30日</div>
+                  <div class="rec">
+                    <div class="thumb g3"><span style="font-family:var(--font-num);font-weight:800;font-size:10px">IMG</span></div>
+                    <div class="info"><div class="nm">IMG_1992.heic</div><div class="mt num">2.9 MB · 21:03 · 回执已验证 ✓</div></div>
+                    <div class="acts"><span class="btn btn-ghost btn-xs">下载回来</span></div>
+                  </div>
+                </div>
+                <div class="pager mob" role="navigation" aria-label="备份记录分页">
+                  <span class="pbtn off" aria-label="上一页"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg>上一页</span>
+                  <span class="pinfo"><b class="num">1</b> / <span class="num">271</span> 页 · <span class="num">20</span>/页</span>
+                  <span class="pbtn" aria-label="下一页">下一页<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5.5 6.5 6.5L9 18.5"/></svg></span>
+                </div>
+                <p style="font-size:11px;color:var(--slate);text-align:center">共 <b class="num" style="color:var(--ink)">5,412</b> 条 · 只加载当前页</p>
+              </div>
+              <nav class="tabbar">
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17.5a4.3 4.3 0 0 1-.5-8.56A5.6 5.6 0 0 1 17.3 10 3.9 3.9 0 0 1 17 17.5"/><path d="M12 12.5v7M9.6 14.6 12 12.2l2.4 2.4"/></svg>备份<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/></svg>文件库<span class="tdot"></span></div>
+                <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>记录<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="8.2" r="3.6"/><path d="M5 19.6c1.4-3 4-4.4 7-4.4s5.6 1.4 7 4.4"/></svg>我的<span class="tdot"></span></div>
+              </nav>
+            </div></div>
+            <p class="caption"><b>记录页（已分页）</b> —— 这是「PC 上有什么」的权威清单，按日期分组；每条都标注回执验证状态，这是敢删本地文件的凭据。<span class="dec">卡片下方新增分页器：每页 20 条、共 271 页，只渲染当前页，按日分组跨页时组头在新页重复；不再把 5,412 条一次同步渲染。顶部常驻「记录截至 10:42」提示条：记录来自 PC 本地库、经直连同步，离线看到的是缓存，必须让用户知道数据的新鲜度。</span></p>
+          </div>
+
+          <!-- ===== 手机 4：我的 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen">
+              <div class="notch"></div>
+              <div class="statusbar"><span>10:42</span><span class="sic">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div class="app-body" style="gap:10px">
+                <div class="app-head"><span class="app-title">我的</span></div>
+                <div class="card" style="padding:12px 14px">
+                  <div class="profile">
+                    <div class="avatar" style="width:44px;height:44px;font-size:18px">牛</div>
+                    <div style="flex:1;min-width:0">
+                      <div class="num" style="font-weight:800;font-size:12.5px;white-space:nowrap">shouji@niubackup.test</div>
+                      <div style="font-size:11px;color:var(--slate)">专属网络 <span class="num">nb-4-xxxx</span> · 1 台电脑已同网</div>
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;margin-top:10px">
+                    <span class="pill pill-ok"><span class="dot"></span>开源免费 · 永久可用</span>
+                  </div>
+                </div>
+                <div class="menu">
+                  <div class="mrow" style="background:var(--brand-50)">
+                    <span class="ic" style="background:#fff;color:var(--brand-700)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><rect x="7" y="7" width="4" height="4" rx=".8"/><rect x="13.5" y="7" width="3.5" height="3.5" rx=".8"/><rect x="7" y="13.5" width="3.5" height="3.5" rx=".8"/><path d="M13.5 13.5h1.8v1.8h-1.8zM17 15.3h.01M15.3 17h1.7"/></svg></span>
+                    <span class="tx"><span class="t1">扫码登录电脑</span><span class="t2" style="display:block">扫电脑端二维码 · 同账号自动同网</span></span>
+                    <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5.5 15.5 12 9 18.5"/></svg></span>
+                  </div>
+                  <div class="mrow">
+                    <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="3" width="10" height="18" rx="2.4"/><path d="M10.8 17.8h2.4"/></svg></span>
+                    <span class="tx"><span class="t1">设备与配对</span><span class="t2" style="display:block">家里的笔记本 · 同账号 · 已同网</span></span>
+                    <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5.5 15.5 12 9 18.5"/></svg></span>
+                  </div>
+                  <div class="mrow">
+                    <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="8.6"/><path d="M3.4 12h17.2M12 3.4c2.5 2.3 3.7 5.2 3.7 8.6s-1.2 6.3-3.7 8.6c-2.5-2.3-3.7-5.2-3.7-8.6S9.5 5.7 12 3.4Z"/></svg></span>
+                    <span class="tx"><span class="t1">网络状态</span><span class="t2" style="display:block">组网自动完成 · 无需手动设置</span></span>
+                    <span class="pill pill-ok"><span class="dot"></span>已连接 · 直连</span>
+                  </div>
+                  <div class="mrow">
+                    <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12.8 3 5.5 13.5h5L9.7 21l7.5-10.7h-5.1l.7-7.3Z"/></svg></span>
+                    <span class="tx"><span class="t1">自动备份条件</span><span class="t2" style="display:block">仅 Wi-Fi · 充电时</span></span>
+                    <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5.5 15.5 12 9 18.5"/></svg></span>
+                  </div>
+                  <div class="mrow">
+                    <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 11v5"/><path d="M12 7.8h.01" stroke-width="2.6"/></svg></span>
+                    <span class="tx"><span class="t1">关于牛备</span><span class="t2" style="display:block">版本 <span class="num">0.4.0</span> · 开源免费</span></span>
+                    <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5.5 15.5 12 9 18.5"/></svg></span>
+                  </div>
+                </div>
+                <div class="card" style="padding:12px 8px;display:flex;text-align:center">
+                  <div style="flex:1"><div class="num" style="font-size:16px;font-weight:800">5,412</div><div style="font-size:10.5px;color:var(--slate);margin-top:1px">已备份文件</div></div>
+                  <div style="flex:1;border-left:1px solid var(--line);border-right:1px solid var(--line)"><div class="num" style="font-size:16px;font-weight:800">18.6 GB</div><div style="font-size:10.5px;color:var(--slate);margin-top:1px">已释放空间</div></div>
+                  <div style="flex:1"><div class="num" style="font-size:16px;font-weight:800;color:var(--wait)">857</div><div style="font-size:10.5px;color:var(--slate);margin-top:1px">待备份</div></div>
+                </div>
+                <span class="btn btn-ghost" style="padding:10px;font-size:13px;color:#B3402E;background:#F9ECE9">退出登录</span>
+              </div>
+              <nav class="tabbar">
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17.5a4.3 4.3 0 0 1-.5-8.56A5.6 5.6 0 0 1 17.3 10 3.9 3.9 0 0 1 17 17.5"/><path d="M12 12.5v7M9.6 14.6 12 12.2l2.4 2.4"/></svg>备份<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/></svg>文件库<span class="tdot"></span></div>
+                <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>记录<span class="tdot"></span></div>
+                <div class="tab on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="8.2" r="3.6"/><path d="M5 19.6c1.4-3 4-4.4 7-4.4s5.6 1.4 7 4.4"/></svg>我的<span class="tdot"></span></div>
+              </nav>
+            </div></div>
+            <p class="caption"><b>我的（含扫码入口）</b> —— 账号放最上，只挂一颗「开源免费 · 永久可用」的绿色药丸：没有试用倒计时，也没有到期日要惦记。菜单第一行新增「扫码登录电脑」并浅染品牌色置顶：这是给第二台设备登录用的高频捷径，必须一眼可见。<span class="dec">设置项每行带一行现状摘要（如「仅 Wi-Fi · 充电时」），不用逐个点进去看；「网络状态」是只读行、没有箭头点不进去——组网由 App 自动完成，用户只需看通没通、是不是直连。同账号扫码登录的电脑自动进同一网络，设备页里也不再有待批准队列。退出登录用低饱和红单独成行，与危险操作保持距离感。</span></p>
+          </div>
+
+          <!-- ===== 手机 5：视频播放 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen dark">
+              <div class="notch"></div>
+              <div class="statusbar"><span>10:42</span><span class="sic">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div class="viewer-top">
+                <span class="vback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg></span>
+                <span class="vt"><span class="t1" style="display:block">视频播放</span><span class="t2">来自 家里的笔记本 · 备份记录</span></span>
+                <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>已备份</span>
+              </div>
+              <div class="video-stage">
+                <span class="vscene">VIDEO · 16:9</span>
+                <span class="play-big"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.8v12.4c0 .9 1 1.5 1.8 1L20 13a1.2 1.2 0 0 0 0-2L9.8 4.9C9 4.4 8 5 8 5.8Z"/></svg></span>
+                <span class="vdur">02:31</span>
+              </div>
+              <div class="player-body">
+                <div>
+                  <div class="p-title">VID_20261031_0917.mp4</div>
+                  <div class="p-meta"><span class="num">1.90 GB</span> · <span class="num">2026-10-31 09:17</span> · <span class="num">1920×1080</span> · 本地已释放，仅 PC 有副本</div>
+                </div>
+                <div class="stream-note">
+                  <span class="chip-stream"><span class="dot"></span>直连流式</span>
+                  <p><b>经产品组网从你的电脑直连播放</b> —— 不经服务器中转，不先下载完整文件；拖动进度时会短暂缓冲。</p>
+                </div>
+                <div class="seek">
+                  <div class="seek-track"><span class="seek-fill" style="width:47%"></span><span class="seek-knob" style="left:47%"></span></div>
+                  <div class="seek-times"><span>已播 <b>01:11</b></span><span>总时长 <b>02:31</b></span></div>
+                </div>
+                <div class="transport">
+                  <span class="tbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M11 8.5 7 12l4 3.5M7 12h9a4 4 0 0 1 0 8h-3"/></svg></span>
+                  <span class="tmain"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="5.5" width="4" height="13" rx="1.2"/><rect x="13.5" y="5.5" width="4" height="13" rx="1.2"/></svg></span>
+                  <span class="tbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m13 8.5 4 3.5-4 3.5M17 12H8a4 4 0 0 0 0 8h3"/></svg></span>
+                </div>
+                <p style="font-size:11px;color:#7E9AA5;text-align:center;line-height:1.6">播放 / 暂停在中央，进度条可直接拖动；<br/>快退 / 快进 10 秒分列两侧，大拇指够得到。</p>
+              </div>
+              <div class="viewer-actions">
+                <span class="btn btn-download"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v10M7.5 11 12 15.5 16.5 11"/><path d="M4 19.5h16"/></svg>下载回来</span>
+                <span class="btn btn-dark-ghost">详情</span>
+              </div>
+            </div></div>
+            <p class="caption"><b>视频播放页（新增）</b> —— 从记录页「播放」或文件库视频瓷砖进入，全屏深色只为看清画面；16:9 视频区居中，大号播放键在未播放时是唯一焦点。<span class="dec">「直连流式」chip 与说明常驻标题下方：用户要知道这是在线播 PC 上的副本、不是本地文件。底部只留一个橙色主动作「下载回来」，与记录页文案完全一致。</span></p>
+          </div>
+
+          <!-- ===== 手机 6：照片预览 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen dark" style="background:#0A161C">
+              <div class="notch"></div>
+              <div class="photo-stage">
+                <div class="photo-top">
+                  <div class="statusbar" style="padding:2px 8px 10px"><span>10:42</span><span class="sic">
+                    <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                    <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+                  </span></div>
+                  <div class="viewer-top">
+                    <span class="vback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg></span>
+                    <span class="vt"><span class="t1" style="display:block"><span class="num">IMG_2038.jpg</span></span><span class="t2"><span class="num">2026-10-31 09:17</span> · <span class="num">4.2 MB</span> · <span class="num">3 / 12</span></span></span>
+                    <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>已备份</span>
+                  </div>
+                </div>
+                <span class="pscene">PHOTO PREVIEW<br/><span style="letter-spacing:.06em;font-size:11px;opacity:.85">4032 × 3024 · 原图</span></span>
+                <div class="swipe-hint">
+                  <span class="sarrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg></span>
+                  <span class="pager-dots"><i></i><i></i><i class="on"></i><i></i><i></i></span>
+                  <span class="sarrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5.5 6.5 6.5L9 18.5"/></svg></span>
+                </div>
+                <span class="pinch-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/></svg>双指放大 · 捏合或双击查看细节</span>
+              </div>
+              <div class="photo-actions">
+                <span class="pact"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v10M7.5 11 12 15.5 16.5 11"/><path d="M4 19.5h16"/></svg>下载回来</span>
+                <span class="pact accent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.2c0 4.6 3 7.7 7 9.3 4-1.6 7-4.7 7-9.3V6l-7-2.5Z"/><path d="M9 11.8l2.2 2.2 4-4.2"/></svg>释放空间</span>
+                <span class="pact"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>记录</span>
+              </div>
+            </div></div>
+            <p class="caption"><b>照片预览页（新增）</b> —— 从文件库或记录点开，大图占满整屏，信息退到半透明的顶栏与底栏后面，点一下画面即可全隐。<span class="dec">顶栏把文件名、日期与绿色「已备份」徽标放在一起：能不能删本地，看一眼徽标就够。底部三动作固定为下载回来 / 释放空间 / 记录；左右箭头 + 圆点提示可滑动切换，「双指放大」chip 只在首次进入时提示，不挡图。</span></p>
+          </div>
+
+          <!-- ===== 手机 7：扫码登录确认 ===== -->
+          <div class="frame-col">
+            <div class="phone"><div class="screen" style="background:#0C1A21">
+              <div class="notch"></div>
+              <div class="statusbar" style="color:#EAF3F5"><span>10:43</span><span class="sic" style="color:#EAF3F5">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="3" height="6" rx="1"/><rect x="8.5" y="11" width="3" height="9" rx="1"/><rect x="14" y="8" width="3" height="12" rx="1"/><rect x="19.5" y="5" width="3" height="15" rx="1" opacity=".35"/></svg>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10.5a12 12 0 0 1 16 0M7.2 14a7.5 7.5 0 0 1 9.6 0"/><circle cx="12" cy="17.4" r="1.4" fill="currentColor" stroke="none"/></svg>
+                <svg viewBox="0 0 28 24" fill="none"><rect x="2" y="8" width="20" height="9" rx="2.5" stroke="currentColor" stroke-width="1.6" opacity=".5"/><rect x="4" y="10" width="13" height="5" rx="1.2" fill="currentColor"/><path d="M24.5 11v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".5"/></svg>
+              </span></div>
+              <div style="display:flex;align-items:center;gap:10px;padding:8px 16px 2px;color:#EAF3F5">
+                <span style="width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.1);display:grid;place-items:center;flex:none"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg></span>
+                <span style="font-size:15px;font-weight:900">扫码登录电脑</span>
+                <span style="margin-left:auto;font-size:11px;color:#9DB8C1">对准二维码即可</span>
+              </div>
+              <div class="scan-stage" style="background:transparent">
+                <div class="scan-view">
+                  <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+                  <div style="width:108px;height:108px;background:#fff;border-radius:10px;padding:8px;opacity:.96">
+                    <svg viewBox="0 0 100 100" fill="#16242C" aria-hidden="true"><rect x="4" y="4" width="22" height="22" fill="none" stroke="#16242C" stroke-width="5"/><rect x="11" y="11" width="8" height="8"/><rect x="74" y="4" width="22" height="22" fill="none" stroke="#16242C" stroke-width="5"/><rect x="81" y="11" width="8" height="8"/><rect x="4" y="74" width="22" height="22" fill="none" stroke="#16242C" stroke-width="5"/><rect x="11" y="81" width="8" height="8"/><rect x="34" y="6" width="6" height="6"/><rect x="44" y="6" width="6" height="10"/><rect x="56" y="10" width="8" height="6"/><rect x="34" y="20" width="10" height="6"/><rect x="50" y="22" width="6" height="6"/><rect x="34" y="34" width="6" height="12"/><rect x="44" y="34" width="12" height="6"/><rect x="62" y="34" width="6" height="6"/><rect x="74" y="34" width="10" height="10"/><rect x="88" y="38" width="6" height="6"/><rect x="6" y="34" width="6" height="10"/><rect x="18" y="40" width="8" height="6"/><rect x="6" y="52" width="10" height="6"/><rect x="22" y="52" width="6" height="12"/><rect x="34" y="54" width="8" height="8"/><rect x="48" y="52" width="6" height="6"/><rect x="60" y="50" width="12" height="6"/><rect x="78" y="52" width="6" height="12"/><rect x="88" y="52" width="6" height="6"/><rect x="34" y="68" width="6" height="6"/><rect x="44" y="70" width="10" height="6"/><rect x="60" y="68" width="6" height="10"/><rect x="72" y="72" width="8" height="8"/><rect x="86" y="70" width="8" height="6"/><rect x="34" y="84" width="12" height="6"/><rect x="52" y="84" width="6" height="10"/><rect x="64" y="86" width="8" height="8"/><rect x="82" y="84" width="12" height="10"/></svg>
+                  </div>
+                </div>
+                <p style="text-align:center;font-size:11.5px;color:#9DB8C1;margin-top:10px">已识别 · 正在等待你确认</p>
+                <div class="confirm-sheet">
+                  <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+                    <span style="width:38px;height:38px;border-radius:10px;background:var(--brand-50);color:var(--brand-700);display:grid;place-items:center;flex:none"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9.5 20.5h5"/></svg></span>
+                    <div style="flex:1;min-width:0"><h6>家里的笔记本 请求登录</h6><p class="num" style="font-size:11px">Windows · 10:43 申请 · 与当前账号一致</p></div>
+                    <span class="badge b-ok">同账号</span>
+                  </div>
+                  <p>确认后，这台电脑将以 <b class="num" style="color:var(--ink)">shouji@niubackup.test</b> 登录，并自动加入你的专属网络 <b class="num" style="color:var(--ink)">nb-4-xxxx</b>，与这台手机在同一网络里互相发现，无需再配对批准。</p>
+                  <span class="btn btn-primary" style="width:100%;padding:12px;font-size:14px;margin-top:12px">确认登录这台电脑</span>
+                  <span class="btn" style="width:100%;padding:9px;font-size:12.5px;color:var(--slate);margin-top:4px">取消 · 不是我操作的</span>
+                </div>
+                <p style="font-size:10.5px;color:#7E9AA5;text-align:center;padding:10px 22px 14px;line-height:1.6">只扫牛备电脑端登录页的二维码。客服、网页或他人发来的码不要确认。</p>
+              </div>
+            </div></div>
+            <p class="caption"><b>扫码登录 · 手机确认页（新增）</b> —— 上半是扫码取景框（橙色扫描线、四角框），识别成功后下半原地升起确认卡，不跳页、不丢上下文。<span class="dec">确认卡必须同时显示三件事：哪台电脑、是不是同账号、确认后会发生什么（登录 + 自动同网）。「确认登录」是唯一主按钮；不是本人操作时点取消即作废该二维码。扫码入口在「我的」第一行，备份页网络异常时也给同一入口的快捷提示。</span></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 03 桌面端 ================= -->
+      <section>
+        <div class="sec-head"><span class="sec-no">03</span><h2 class="sec-title">桌面端 · 侧边栏主窗</h2></div>
+        <p class="sec-desc">桌面端放弃单窗口堆控件的老结构：左侧深青蓝导航栏固定六个分区，右侧只显示当前页。导航栏同时是品牌面——字标、当前账号与「开源免费」标识都在这里，窗口任何一页都不会「不知道自己是谁的软件」。组网在桌面端同样全自动：引擎起来即组网，界面只在概览页展示网络状态，不设组网开关与参数页。备份记录与手机端一致分页：每页 50 条，只渲染当前页。<b>登录默认扫码</b>：登录页第一页签就是二维码——手机已登录时扫码 + 在手机上确认一次即完成登录、设备登记与组网三件事；没有手机在手边时切到「账号密码」页签走老路，登进的是同一个账号、同一个网络。</p>
+
+        <!-- ===== 主窗口：概览 ===== -->
+        <div class="desk-col">
+          <div class="win">
+            <div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="wt"><b>牛备 NiuBackup</b> · 桌面端</span></div>
+            <div class="win-body">
+              <aside class="sidebar">
+                <div class="wordmark">
+                  <div class="mark" style="width:34px;height:34px">
+                    <svg width="23" height="23" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/></svg>
+                  </div>
+                  <div><div class="wm-cn">牛备</div><div class="wm-en">NIUBACKUP</div></div>
+                </div>
+                <div class="nav-item on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11.2 12 4l8 7.2"/><path d="M6.2 9.8V20h11.6V9.8"/></svg>概览</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M10.8 18h2.4"/></svg>设备<span class="cnt">1</span></div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="7" width="18" height="10" rx="2.2"/><circle cx="17" cy="12" r="1.3" fill="currentColor" stroke="none"/><path d="M6.5 12h5"/></svg>存储</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>备份记录</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5.5 10 10l-5 4.5M12.5 18.5H19"/></svg>日志</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg>设置</div>
+                <div class="side-user">
+                  <div class="em num">shouji@niubackup.test</div>
+                  <div class="lc">开源免费 · 永久可用</div>
+                </div>
+              </aside>
+              <div class="main">
+                <div class="main-head">
+                  <div><h4>概览</h4><span class="sub">10月31日 · 星期六</span></div>
+                  <span class="pill pill-ok"><span class="dot"></span>接收服务运行中</span>
+                </div>
+                <div class="banner">
+                  <span class="bic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="3" width="10" height="18" rx="2.4"/><path d="M12 8v4M10 10h4"/></svg></span>
+                  <div class="bt"><b>新手机已自动加入同一网络</b><p><span class="num">未命名手机 · 10.99.0.5</span> 已用同一账号扫码登录，自动与这台电脑同网，现在即可发起备份，无需批准。</p></div>
+                  <span class="btn btn-primary btn-sm">查看设备</span>
+                </div>
+                <div class="cards-3">
+                  <div class="stat"><div class="lab">接收服务</div><div class="big"><span class="sdot ok"></span>运行中</div><div class="small">协议 v2 · 自 <span class="num">09:02</span> 起 · 待机零流量</div></div>
+                  <div class="stat"><div class="lab">网络状态 · 同账号自动组网</div><div class="big"><span class="sdot ok"></span>已连接 · 直连</div><div class="small">账号专属网络 <span class="num">nb-4-xxxx</span> · 本账号 <span class="num">2</span> 台设备已同网 · 公共节点仅作发现与打洞</div></div>
+                  <div class="stat"><div class="lab">账户</div><div class="big">开源免费</div><div class="small"><span class="num">shouji@niubackup.test</span> · 永久可用 · 无授权期限</div></div>
+                </div>
+                <div style="display:grid;grid-template-columns:1.05fr 1fr;gap:12px">
+                  <div class="stat">
+                    <div class="lab">存储 · 备份目录</div>
+                    <div class="num" style="font-weight:800;font-size:14px;margin:6px 0 10px">~/NiuBackupTest</div>
+                    <div class="prog storage"><i style="width:26%"></i></div>
+                    <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--slate);margin-top:7px"><span>已用 <b class="num" style="color:var(--ink)">128 GB</b></span><span>配额 <span class="num">500 GB</span></span></div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:11px;font-size:12px"><span style="color:var(--ink-2)">已存文件 <b class="num">5,412</b> 个</span><span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>完整性自检通过 · 08:30</span></div>
+                  </div>
+                  <div class="stat">
+                    <div class="lab" style="margin-bottom:4px">最近会话</div>
+                    <div class="sess"><span class="sic2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span><div class="st"><b>今天 09:17 · OnePlus PJA110</b><span><span class="num">128</span> 个文件 · <span class="num">3.4 GB</span> · 直连</span></div><span class="badge b-ok">完成</span></div>
+                    <div class="sess"><span class="sic2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span><div class="st"><b>今天 08:52 · OnePlus PJA110</b><span><span class="num">12</span> 个文件 · 中断后断点续传完成</span></div><span class="badge b-ok">完成</span></div>
+                    <div class="sess"><span class="sic2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span><div class="st"><b>昨天 21:03 · OnePlus PJA110</b><span><span class="num">342</span> 个文件 · <span class="num">6.1 GB</span> · 直连</span></div><span class="badge b-ok">完成</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="caption" style="max-width:760px"><b>主窗口 · 概览页</b> —— 打开软件三秒内要回答三件事：服务活着吗、组网通吗、盘还够吗。账户卡只写「开源免费 · 永久可用」，不再有授权期限这一问。同账号新设备自动入网的提示条置于内容最上方：只告知、不拦截，用户点「查看设备」确认一眼即可，不再有待批准这类需要动手处理的事。<span class="dec">存储条在 80% 前是青蓝、之后转橙，颜色本身就是提醒，不再另发通知。</span></p>
+        </div>
+
+        <div class="desk-2col">
+          <!-- ===== 设备页 ===== -->
+          <div class="desk-col">
+            <div class="win">
+              <div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="wt"><b>牛备 NiuBackup</b> · 设备</span></div>
+              <div class="win-body">
+                <aside class="sidebar" style="width:158px">
+                  <div class="wordmark">
+                    <div class="mark" style="width:30px;height:30px">
+                      <svg width="20" height="20" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/></svg>
+                    </div>
+                    <div><div class="wm-cn" style="font-size:18px">牛备</div><div class="wm-en">NIUBACKUP</div></div>
+                  </div>
+                  <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11.2 12 4l8 7.2"/><path d="M6.2 9.8V20h11.6V9.8"/></svg>概览</div>
+                  <div class="nav-item on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M10.8 18h2.4"/></svg>设备<span class="cnt">1</span></div>
+                  <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="7" width="18" height="10" rx="2.2"/><circle cx="17" cy="12" r="1.3" fill="currentColor" stroke="none"/><path d="M6.5 12h5"/></svg>存储</div>
+                  <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>备份记录</div>
+                  <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5.5 10 10l-5 4.5M12.5 18.5H19"/></svg>日志</div>
+                  <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg>设置</div>
+                </aside>
+                <div class="main">
+                  <div class="main-head"><div><h4>设备</h4><span class="sub">登录同一账号的设备自动同网，都可备份到这里</span></div><span class="btn btn-ghost btn-sm">刷新</span></div>
+                  <div class="stat" style="padding:6px 8px">
+                    <table class="dev">
+                      <thead><tr><th>设备</th><th>状态</th><th>最近在线</th><th style="text-align:right">操作</th></tr></thead>
+                      <tbody>
+                        <tr>
+                          <td><div class="devcell"><span class="dic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M10.8 18h2.4"/></svg></span><span><span class="dn">OnePlus PJA110</span><span class="dm" style="display:block">手机 · Android 16 · 10.99.0.3</span></span></div></td>
+                          <td><span class="badge b-ok">已批准</span></td>
+                          <td class="num">今天 10:42</td>
+                          <td style="text-align:right"><span class="btn btn-ghost btn-xs">管理</span></td>
+                        </tr>
+                        <tr>
+                          <td><div class="devcell"><span class="dic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9.5 20.5h5"/></svg></span><span><span class="dn">machang-laptop</span><span class="dm" style="display:block">这台电脑 · 接收端 · 10.99.0.2</span></span></div></td>
+                          <td><span class="badge b-pc">本机</span></td>
+                          <td>持续在线</td>
+                          <td style="text-align:right"><span style="color:var(--slate)">—</span></td>
+                        </tr>
+                        <tr>
+                          <td><div class="devcell"><span class="dic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M10.8 18h2.4"/></svg></span><span><span class="dn">未命名手机</span><span class="dm" style="display:block">同账号登录于 10:41 · 10.99.0.5</span></span></div></td>
+                          <td><span class="badge b-ok">已同网 · 同账号</span></td>
+                          <td class="num">刚刚</td>
+                          <td style="text-align:right;white-space:nowrap"><span class="btn btn-ghost btn-xs">管理</span></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <p style="font-size:11.5px;color:var(--slate)">同账号即同网络：设备列表只读展示本账号的设备；要移除某台设备，在那台设备上退出登录或在账号里吊销它，不在这台电脑上做批准。</p>
+                </div>
+              </div>
+            </div>
+            <p class="caption" style="max-width:560px"><b>设备页</b> —— 只读的同账号设备清单：手机与电脑只要登录同一账号就自动出现在同一行表里并同网，没有批准 / 拒绝按钮；新加入的设备行带「已同网 · 同账号」徽标，与概览页的入网提示是同一件事的两个视图。</p>
+          </div>
+
+          <!-- ===== 登录框 · 扫码登录 ===== -->
+          <div class="desk-col">
+            <div class="login-stage">
+              <div class="login-card" style="width:320px">
+                <div class="wordmark">
+                  <div class="mark" style="width:42px;height:42px">
+                    <svg width="28" height="28" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/></svg>
+                  </div>
+                  <div><div class="wm-cn">牛备</div><div class="wm-en">NIUBACKUP</div></div>
+                </div>
+                <p class="tag">登录后，这台电脑成为你的备份接收端<br/>同账号设备自动组同一网络</p>
+                <div class="login-tabs"><span class="on">扫码登录</span><span>账号密码</span></div>
+                <div class="qr-wrap">
+                  <div class="qr-box">
+                    <svg viewBox="0 0 100 100" fill="#16242C" aria-hidden="true"><rect x="4" y="4" width="22" height="22" fill="none" stroke="#16242C" stroke-width="5"/><rect x="11" y="11" width="8" height="8"/><rect x="74" y="4" width="22" height="22" fill="none" stroke="#16242C" stroke-width="5"/><rect x="81" y="11" width="8" height="8"/><rect x="4" y="74" width="22" height="22" fill="none" stroke="#16242C" stroke-width="5"/><rect x="11" y="81" width="8" height="8"/><rect x="34" y="6" width="6" height="6"/><rect x="44" y="6" width="6" height="10"/><rect x="56" y="10" width="8" height="6"/><rect x="34" y="20" width="10" height="6"/><rect x="50" y="22" width="6" height="6"/><rect x="34" y="34" width="6" height="12"/><rect x="44" y="34" width="12" height="6"/><rect x="62" y="34" width="6" height="6"/><rect x="74" y="34" width="10" height="10"/><rect x="88" y="38" width="6" height="6"/><rect x="6" y="34" width="6" height="10"/><rect x="18" y="40" width="8" height="6"/><rect x="6" y="52" width="10" height="6"/><rect x="22" y="52" width="6" height="12"/><rect x="34" y="54" width="8" height="8"/><rect x="48" y="52" width="6" height="6"/><rect x="60" y="50" width="12" height="6"/><rect x="78" y="52" width="6" height="12"/><rect x="88" y="52" width="6" height="6"/><rect x="34" y="68" width="6" height="6"/><rect x="44" y="70" width="10" height="6"/><rect x="60" y="68" width="6" height="10"/><rect x="72" y="72" width="8" height="8"/><rect x="86" y="70" width="8" height="6"/><rect x="34" y="84" width="12" height="6"/><rect x="52" y="84" width="6" height="10"/><rect x="64" y="86" width="8" height="8"/><rect x="82" y="84" width="12" height="10"/></svg>
+                    <span class="qr-center"><span class="mark" style="width:26px;height:26px;border-radius:7px"><svg width="17" height="17" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/></svg></span></span>
+                  </div>
+                  <p style="font-size:13px;font-weight:800;margin-top:12px">用手机牛备扫码登录</p>
+                  <p class="qr-meta">打开手机牛备 → <b>我的 → 扫码登录电脑</b><br/>扫码后在手机上点「确认登录」即可<br/><span class="pill pill-wait" style="margin-top:7px"><span class="dot"></span>待扫码 · <span class="num">01:42</span> 后刷新</span></p>
+                </div>
+                <div class="or-div">手机不在手边时</div>
+                <p style="font-size:11.5px;color:var(--slate);text-align:center;line-height:1.6">切到「账号密码」页签用邮箱 + 密码登录，<br/>登进同一账号、同一网络 <span class="num">nb-4-xxxx</span>。</p>
+                <div class="foot"><span>还没有账号？在手机端注册</span><span style="color:var(--brand-600);font-weight:700">忘记密码</span></div>
+              </div>
+            </div>
+            <p class="caption" style="max-width:420px"><b>登录框 · 扫码登录（本轮重做）</b> —— 独立小窗、深青蓝底衬白卡，和主窗导航栏同色，登录前后视觉不断档。默认页签就是扫码：二维码居中、牛头标压在码心防仿冒，下方三行把路径写全（我的 → 扫码登录电脑 → 手机上确认），再加倒计时药丸。二维码只含一次性票据，2 分钟过期自动刷新；被扫后此处变「已扫码，请在手机上确认」，确认后自动进主界面。<span class="dec">密码登录不删、降为第二页签：服务地址输入框一并去掉——地址由账号服务下发，用户不该再手填。同账号即同网络：无论扫码还是密码登进来，这台电脑都登记为该账号设备并自动入网，不再有第二步配对向导。</span></p>
+          </div>
+        </div>
+
+        <!-- ===== 备份记录页 · 带预览 ===== -->
+        <div class="desk-col desk-full">
+          <div class="win">
+            <div class="titlebar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="wt"><b>牛备 NiuBackup</b> · 备份记录</span></div>
+            <div class="win-body">
+              <aside class="sidebar">
+                <div class="wordmark">
+                  <div class="mark" style="width:34px;height:34px">
+                    <svg width="23" height="23" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16.5 16.5C10 15.5 5.8 11 6.2 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M31.5 16.5C38 15.5 42.2 11 41.8 4.8" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M16.8 14.5h14.4l-1.7 14.6c-.5 4.4-2.7 7-5.5 7s-5-2.6-5.5-7L16.8 14.5Z" fill="#fff"/><path d="M20.2 19.2 24 15.8l3.8 3.4" stroke="#F07F13" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20.6" cy="24.6" r="1.7" fill="#0A4757"/><circle cx="27.4" cy="24.6" r="1.7" fill="#0A4757"/></svg>
+                  </div>
+                  <div><div class="wm-cn">牛备</div><div class="wm-en">NIUBACKUP</div></div>
+                </div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11.2 12 4l8 7.2"/><path d="M6.2 9.8V20h11.6V9.8"/></svg>概览</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.4"/><path d="M10.8 18h2.4"/></svg>设备<span class="cnt">1</span></div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="3" y="7" width="18" height="10" rx="2.2"/><circle cx="17" cy="12" r="1.3" fill="currentColor" stroke="none"/><path d="M6.5 12h5"/></svg>存储</div>
+                <div class="nav-item on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="4" cy="6" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.15" fill="currentColor" stroke="none"/></svg>备份记录</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5.5 10 10l-5 4.5M12.5 18.5H19"/></svg>日志</div>
+                <div class="nav-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg>设置</div>
+                <div class="side-user">
+                  <div class="em num">shouji@niubackup.test</div>
+                  <div class="lc">开源免费 · 永久可用</div>
+                </div>
+              </aside>
+              <div class="main">
+                <div class="main-head">
+                  <div><h4>备份记录</h4><span class="sub">这台电脑上存着什么 · 点任意一条在右侧预览，不用打开文件夹找</span></div>
+                  <span class="pill pill-ok"><span class="dot"></span>完整性自检通过 · 08:30</span>
+                </div>
+                <div class="records-split">
+                  <div class="rec-list">
+                    <div class="day-label">今天 · 10月31日</div>
+                    <div class="drec sel">
+                      <div class="thumb g1"><span style="font-family:var(--font-num);font-weight:800;font-size:10px">IMG</span></div>
+                      <div class="info"><div class="nm">IMG_2038.jpg</div><div class="mt num">4.2 MB · 09:17</div></div>
+                      <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span>
+                    </div>
+                    <div class="drec">
+                      <div class="thumb g6"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 7.8v8.4c0 .8.9 1.3 1.6.9l6.8-4.2c.6-.4.6-1.4 0-1.8L10.6 6.9c-.7-.4-1.6.1-1.6.9Z"/></svg></div>
+                      <div class="info"><div class="nm">VID_20261031_0917.mp4</div><div class="mt num">1.90 GB · 09:17 · 02:31</div></div>
+                      <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span>
+                    </div>
+                    <div class="drec">
+                      <div class="thumb g5"><span style="font-family:var(--font-num);font-weight:800;font-size:10px">IMG</span></div>
+                      <div class="info"><div class="nm">IMG_2037.jpg</div><div class="mt num">3.8 MB · 09:16</div></div>
+                      <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span>
+                    </div>
+                    <div class="day-label">昨天 · 10月30日</div>
+                    <div class="drec">
+                      <div class="thumb g3"><span style="font-family:var(--font-num);font-weight:800;font-size:10px">IMG</span></div>
+                      <div class="info"><div class="nm">IMG_1992.heic</div><div class="mt num">2.9 MB · 21:03</div></div>
+                      <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span>
+                    </div>
+                    <div class="drec">
+                      <div class="thumb g8"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5h8L19 8.5v12H6z"/><path d="M13.5 3.5v5.5H19M9 13h6M9 16.5h6"/></svg></div>
+                      <div class="info"><div class="nm">工作文档_备份.zip</div><div class="mt num">86.4 MB · 20:58</div></div>
+                      <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></span>
+                    </div>
+                    <p style="font-size:11px;color:var(--slate);padding:8px 6px 2px;line-height:1.6">共 <b class="num" style="color:var(--ink)">5,412</b> 个文件 · 按日分组，与手机端记录页同一套分组与命名。</p>
+                    <div class="pager" role="navigation" aria-label="桌面备份记录分页" style="margin-top:8px;box-shadow:none">
+                      <span class="pbtn off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5 8.5 12 15 18.5"/></svg></span>
+                      <span class="pagenums"><span class="pnum on">1</span><span class="pnum">2</span><span class="pnum">3</span><span class="pnum ellipsis">…</span><span class="pnum">109</span></span>
+                      <span class="pbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5.5 6.5 6.5L9 18.5"/></svg></span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 4px 0">
+                      <span class="pinfo" style="font-size:11px;color:var(--slate)">第 <b style="color:var(--ink)">1</b> / 109 页 · 只渲染当前页</span>
+                      <span class="perpage">每页 <b>50 条</b></span>
+                    </div>
+                  </div>
+                  <div class="preview-card">
+                    <div class="preview-stage">
+                      <span class="badge b-ok pv-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>已备份 · 校验 OK</span>
+                      <span class="pscene">PHOTO PREVIEW<br/><span style="letter-spacing:.06em;font-size:11px;opacity:.85">IMG_2038.jpg · 原图预览</span></span>
+                    </div>
+                    <div class="preview-meta">
+                      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+                        <div><div class="num" style="font-size:15px;font-weight:900">IMG_2038.jpg</div><div style="font-size:11.5px;color:var(--slate)">来自 OnePlus PJA110 · DCIM/Camera</div></div>
+                        <span class="badge b-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>校验状态 OK</span>
+                      </div>
+                      <div class="meta-grid">
+                        <div><div class="mk">文件大小</div><div class="mv num">4.2 MB</div></div>
+                        <div><div class="mk">尺寸</div><div class="mv num">4032 × 3024</div></div>
+                        <div><div class="mk">备份时间</div><div class="mv num">今天 09:17</div></div>
+                        <div><div class="mk">校验状态</div><div class="mv" style="color:#0E7046">OK · SHA-256 一致</div></div>
+                      </div>
+                      <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <span class="btn btn-primary btn-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2V7.5Z"/></svg>打开所在文件夹</span>
+                        <span class="btn btn-ghost btn-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.2c0 4.6 3 7.7 7 9.3 4-1.6 7-4.7 7-9.3V6l-7-2.5Z"/><path d="M9 11.8l2.2 2.2 4-4.2"/></svg>校验完整性</span>
+                        <span style="font-size:11.5px;color:var(--slate);align-self:center">视频记录在此处显示封面帧 + 播放键，点开即在本机播放。</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="caption" style="max-width:760px"><b>备份记录页 · 带预览 + 分页</b> —— 沿用侧边栏布局并高亮「备份记录」；左列按日分组的记录列表与手机端记录页同名同序，右列是就地预览区，选中照片直接看大图、选中视频显示封面帧加播放键，不必跳文件夹管理器。<span class="dec">左列底部新增分页器：每页 50 条、共 109 页，可点页码直跳，只渲染当前页的 50 条与缩略图，翻页时右列预览保留当前选中项直至在新页选新项；5,412 条不再整表渲染。预览下方固定四项元信息（大小 / 尺寸 / 备份时间 / 校验状态 OK）与两个动作：打开所在文件夹、校验完整性——查文件与验文件都在这一页闭环。</span></p>
+        </div>
+      </section>
+
+      <footer>
+        <span>牛备 NiuBackup · 界面设计稿 v1.5 · <span class="num">2026-10-31</span></span>
+        <span>评审点：配色 / 字标 / 手机四页结构 / 暂停与继续备份 / 自动组网与网络状态 / 文件库与记录分页 / 播放与照片预览 / 扫码登录与同账号自动组网 / 开源免费 · 无授权期限 / 桌面侧边栏与记录预览 —— 圈改后照定稿实现</span>
+      </footer>
+    </div>
+  </body>
+</html>
