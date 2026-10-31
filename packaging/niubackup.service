@@ -1,0 +1,14 @@
+[Unit]
+Description=NiuBackup PC receiver (account mode, headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# __APP_DIR__ is replaced by install-autostart.sh with the jpackage app dir
+# (Linux app-image layout: the launcher lives in <app dir>/bin/).
+ExecStart=__APP_DIR__/bin/NiuBackup --serve --account --port 28741 --data-dir %h/.niubackup --target %h/NiuBackup
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

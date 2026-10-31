@@ -4,12 +4,17 @@ import java.awt.image.BufferedImage;
 import javax.imageio.ImageIO;
 import java.io.*;
 import java.net.*;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.*;
 import java.security.spec.*;
 import java.sql.*;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -48,9 +53,22 @@ import java.util.regex.*;
  *    already expired, for tests).
  *  - --allow-v1: also accept the legacy v1 HELLO (no auth) into
  *    &lt;target&gt;/&lt;device&gt;/ (transition compatibility; default OFF).
+ *  - M4c account mode (--account, after a one-time --login): the receiver logs
+ *    in to the account service (M4b), registers THIS PC as a pc device with
+ *    the receipt-signing public key, fetches the per-user mesh provisioning,
+ *    and keeps the local users/devices/licenses tables synced from the
+ *    service (approved/revoked state + license; device token hashes are
+ *    learned from successful online /api/license/validate calls, since the
+ *    service API never returns stored hashes). HELLOs validate against the
+ *    local cache — with the design's offline grace: a previously-synced,
+ *    previously-validated device keeps working while the server is down.
+ *    Unknown devices are verified online at HELLO time when reachable.
+ *    --approve/--devices/--sync are operator commands over the stored PC
+ *    device token (the PC-approves-phone path); a supervised easytier-core
+ *    sidecar joins the issued nb- network (see MeshSidecar).
  *
  * Data dir (default &lt;target&gt;/.niubackup): records.db, receiver-key.pkcs8 (600),
- * receiver-key.pub, thumbs/.
+ * receiver-key.pub, thumbs/, account.json (account mode, 600), easytier.toml.
  *
  * Build/run: see receiver/BUILD.md.
  */
@@ -74,6 +92,22 @@ public class BackupReceiver {
     boolean ffmpegPresent;
     boolean convertPresent;
 
+    // M4c account mode (set from main before serve())
+    boolean accountMode;
+    AccountLink.State acct;
+    int syncSeconds = 300;
+    MeshSidecar sidecar;
+    volatile long lastSyncOkMs = 0;
+    static volatile ServerSocket currentServer;
+
+    /** Close the currently-serving socket (used by the PC operator UI's stop button). */
+    public static void stopCurrentServer() {
+        ServerSocket ss = currentServer;
+        if (ss != null) {
+            try { ss.close(); } catch (IOException ignore) { }
+        }
+    }
+
     public BackupReceiver(int port, Path targetRoot, String bind, Path dataDir, boolean allowV1) {
         this.port = port;
         this.targetRoot = targetRoot;
@@ -96,12 +130,29 @@ public class BackupReceiver {
         String bind = System.getenv("BACKUP_BIND");
         Path dataDir = null;
         boolean allowV1 = false, seed = false, verify = false;
+        boolean login = false, accountMode = false, syncCmd = false, devicesCmd = false;
+        boolean noMesh = false;
+        String server = System.getenv("NB_SERVER");
+        String approveId = null, meshBin = null, pcIp = null;
+        int syncSeconds = 300;
+        String envSync = System.getenv("NB_SYNC_SECONDS");
+        if (envSync != null) syncSeconds = Integer.parseInt(envSync.trim());
         Map<String, String> opt = new HashMap<>();
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--allow-v1": allowV1 = true; break;
                 case "--seed": seed = true; break;
                 case "--verify": verify = true; break;
+                case "--login": login = true; break;
+                case "--account": accountMode = true; break;
+                case "--sync": syncCmd = true; break;
+                case "--devices": devicesCmd = true; break;
+                case "--no-mesh": noMesh = true; break;
+                case "--approve": approveId = args[++i]; break;
+                case "--server": server = args[++i]; break;
+                case "--mesh-bin": meshBin = args[++i]; break;
+                case "--pc-ip": pcIp = args[++i]; break;
+                case "--sync-seconds": syncSeconds = Integer.parseInt(args[++i]); break;
                 case "--port": port = Integer.parseInt(args[++i]); break;
                 case "--target": target = Paths.get(args[++i]); break;
                 case "--bind": bind = args[++i]; break;
@@ -110,13 +161,139 @@ public class BackupReceiver {
             }
         }
         if (dataDir == null) dataDir = target.resolve(".niubackup");
+        // In account mode the default bind is the product-mesh IP from the
+        // saved account state; resolve it before constructing the receiver.
+        AccountLink.State earlyState = accountMode ? AccountLink.load(dataDir) : null;
+        if (accountMode && earlyState != null && (bind == null || bind.isEmpty())) {
+            bind = earlyState.pcIp;
+        }
         BackupReceiver r = new BackupReceiver(port, target, bind, dataDir, allowV1);
         r.openStore();
+
+        // ---- M4c one-shot account commands ----
+        if (login) {
+            String account = opt.containsKey("--account-user") ? opt.get("--account-user")
+                    : System.getenv("NB_ACCOUNT");
+            String password = opt.containsKey("--account-pass") ? opt.get("--account-pass")
+                    : System.getenv("NB_PASSWORD");
+            if (server == null || account == null || password == null) {
+                System.err.println("usage: --login --server <url> with credentials in "
+                        + "NB_ACCOUNT / NB_PASSWORD (or --account-user / --account-pass)");
+                System.exit(2);
+            }
+            r.loadOrCreateKeys();
+            AccountLink.State st = AccountLink.loginFlow(dataDir, r.store, server, account,
+                    password, r.pubkeyB64(), pcIp);
+            System.out.println("login ok: user_id=" + st.userId + " pc_device_id=" + st.pcDeviceId
+                    + " network=" + st.networkName + " public_node=" + st.publicNode
+                    + " pc_ip=" + st.pcIp);
+            System.out.println("account state saved to " + dataDir.resolve("account.json")
+                    + " (mode 600; the pc device token is stored there, never printed)");
+            return;
+        }
+        if (approveId != null || syncCmd || devicesCmd) {
+            AccountLink.State st = AccountLink.load(dataDir);
+            if (st == null) {
+                System.err.println("no account state in " + dataDir + " — run --login first");
+                System.exit(2);
+            }
+            if (server != null) st.server = server;
+            if (approveId != null) {
+                String res = AccountLink.approveWithDevice(st, approveId);
+                System.out.println("approve device " + approveId + ": " + res);
+            }
+            if (devicesCmd) {
+                System.out.println("server devices for user " + st.userId + ":");
+                for (String[] d : AccountLink.listDevices(st, st.pcDeviceToken)) {
+                    System.out.println("  id=" + d[0] + " kind=" + d[1] + " name=" + d[2]
+                            + " approved=" + d[3] + " revoked=" + d[4]);
+                }
+            }
+            if (syncCmd) {
+                System.out.println(AccountLink.syncOnce(st, r.store));
+            }
+            return;
+        }
+
         if (seed) { r.seed(opt); return; }
         if (verify) { System.exit(r.verifyAll() ? 0 : 1); }
         r.loadOrCreateKeys();
         r.detectTools();
+
+        // ---- M4c account-mode serve ----
+        if (accountMode) {
+            AccountLink.State st = earlyState;
+            if (st == null) {
+                System.err.println("account mode requested but no account state in "
+                        + dataDir + " — run --login first");
+                System.exit(2);
+            }
+            if (server != null) st.server = server;
+            r.accountMode = true;
+            r.acct = st;
+            r.syncSeconds = Math.max(5, syncSeconds);
+            try {
+                log(AccountLink.syncOnce(st, r.store));
+                r.lastSyncOkMs = System.currentTimeMillis();
+            } catch (Exception e) {
+                log("initial account sync failed (continuing on cached state): " + e.getMessage());
+            }
+            if (!noMesh) {
+                r.sidecar = new MeshSidecar(dataDir, st, meshBin);
+                final MeshSidecar sc = r.sidecar;
+                Runtime.getRuntime().addShutdownHook(new Thread(sc::stopSidecar));
+                r.sidecar.start();
+                waitForBindAddress(bind, 45);
+            }
+            r.startSyncThread();
+        }
         r.serve();
+    }
+
+    /** In account+mesh mode the TUN address appears asynchronously; wait for it. */
+    static void waitForBindAddress(String bind, int timeoutSec) {
+        if (bind == null || bind.isEmpty() || bind.equals("0.0.0.0")) return;
+        long deadline = System.currentTimeMillis() + timeoutSec * 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Enumeration<NetworkInterface> nis = NetworkInterface.getNetworkInterfaces();
+                while (nis.hasMoreElements()) {
+                    Enumeration<InetAddress> addrs = nis.nextElement().getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        if (addrs.nextElement().getHostAddress().equals(bind)) return;
+                    }
+                }
+            } catch (Exception ignore) { }
+            try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+        }
+        log("warning: bind address " + bind + " not seen on any interface after "
+                + timeoutSec + "s; serve() bind will retry/fail as usual");
+    }
+
+    /** Periodic allowlist/license refresh for account mode (daemon thread). */
+    void startSyncThread() {
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(syncSeconds * 1000L);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                try {
+                    String summary = AccountLink.syncOnce(acct, store);
+                    lastSyncOkMs = System.currentTimeMillis();
+                    log("account sync: " + summary);
+                } catch (Exception e) {
+                    String age = lastSyncOkMs == 0 ? "never"
+                            : ((System.currentTimeMillis() - lastSyncOkMs) / 1000) + "s ago";
+                    log("account sync failed (last ok " + age + "); "
+                            + "validating from cache: " + e.getMessage());
+                }
+            }
+        }, "account-sync");
+        t.setDaemon(true);
+        t.start();
+        log("account sync thread started (every " + syncSeconds + "s)");
     }
 
     void openStore() throws Exception {
@@ -237,12 +414,33 @@ public class BackupReceiver {
     void serve() throws IOException {
         Files.createDirectories(targetRoot);
         InetAddress addr = (bind == null || bind.isEmpty()) ? null : InetAddress.getByName(bind);
-        try (ServerSocket ss = new ServerSocket(port, 50, addr)) {
+        ServerSocket ss = null;
+        // In account+mesh mode the TUN address may appear a moment after the
+        // sidecar starts; retry the bind briefly instead of dying.
+        for (int attempt = 0; attempt < 30 && ss == null; attempt++) {
+            try {
+                ss = new ServerSocket(port, 50, addr);
+            } catch (BindException e) {
+                if (!accountMode) throw e;
+                if (attempt == 0) log("bind " + bind + ":" + port + " not ready yet, retrying…");
+                try { Thread.sleep(2000); } catch (InterruptedException ie) { throw new IOException(ie); }
+            }
+        }
+        if (ss == null) throw new BindException("cannot bind " + bind + ":" + port);
+        currentServer = ss;
+        try (ServerSocket server = ss) {
             log("listening on " + (addr == null ? "*" : addr.getHostAddress()) + ":" + port
                     + ", target dir " + targetRoot + ", data dir " + dataDir
-                    + ", allowV1=" + allowV1 + ", allowRelay=" + allowRelay);
+                    + ", allowV1=" + allowV1 + ", allowRelay=" + allowRelay
+                    + ", accountMode=" + accountMode);
             while (true) {
-                Socket s = ss.accept();
+                Socket s;
+                try {
+                    s = server.accept();
+                } catch (SocketException closed) {
+                    log("server socket closed, serve loop ending");
+                    return;
+                }
                 log("connection from " + s.getRemoteSocketAddress());
                 try {
                     handle(s);
@@ -252,6 +450,8 @@ public class BackupReceiver {
                     try { s.close(); } catch (IOException ignore) { }
                 }
             }
+        } finally {
+            if (currentServer == ss) currentServer = null;
         }
     }
 
@@ -296,18 +496,25 @@ public class BackupReceiver {
         auth.routeCost = (int) MiniJson.num(json, "route_cost", -1);
         if (auth.userId == null || auth.deviceId == null || token == null) return "AUTH";
 
-        DeviceRow dev = store.findDevice(auth.userId, auth.deviceId);
-        if (dev == null || !dev.approved || dev.revoked) {
-            log("auth fail (unknown/unapproved/revoked device) user=" + auth.userId + " device=" + auth.deviceId);
-            return "AUTH";
+        DeviceRow dev;
+        if (accountMode) {
+            String acctErr = authenticateAccount(auth, token);
+            if (acctErr != null) return acctErr;
+            dev = auth.device;
+        } else {
+            dev = store.findDevice(auth.userId, auth.deviceId);
+            if (dev == null || !dev.approved || dev.revoked) {
+                log("auth fail (unknown/unapproved/revoked device) user=" + auth.userId + " device=" + auth.deviceId);
+                return "AUTH";
+            }
+            byte[] presented = sha256(token);
+            byte[] expected = hexToBytes(dev.tokenHash);
+            if (!MessageDigest.isEqual(presented, expected)) {
+                log("auth fail (token mismatch) user=" + auth.userId + " device=" + auth.deviceId);
+                return "AUTH";
+            }
+            auth.device = dev;
         }
-        byte[] presented = sha256(token);
-        byte[] expected = hexToBytes(dev.tokenHash);
-        if (!MessageDigest.isEqual(presented, expected)) {
-            log("auth fail (token mismatch) user=" + auth.userId + " device=" + auth.deviceId);
-            return "AUTH";
-        }
-        auth.device = dev;
 
         long expires = store.licenseExpiresAt(auth.userId);
         if (expires < 0 || expires < System.currentTimeMillis()) {
@@ -334,6 +541,69 @@ public class BackupReceiver {
             log("direct check: ok (client route_cost=" + auth.routeCost + ", receiver cost=" + ownCost + ")");
         }
         if (!auth.mode.equals("backup") && !auth.mode.equals("fs")) return "MODE";
+        return null;
+    }
+
+    /**
+     * Account-mode identity resolution (M4c). The receiver serves exactly one
+     * account. Order:
+     *  1. A locally-known revoked device is rejected immediately.
+     *  2. A locally-known approved device whose token hash matches validates
+     *     from cache (offline grace — the periodic sync keeps the cache's
+     *     approved/revoked/license state fresh).
+     *  3. Anything else (unknown device, or approved-but-hash-not-yet-learned)
+     *     is verified ONLINE via /api/license/validate; on success the token
+     *     hash is learned into the cache so later offline sessions work.
+     *     A token mismatch on a device whose hash IS known never falls back
+     *     online — a wrong token stays wrong.
+     * Returns null (auth.device filled) or the HELLO_ERR code.
+     */
+    String authenticateAccount(Auth auth, String token) throws Exception {
+        if (!auth.userId.equals(acct.userId)) {
+            log("auth fail (other account's user) user=" + auth.userId);
+            return "AUTH";
+        }
+        DeviceRow dev = store.findDevice(auth.userId, auth.deviceId);
+        if (dev != null && dev.revoked) {
+            log("auth fail (device revoked, cached) device=" + auth.deviceId);
+            return "AUTH";
+        }
+        boolean hashKnown = dev != null && dev.tokenHash != null && !dev.tokenHash.isEmpty();
+        if (dev != null && dev.approved && hashKnown
+                && MessageDigest.isEqual(sha256(token), hexToBytes(dev.tokenHash))) {
+            String age = lastSyncOkMs == 0 ? "never (offline grace)"
+                    : ((System.currentTimeMillis() - lastSyncOkMs) / 1000) + "s ago";
+            log("auth ok from cache: device=" + auth.deviceId + " (last sync " + age + ")");
+            auth.device = dev;
+            return null;
+        }
+        if (dev != null && dev.approved && hashKnown) {
+            log("auth fail (token mismatch, cached hash) device=" + auth.deviceId);
+            return "AUTH";
+        }
+        // Online verification path (unknown device or hash not yet learned).
+        String[] v;
+        try {
+            v = AccountLink.validate(acct.server, auth.deviceId, token);
+        } catch (Exception e) {
+            log("auth fail (device unknown locally and account service unreachable: "
+                    + e.getMessage() + ") device=" + auth.deviceId);
+            return "AUTH";
+        }
+        if (!"true".equals(v[0])) {
+            log("auth fail (server validate: " + v[1] + ") device=" + auth.deviceId);
+            return "license_expired".equals(v[1]) ? "LICENSE_EXPIRED" : "AUTH";
+        }
+        // Learn the device + hash so future sessions validate offline.
+        store.syncDevice(auth.userId, auth.deviceId,
+                dev != null ? dev.name : auth.deviceId,
+                dev != null ? dev.kind : "phone",
+                true, false, Hash.hex(sha256(token)));
+        if (v[2] != null) {
+            store.touchLicenseExpiry(auth.userId, Long.parseLong(v[2]));
+        }
+        log("auth ok via online validate (hash learned): device=" + auth.deviceId);
+        auth.device = store.findDevice(auth.userId, auth.deviceId);
         return null;
     }
 
@@ -907,7 +1177,107 @@ public class BackupReceiver {
                 st.execute("CREATE TABLE IF NOT EXISTS sessions ("
                         + "ts INTEGER NOT NULL, device_id TEXT NOT NULL, files_ok INTEGER NOT NULL, "
                         + "bytes INTEGER NOT NULL, result TEXT NOT NULL)");
+                st.execute("CREATE TABLE IF NOT EXISTS meta ("
+                        + "k TEXT PRIMARY KEY, v TEXT)");
             }
+        }
+
+        // ---- M4c account-mode sync support ----
+
+        synchronized String getMeta(String k) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement("SELECT v FROM meta WHERE k = ?")) {
+                q.setString(1, k);
+                try (ResultSet rs = q.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            }
+        }
+
+        synchronized void setMeta(String k, String v) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "INSERT INTO meta(k, v) VALUES(?, ?) "
+                            + "ON CONFLICT(k) DO UPDATE SET v = excluded.v")) {
+                q.setString(1, k);
+                q.setString(2, v);
+                q.executeUpdate();
+            }
+        }
+
+        /**
+         * Upsert a device row from the account service's view. A null
+         * tokenHash keeps the locally stored hash (the service API never
+         * returns stored hashes; hashes are learned at validate time).
+         */
+        synchronized void syncDevice(String userId, String deviceId, String name, String kind,
+                                     boolean approved, boolean revoked,
+                                     String tokenHashOrNull) throws SQLException {
+            // token_hash is NOT NULL in the local schema: an unknown hash is
+            // stored as "" (authenticate treats "" as "not learned yet"), and
+            // an upsert with an unknown hash never clobbers a learned one.
+            try (PreparedStatement q = db.prepareStatement(
+                    "INSERT INTO devices(id, user_id, name, kind, token_hash, approved, revoked) "
+                            + "VALUES(?, ?, ?, ?, ?, ?, ?) "
+                            + "ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, "
+                            + "name = excluded.name, kind = excluded.kind, "
+                            + "approved = excluded.approved, revoked = excluded.revoked, "
+                            + "token_hash = CASE WHEN excluded.token_hash = '' "
+                            + "THEN devices.token_hash ELSE excluded.token_hash END")) {
+                q.setString(1, deviceId);
+                q.setString(2, userId);
+                q.setString(3, name);
+                q.setString(4, kind);
+                q.setString(5, tokenHashOrNull == null ? "" : tokenHashOrNull);
+                q.setInt(6, approved ? 1 : 0);
+                q.setInt(7, revoked ? 1 : 0);
+                q.executeUpdate();
+            }
+        }
+
+        synchronized void upsertLicense(String userId, long expiresAt, int maxPhones,
+                                        int maxPcs) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "INSERT OR REPLACE INTO licenses(user_id, expires_at, max_phones, max_pcs) "
+                            + "VALUES(?, ?, ?, ?)")) {
+                q.setString(1, userId);
+                q.setLong(2, expiresAt);
+                q.setInt(3, maxPhones);
+                q.setInt(4, maxPcs);
+                q.executeUpdate();
+            }
+        }
+
+        /** Update only the expiry (insert with defaults when absent). */
+        synchronized void touchLicenseExpiry(String userId, long expiresAt) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "INSERT INTO licenses(user_id, expires_at) VALUES(?, ?) "
+                            + "ON CONFLICT(user_id) DO UPDATE SET expires_at = excluded.expires_at")) {
+                q.setString(1, userId);
+                q.setLong(2, expiresAt);
+                q.executeUpdate();
+            }
+        }
+
+        synchronized List<DeviceRow> listDevices(String userId) throws SQLException {
+            List<DeviceRow> out = new ArrayList<>();
+            try (PreparedStatement q = db.prepareStatement(
+                    "SELECT * FROM devices WHERE user_id = ? ORDER BY id")) {
+                q.setString(1, userId);
+                try (ResultSet rs = q.executeQuery()) {
+                    while (rs.next()) {
+                        DeviceRow d = new DeviceRow();
+                        d.id = rs.getString("id");
+                        d.userId = rs.getString("user_id");
+                        d.name = rs.getString("name");
+                        d.kind = rs.getString("kind");
+                        d.tokenHash = rs.getString("token_hash");
+                        d.pcPubkey = rs.getString("pc_pubkey");
+                        d.approved = rs.getInt("approved") != 0;
+                        d.revoked = rs.getInt("revoked") != 0;
+                        out.add(d);
+                    }
+                }
+            }
+            return out;
         }
 
         synchronized void seedUserDevice(String user, String device, String name, String kind,
@@ -1048,6 +1418,36 @@ public class BackupReceiver {
             }
         }
 
+        /** Recent sessions, newest first (PC UI session log view). */
+        synchronized List<String[]> listSessions(int limit) throws SQLException {
+            List<String[]> out = new ArrayList<>();
+            try (PreparedStatement q = db.prepareStatement(
+                    "SELECT ts, device_id, files_ok, bytes, result FROM sessions"
+                            + " ORDER BY id DESC LIMIT ?")) {
+                q.setInt(1, limit);
+                try (ResultSet rs = q.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(new String[]{
+                                String.valueOf(rs.getLong(1)), rs.getString(2),
+                                String.valueOf(rs.getInt(3)),
+                                String.valueOf(rs.getLong(4)), rs.getString(5)});
+                    }
+                }
+            }
+            return out;
+        }
+
+        /** Total stored bytes for one user (PC UI quota display). */
+        synchronized long filesBytesTotal(String userId) throws SQLException {
+            try (PreparedStatement q = db.prepareStatement(
+                    "SELECT COALESCE(SUM(size), 0) FROM files WHERE user_id = ?")) {
+                q.setString(1, userId);
+                try (ResultSet rs = q.executeQuery()) {
+                    return rs.next() ? rs.getLong(1) : 0;
+                }
+            }
+        }
+
         private static FileRow toFileRow(ResultSet rs) throws SQLException {
             FileRow f = new FileRow();
             f.id = rs.getLong("id");
@@ -1061,6 +1461,566 @@ public class BackupReceiver {
             f.thumb = rs.getString("thumb");
             return f;
         }
+    }
+}
+
+/**
+ * AccountLink — the receiver's client for the M4b account service (M4c).
+ *
+ * Bootstrap is the only password moment: {@link #loginFlow} logs in with the
+ * account credentials, registers (or reuses) this PC as a pc device — sending
+ * the receipt-signing public key — approves it with the account session, and
+ * persists everything later steps need into &lt;dataDir&gt;/account.json
+ * (mode 600): user id, PC device id + token, refresh token, and the mesh
+ * provisioning (per-user network name/secret + public node).
+ *
+ * After bootstrap everything runs on the PC device token: device list,
+ * license, provisioning, and the approve call (the PC-approves-phone path).
+ * {@link #syncOnce} merges the service view into the receiver's local SQLite:
+ * approved/revoked flags and the license land in the same tables the M4a
+ * standalone mode uses, so HELLO validation is identical afterwards. Token
+ * hashes are NOT synced (the API never exposes stored hashes); a device's
+ * hash is learned by BackupReceiver.authenticateAccount after a successful
+ * online /api/license/validate.
+ */
+final class AccountLink {
+
+    static final String DEFAULT_PC_IP = "10.99.0.2";
+
+    static final class State {
+        String server, account, userId, pcDeviceId, pcDeviceToken, refreshToken;
+        String networkName, networkSecret, publicNode, pcIp;
+        transient Path dataDir;
+
+        Path file() { return dataDir.resolve("account.json"); }
+
+        void save() throws IOException {
+            String json = "{"
+                    + "\"server\":\"" + MiniJson.esc(server)
+                    + "\",\"account\":\"" + MiniJson.esc(account)
+                    + "\",\"user_id\":\"" + MiniJson.esc(userId)
+                    + "\",\"pc_device_id\":\"" + MiniJson.esc(pcDeviceId)
+                    + "\",\"pc_device_token\":\"" + MiniJson.esc(pcDeviceToken)
+                    + "\",\"refresh_token\":\"" + MiniJson.esc(refreshToken == null ? "" : refreshToken)
+                    + "\",\"network_name\":\"" + MiniJson.esc(networkName)
+                    + "\",\"network_secret\":\"" + MiniJson.esc(networkSecret)
+                    + "\",\"public_node\":\"" + MiniJson.esc(publicNode)
+                    + "\",\"pc_ip\":\"" + MiniJson.esc(pcIp)
+                    + "\"}";
+            Files.createDirectories(dataDir);
+            Files.writeString(file(), json, StandardCharsets.UTF_8);
+            try {
+                Files.setPosixFilePermissions(file(), PosixFilePermissions.fromString("rw-------"));
+            } catch (Exception ignore) { /* non-POSIX fs */ }
+        }
+    }
+
+    static State load(Path dataDir) {
+        Path f = dataDir.resolve("account.json");
+        if (!Files.isRegularFile(f)) return null;
+        try {
+            String json = Files.readString(f, StandardCharsets.UTF_8);
+            State st = new State();
+            st.dataDir = dataDir;
+            st.server = MiniJson.str(json, "server");
+            st.account = MiniJson.str(json, "account");
+            st.userId = MiniJson.str(json, "user_id");
+            st.pcDeviceId = MiniJson.str(json, "pc_device_id");
+            st.pcDeviceToken = MiniJson.str(json, "pc_device_token");
+            st.refreshToken = MiniJson.str(json, "refresh_token");
+            st.networkName = MiniJson.str(json, "network_name");
+            st.networkSecret = MiniJson.str(json, "network_secret");
+            st.publicNode = MiniJson.str(json, "public_node");
+            st.pcIp = MiniJson.str(json, "pc_ip");
+            if (st.server == null || st.userId == null || st.pcDeviceToken == null) return null;
+            if (st.pcIp == null) st.pcIp = DEFAULT_PC_IP;
+            st.server = normalize(st.server);
+            return st;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static String normalize(String server) {
+        String s = server.trim();
+        while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+        return s;
+    }
+
+    // ------------------------------------------------------------- HTTP core
+
+    static final class ApiResult {
+        final int status; final String body;
+        ApiResult(int status, String body) { this.status = status; this.body = body; }
+        boolean ok() { return status >= 200 && status < 300; }
+    }
+
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+
+    static ApiResult http(String method, String url, String bearer, String json)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/json");
+        if (bearer != null) b.header("Authorization", "Bearer " + bearer);
+        if ("GET".equals(method)) {
+            b.GET();
+        } else {
+            b.method(method, HttpRequest.BodyPublishers.ofString(json == null ? "" : json));
+        }
+        HttpResponse<String> resp = HTTP.send(b.build(),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        return new ApiResult(resp.statusCode(), resp.body());
+    }
+
+    static ApiResult http(State st, String method, String path, String bearer, String json)
+            throws IOException, InterruptedException {
+        return http(method, st.server + path, bearer, json);
+    }
+
+    static String requireOk(ApiResult r, String what) throws IOException {
+        if (!r.ok()) throw new IOException(what + " failed: HTTP " + r.status + " " + r.body);
+        return r.body;
+    }
+
+    // ------------------------------------------------------------- API calls
+
+    /** POST /api/auth/login → {access, refresh}. */
+    static String[] login(String server, String account, String password) throws Exception {
+        ApiResult r = http("POST", normalize(server) + "/api/auth/login", null,
+                "{\"account\":\"" + MiniJson.esc(account)
+                        + "\",\"password\":\"" + MiniJson.esc(password) + "\"}");
+        requireOk(r, "login");
+        return new String[]{MiniJson.str(r.body, "access_token"),
+                MiniJson.str(r.body, "refresh_token")};
+    }
+
+    /** POST /api/license/validate (no bearer) → {valid, reason, expiresEpochMsOrNull}. */
+    static String[] validate(String server, String deviceId, String token) throws Exception {
+        long idNum;
+        try {
+            idNum = Long.parseLong(deviceId.trim());
+        } catch (NumberFormatException e) {
+            throw new IOException("device_id is not numeric: " + deviceId);
+        }
+        ApiResult r = http("POST", normalize(server) + "/api/license/validate", null,
+                "{\"device_id\":" + idNum + ",\"device_token\":\"" + MiniJson.esc(token) + "\"}");
+        requireOk(r, "validate");
+        boolean valid = r.body.contains("\"valid\":true");
+        String reason = MiniJson.str(r.body, "reason");
+        String exp = MiniJson.str(r.body, "expires_at");
+        String expMs = null;
+        if (exp != null) {
+            try { expMs = Long.toString(Instant.parse(exp).toEpochMilli()); }
+            catch (Exception ignore) { }
+        }
+        return new String[]{valid ? "true" : "false", reason == null ? "" : reason, expMs};
+    }
+
+    /** GET /api/license → {expiresMs, maxPhones, maxPcs, quotaBytes, userId}. */
+    static long[] license(State st, String bearer) throws Exception {
+        ApiResult r = http(st, "GET", "/api/license", bearer, null);
+        requireOk(r, "license");
+        String exp = MiniJson.str(r.body, "expires_at");
+        long expMs = exp == null ? -1 : Instant.parse(exp).toEpochMilli();
+        return new long[]{expMs,
+                MiniJson.num(r.body, "max_phones", 2),
+                MiniJson.num(r.body, "max_pcs", 1),
+                MiniJson.num(r.body, "quota_bytes", 0),
+                MiniJson.num(r.body, "user_id", -1)};
+    }
+
+    /** GET /api/provisioning → {publicNode, networkName, networkSecret}. */
+    static String[] provisioning(State st, String bearer) throws Exception {
+        ApiResult r = http(st, "GET", "/api/provisioning", bearer, null);
+        requireOk(r, "provisioning");
+        return new String[]{MiniJson.str(r.body, "public_node"),
+                MiniJson.str(r.body, "network_name"),
+                MiniJson.str(r.body, "network_secret")};
+    }
+
+    /** GET /api/devices → rows {id, kind, name, approved, revoked}. */
+    static List<String[]> listDevices(State st, String bearer) throws Exception {
+        ApiResult r = http(st, "GET", "/api/devices", bearer, null);
+        requireOk(r, "device list");
+        List<String[]> out = new ArrayList<>();
+        for (String obj : arrayObjects(r.body, "devices")) {
+            out.add(new String[]{
+                    Long.toString(MiniJson.num(obj, "id", -1)),
+                    MiniJson.str(obj, "kind"),
+                    MiniJson.str(obj, "name"),
+                    Boolean.toString(obj.contains("\"approved\":true")),
+                    Boolean.toString(obj.contains("\"revoked\":true"))});
+        }
+        return out;
+    }
+
+    /** Split a top-level JSON array field into its object literals. */
+    static List<String> arrayObjects(String json, String key) {
+        List<String> out = new ArrayList<>();
+        int i = json.indexOf("\"" + key + "\"");
+        if (i < 0) return out;
+        i = json.indexOf('[', i);
+        if (i < 0) return out;
+        int depth = 0, start = -1;
+        boolean inStr = false, esc = false;
+        for (int j = i; j < json.length(); j++) {
+            char c = json.charAt(j);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') { if (depth == 0) start = j; depth++; }
+            if (c == '}') {
+                depth--;
+                if (depth == 0 && start >= 0) {
+                    out.add(json.substring(start, j + 1));
+                    start = -1;
+                }
+            }
+            if (c == ']' && depth == 0) break;
+        }
+        return out;
+    }
+
+    /** POST /api/devices/{id}/approve with the PC device token → response body. */
+    static String approveWithDevice(State st, String deviceId) throws Exception {
+        ApiResult r = http(st, "POST", "/api/devices/" + deviceId + "/approve",
+                st.pcDeviceToken, "");
+        if (!r.ok()) {
+            throw new IOException("approve failed: HTTP " + r.status + " " + r.body);
+        }
+        return r.body;
+    }
+
+    // ------------------------------------------------------------- flows
+
+    /**
+     * Full bootstrap: password login → (reuse or register+approve the PC
+     * device) → provisioning → save account.json → one sync. Returns the state.
+     */
+    static State loginFlow(Path dataDir, BackupReceiver.Store store, String server,
+                           String account, String password, String pubkeyB64,
+                           String pcIpOverride) throws Exception {
+        server = normalize(server);
+        String[] pair = login(server, account, password);
+        String session = pair[0];
+
+        State st = new State();
+        st.dataDir = dataDir;
+        st.server = server;
+        st.account = account;
+        st.refreshToken = pair[1];
+
+        long[] lic = license(st, session);
+        st.userId = Long.toString(lic[4]);
+
+        // Reuse a previous PC registration for this same server+account when
+        // it is still live — the license caps PCs at 1, so re-registering
+        // blindly would hit device_limit.
+        State old = load(dataDir);
+        boolean reused = false;
+        if (old != null && old.server.equals(server) && old.account.equals(account)
+                && old.pcDeviceId != null && old.pcDeviceToken != null) {
+            try {
+                for (String[] d : listDevices(old, old.pcDeviceToken)) {
+                    if (d[0].equals(old.pcDeviceId) && !"true".equals(d[4])) {
+                        st.pcDeviceId = old.pcDeviceId;
+                        st.pcDeviceToken = old.pcDeviceToken;
+                        st.pcIp = old.pcIp;
+                        reused = true;
+                        if (!"true".equals(d[3])) {
+                            http(st, "POST", "/api/devices/" + st.pcDeviceId + "/approve",
+                                    session, "");
+                        }
+                        break;
+                    }
+                }
+            } catch (Exception ignore) { /* fall through to fresh registration */ }
+        }
+        if (!reused) {
+            if (old != null && old.pcDeviceId != null && old.server.equals(server)
+                    && old.account.equals(account)) {
+                // Free the single PC slot held by our previous registration.
+                try {
+                    http(st, "POST", "/api/devices/" + old.pcDeviceId + "/revoke", session, "");
+                } catch (Exception ignore) { }
+            }
+            String hostname;
+            try {
+                hostname = InetAddress.getLocalHost().getHostName();
+            } catch (Exception e) {
+                hostname = "niubackup-pc";
+            }
+            String regBody = "{\"kind\":\"pc\",\"name\":\"" + MiniJson.esc(hostname)
+                    + "\",\"pc_pubkey\":\"" + MiniJson.esc(pubkeyB64) + "\"}";
+            ApiResult r = http(st, "POST", "/api/devices/register", session, regBody);
+            if (r.status == 409 && r.body.contains("device_limit")) {
+                // Reinstall case: a previous registration of this user still
+                // holds the single PC slot. The caller authenticated with the
+                // account password, so reclaiming the slot is legitimate:
+                // revoke the stale pc devices and retry once.
+                for (String[] d : listDevices(st, session)) {
+                    if ("pc".equals(d[1]) && !"true".equals(d[4])) {
+                        http(st, "POST", "/api/devices/" + d[0] + "/revoke", session, "");
+                    }
+                }
+                r = http(st, "POST", "/api/devices/register", session, regBody);
+            }
+            requireOk(r, "pc device register");
+            st.pcDeviceId = Long.toString(MiniJson.num(r.body, "device_id", -1));
+            st.pcDeviceToken = MiniJson.str(r.body, "device_token");
+            ApiResult ap = http(st, "POST", "/api/devices/" + st.pcDeviceId + "/approve",
+                    session, "");
+            requireOk(ap, "pc device self-approve");
+        }
+        if (pcIpOverride != null) st.pcIp = pcIpOverride;
+        if (st.pcIp == null) st.pcIp = DEFAULT_PC_IP;
+
+        String[] prov = provisioning(st, st.pcDeviceToken);
+        st.publicNode = prov[0];
+        st.networkName = prov[1];
+        st.networkSecret = prov[2];
+        st.save();
+        syncOnce(st, store);
+        return st;
+    }
+
+    /**
+     * One refresh cycle against the service: device states + license into the
+     * local store, provisioning rotation pickup. Runs on the PC device token.
+     */
+    static String syncOnce(State st, BackupReceiver.Store store) throws Exception {
+        List<String[]> devices = listDevices(st, st.pcDeviceToken);
+        int approved = 0, pending = 0;
+        for (String[] d : devices) {
+            boolean ap = "true".equals(d[3]);
+            boolean rv = "true".equals(d[4]);
+            if (ap && !rv) approved++; else if (!rv) pending++;
+            String hash = d[0].equals(st.pcDeviceId)
+                    ? Hash.hex(BackupReceiver.sha256(st.pcDeviceToken)) : null;
+            store.syncDevice(st.userId, d[0], d[2], d[1], ap, rv, hash);
+        }
+        long[] lic = license(st, st.pcDeviceToken);
+        store.upsertLicense(st.userId, lic[0], (int) lic[1], (int) lic[2]);
+        store.setMeta("quota_bytes", Long.toString(lic[3]));
+        store.setMeta("license_expires_at", Long.toString(lic[0]));
+        String[] prov = provisioning(st, st.pcDeviceToken);
+        if (prov[1] != null && (!prov[1].equals(st.networkName)
+                || !prov[2].equals(st.networkSecret) || !prov[0].equals(st.publicNode))) {
+            st.networkName = prov[1];
+            st.networkSecret = prov[2];
+            st.publicNode = prov[0];
+            st.save();
+        }
+        store.setMeta("last_sync_ok", Long.toString(System.currentTimeMillis()));
+        return "synced " + devices.size() + " devices (" + approved + " approved, "
+                + pending + " pending), license expires "
+                + (lic[0] < 0 ? "?" : new java.util.Date(lic[0]).toString())
+                + ", network " + st.networkName;
+    }
+}
+
+/**
+ * MeshSidecar — a supervised easytier-core child process joining THIS user's
+ * nb- network (M4c). The receiver writes the TOML config from the account
+ * provisioning (schema validated against easytier-core 2.6.4 --check-config:
+ * top-level identity + [network_identity] + [[peer]], `listeners = []`,
+ * `[flags] secure_mode`), then launches the core with its own RPC portal and
+ * supervises it: on exit it is relaunched (rewriting the config first, so a
+ * rotated network secret is picked up).
+ *
+ * Secure mode: the first launch tries `[flags] secure_mode = true`. If the
+ * process dies within the probe window for a non-privilege reason, it is
+ * retried once without secure mode and the fallback is logged loudly —
+ * 2.6.4 exposes no stable node public key to pin (see docs/m4b-notes.md),
+ * so product clients run on the per-network legacy keys in that case.
+ *
+ * Linux privilege note: creating the TUN device needs CAP_NET_ADMIN or
+ * root. A user-level launch fails with "tun device error / Operation not
+ * permitted"; that failure is classified separately (secure mode is NOT
+ * degraded for it). Installers must grant the capability (setcap on the
+ * sidecar binary or a root systemd unit) — see docs/m4c-notes.md.
+ */
+final class MeshSidecar {
+
+    private final Path dataDir;
+    private final AccountLink.State st;
+    private final String binOverride;
+    private final int rpcPort = 15891;
+
+    private volatile boolean stop;
+    private volatile Process proc;
+    private volatile boolean secureMode = true;
+    private volatile boolean secureFellBack;
+    private Thread supervisor;
+
+    MeshSidecar(Path dataDir, AccountLink.State st, String binOverride) {
+        this.dataDir = dataDir;
+        this.st = st;
+        this.binOverride = binOverride;
+    }
+
+    Path configFile() { return dataDir.resolve("easytier.toml"); }
+    Path logFile() { return dataDir.resolve("easytier.log"); }
+    boolean secureModeActive() { return secureMode && !secureFellBack; }
+    boolean isAlive() { return proc != null && proc.isAlive(); }
+
+    String resolveBin() {
+        List<String> candidates = new ArrayList<>();
+        if (binOverride != null) candidates.add(binOverride);
+        String env = System.getenv("NB_EASYTIER_BIN");
+        if (env != null && !env.isEmpty()) candidates.add(env);
+        try { // sibling of the jar/classes (jpackage app dir carries the sidecar here)
+            Path code = Paths.get(MeshSidecar.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI());
+            Path dir = Files.isDirectory(code) ? code : code.getParent();
+            if (dir != null) candidates.add(dir.resolve("easytier-core").toString());
+        } catch (Exception ignore) { }
+        candidates.add(dataDir.resolve("sidecar").resolve("easytier-core").toString());
+        candidates.add("easytier-core");
+        for (String c : candidates) {
+            if (c.equals("easytier-core")) {
+                if (BackupReceiver.onPath("easytier-core")) return c;
+            } else if (Files.isExecutable(Paths.get(c))) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    void writeConfig() throws IOException {
+        StringBuilder b = new StringBuilder();
+        b.append("instance_name = \"niubackup-pc\"\n");
+        b.append("hostname = \"niubackup-pc\"\n");
+        b.append("ipv4 = \"").append(st.pcIp).append("/24\"\n");
+        b.append("dhcp = false\n");
+        b.append("listeners = []\n\n");
+        b.append("[network_identity]\n");
+        b.append("network_name = \"").append(tomlEsc(st.networkName)).append("\"\n");
+        b.append("network_secret = \"").append(tomlEsc(st.networkSecret)).append("\"\n\n");
+        b.append("[[peer]]\n");
+        b.append("uri = \"").append(tomlEsc(st.publicNode)).append("\"\n");
+        if (secureMode && !secureFellBack) {
+            b.append("\n[flags]\nsecure_mode = true\n");
+        }
+        Files.writeString(configFile(), b.toString(), StandardCharsets.UTF_8);
+        try {
+            Files.setPosixFilePermissions(configFile(),
+                    PosixFilePermissions.fromString("rw-------"));
+        } catch (Exception ignore) { }
+    }
+
+    private static String tomlEsc(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private boolean launch() {
+        try {
+            writeConfig();
+            String bin = resolveBin();
+            if (bin == null) {
+                BackupReceiver.log("mesh sidecar: easytier-core binary not found "
+                        + "(set --mesh-bin or NB_EASYTIER_BIN)");
+                return false;
+            }
+            // Clear an orphaned instance of THIS config (a previous receiver
+            // process that died without stopping its child) — it would hold
+            // the TUN address and RPC portal and make this launch fail.
+            try {
+                new ProcessBuilder("pkill", "-f",
+                        "easytier-core -c " + configFile()).start().waitFor();
+                Thread.sleep(500);
+            } catch (Exception ignore) { }
+            ProcessBuilder pb = new ProcessBuilder(bin, "-c", configFile().toString(),
+                    "--rpc-portal", "127.0.0.1:" + rpcPort);
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile().toFile()));
+            proc = pb.start();
+            BackupReceiver.log("mesh sidecar started: bin=" + bin + " network="
+                    + st.networkName + " ip=" + st.pcIp + " peer=" + st.publicNode
+                    + " secure_mode=" + (secureMode && !secureFellBack)
+                    + " (log: " + logFile() + ")");
+            return true;
+        } catch (Exception e) {
+            BackupReceiver.log("mesh sidecar launch failed: " + e);
+            return false;
+        }
+    }
+
+    /** Tail of the sidecar log, for failure-cause classification. */
+    private String logTail() {
+        try {
+            if (!Files.isRegularFile(logFile())) return "";
+            byte[] all = Files.readAllBytes(logFile());
+            int from = Math.max(0, all.length - 4096);
+            return new String(all, from, all.length - from, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** Start the sidecar (with the secure-mode fallback) + supervision thread. */
+    void start() {
+        if (!launch()) return;
+        // Probe: a process that dies almost immediately gets classified by
+        // its log tail. A TUN permission failure is NOT a secure-mode
+        // failure (the sidecar needs CAP_NET_ADMIN or root — a packaging /
+        // install-time concern); only other startup deaths degrade secure
+        // mode, once.
+        try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+        if (!isAlive()) {
+            String tail = logTail();
+            if (tail.contains("tun") && tail.contains("not permitted")) {
+                BackupReceiver.log("mesh sidecar cannot create its TUN device: "
+                        + "easytier-core needs CAP_NET_ADMIN or root on Linux "
+                        + "(install-time privilege; not a secure-mode failure). "
+                        + "Supervisor keeps retrying; see " + logFile());
+            } else if (secureMode && !secureFellBack) {
+                secureFellBack = true;
+                BackupReceiver.log("mesh sidecar exited immediately with secure_mode=true; "
+                        + "retrying without secure mode (2.6.4 fallback, see docs)");
+                if (!launch()) return;
+                try { Thread.sleep(2000); } catch (InterruptedException e) { return; }
+            }
+        }
+        if (!isAlive()) {
+            BackupReceiver.log("mesh sidecar is not running after launch attempts; "
+                    + "see " + logFile());
+        }
+        supervisor = new Thread(() -> {
+            long backoffMs = 5000;
+            while (!stop) {
+                try {
+                    Thread.sleep(backoffMs);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (stop) return;
+                if (!isAlive()) {
+                    BackupReceiver.log("mesh sidecar exited; relaunching");
+                    launch();
+                    try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+                    backoffMs = isAlive() ? 5000 : Math.min(60_000, backoffMs * 2);
+                } else {
+                    backoffMs = 5000;
+                }
+            }
+        }, "mesh-sidecar");
+        supervisor.setDaemon(true);
+        supervisor.start();
+    }
+
+    void stopSidecar() {
+        stop = true;
+        if (supervisor != null) supervisor.interrupt();
+        Process p = proc;
+        if (p != null) p.destroy();
     }
 }
 

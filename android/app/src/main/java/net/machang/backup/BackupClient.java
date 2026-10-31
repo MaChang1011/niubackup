@@ -58,6 +58,16 @@ public class BackupClient {
         void log(String msg);
     }
 
+    /** Overall transfer progress (M4c file-library 「备份中 x%」 badge). */
+    public interface ProgressListener {
+        void onProgress(long sentBytes, long totalBytes, String currentPath);
+    }
+
+    /** Stats of the most recent session (for the session-log report). */
+    public volatile int lastOkCount;
+    public volatile int lastFailCount;
+    public volatile long lastBytesSent;
+
     static final int PROTO = 1;
     public static final String DEFAULT_HOST = "10.200.0.2"; // laptop, mesh address
     public static final int DEFAULT_PORT = 28741;           // BackupReceiver
@@ -96,10 +106,15 @@ public class BackupClient {
 
     /** Runs one backup session for {@code rootDir}. Returns the number of failed files. */
     public int runBackup(File rootDir) {
-        return runBackup(DEFAULT_HOST, DEFAULT_PORT, DEVICE_NAME, rootDir);
+        return runBackup(DEFAULT_HOST, DEFAULT_PORT, DEVICE_NAME, rootDir, null);
     }
 
     public int runBackup(String host, int port, String device, File rootDir) {
+        return runBackup(host, port, device, rootDir, null);
+    }
+
+    public int runBackup(String host, int port, String device, File rootDir,
+                         ProgressListener progress) {
         List<Entry> entries;
         try {
             entries = scan(rootDir);
@@ -114,7 +129,9 @@ public class BackupClient {
         }
 
         int failures = 0;
-        try (Socket s = new Socket(host, port)) {
+        Socket rawSocket = new Socket();
+        try (Socket s = rawSocket) {
+            rawSocket.connect(new java.net.InetSocketAddress(host, port), 10_000);
             s.setSoTimeout(120_000);
             InputStream in = s.getInputStream();
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
@@ -163,6 +180,13 @@ public class BackupClient {
 
             Map<String, Entry> byPath = new HashMap<>();
             for (Entry e : entries) byPath.put(e.path, e);
+            long totalBytes = 0;
+            for (Map.Entry<String, Long> w : wanted.entrySet()) {
+                Entry e = byPath.get(w.getKey());
+                if (e != null) totalBytes += e.size - w.getValue();
+            }
+            long[] sentBytes = {0};
+            int okCount = 0;
             for (Map.Entry<String, Long> w : wanted.entrySet()) {
                 Entry e = byPath.get(w.getKey());
                 long offset = w.getValue();
@@ -171,17 +195,21 @@ public class BackupClient {
                         + "\",\"bytes\":" + bytes + "}");
                 try (InputStream fis = new FileInputStream(new File(rootDir, e.path))) {
                     skipFully(fis, offset);
-                    copyN(fis, out, bytes);
+                    copyN(fis, out, bytes, progress, sentBytes, totalBytes, e.path);
                 }
                 out.flush();
                 String res = Wire.readLine(in);
                 if (res != null && res.startsWith("DONE")) {
+                    okCount++;
                     logger.log("  已发送 " + e.path + " (" + bytes + " 字节，偏移 " + offset + ")");
                 } else {
                     failures++;
                     logger.log("  失败 " + e.path + " -> " + res);
                 }
             }
+            lastOkCount = okCount + skipped;
+            lastFailCount = failures;
+            lastBytesSent = sentBytes[0];
 
             Wire.writeLine(out, "BYE");
             String receipt = Wire.readLine(in);
@@ -225,6 +253,9 @@ public class BackupClient {
             } catch (IOException e) {
                 logger.log("回执保存失败: " + e.getMessage());
             }
+            // M4c: also keep the receipt in the generalized store — but only
+            // a VERIFIED receipt may vouch for a file (§6.4 deletion gate).
+            if (valid) ReceiptStore.save(cacheDir, stored);
         }
     }
 
@@ -242,7 +273,7 @@ public class BackupClient {
         }
     }
 
-    List<Entry> scan(File root) throws IOException {
+    public List<Entry> scan(File root) throws IOException {
         // Phase 1: collect files only (cheap metadata walk; unreadable dirs
         // under scoped storage are skipped silently, as before).
         List<File> files = new ArrayList<>();
@@ -309,6 +340,23 @@ public class BackupClient {
             if (r == -1) throw new EOFException("source file shrank during send");
             out.write(buf, 0, r);
             left -= r;
+        }
+    }
+
+    /** copyN variant reporting cumulative progress (M4c badges). */
+    static void copyN(InputStream in, OutputStream out, long n, ProgressListener progress,
+                      long[] sentBytes, long totalBytes, String currentPath) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r == -1) throw new EOFException("source file shrank during send");
+            out.write(buf, 0, r);
+            left -= r;
+            sentBytes[0] += r;
+            if (progress != null) {
+                progress.onProgress(sentBytes[0], totalBytes, currentPath);
+            }
         }
     }
 

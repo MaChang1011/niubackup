@@ -69,3 +69,34 @@ java -cp out BackupSender --host ... --fs-thumb photo.jpg [--out thumb.jpg]
 
 # legacy v1 mode: omit --user/--device-id/--token
 ```
+
+## Account mode (M4c) — receiver bound to the account service
+
+```bash
+# one-time login (password moment; writes <data-dir>/account.json, mode 600)
+NB_ACCOUNT=<account> NB_PASSWORD=<password> \
+java -cp classes:$CP BackupReceiver --login \
+  --server http://10.200.0.1:18090 --data-dir ~/.niubackup
+# (or --account-user/--account-pass instead of the env vars)
+
+# serve in account mode: syncs allowlist+license from the service every
+# NB_SYNC_SECONDS (default 300; flag --sync-seconds), validates HELLOs from
+# the local cache with offline grace, and supervises the easytier sidecar
+# for the issued nb-* network (product subnet 10.99.0.0/24, PC = .2).
+# Linux: the sidecar needs CAP_NET_ADMIN (setcap the easytier-core binary)
+# or root; see docs/m4c-notes.md.
+java -cp classes:$CP BackupReceiver --account --port 28741 \
+  --target ~/NiuBackup --data-dir ~/.niubackup [--mesh-bin <easytier-core>]
+
+# operator commands (PC device-token auth; need a prior --login)
+java -cp classes:$CP BackupReceiver --devices  --data-dir ~/.niubackup
+java -cp classes:$CP BackupReceiver --approve <deviceId> --data-dir ~/.niubackup
+java -cp classes:$CP BackupReceiver --sync     --data-dir ~/.niubackup
+
+# PC operator UI / packaging entry point (same classes)
+java -cp classes:$CP NiuPcApp                 # Swing window + tray
+java -cp classes:$CP NiuPcApp --serve --account ...   # headless passthrough
+```
+
+See docs/m4c-notes.md for the account-mode design (hash learning, offline
+grace) and the E2E evidence.

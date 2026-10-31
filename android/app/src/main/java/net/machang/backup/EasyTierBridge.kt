@@ -44,9 +44,11 @@ object EasyTierBridge {
     }
 
     /** Hand the VpnService TUN fd to the running instance. Returns "" on success. */
-    fun setTunFd(fd: Int): String {
+    fun setTunFd(fd: Int): String = setTunFd(INSTANCE_NAME, fd)
+
+    fun setTunFd(instanceName: String, fd: Int): String {
         return try {
-            val r = EasyTierJNI.setTunFd(INSTANCE_NAME, fd)
+            val r = EasyTierJNI.setTunFd(instanceName, fd)
             if (r != 0) err("setTunFd", r) else ""
         } catch (t: Throwable) {
             "setTunFd 异常: ${t.message}"
@@ -122,6 +124,40 @@ object EasyTierBridge {
 
             [[peer]]
             uri = "udp://36.133.114.164:11010"
+        """.trimIndent()
+    }
+
+    const val PRODUCT_INSTANCE_NAME = "niubackup-phone"
+
+    /**
+     * M4c product config (design §8): the per-user network issued by the
+     * account service (nb-*), joined through the shared product public node.
+     * Same proven TOML schema as [buildConfig], plus secure mode — mesh
+     * traffic is encrypted and node-authenticated end to end; verified to
+     * interoperate with easytier-core 2.6.4 in the M4c headless E2E.
+     */
+    fun buildProductConfig(
+        networkName: String,
+        networkSecret: String,
+        publicNodeUri: String,
+        ipv4: String = "10.99.0.3/24"
+    ): String {
+        fun esc(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
+        return """
+            instance_name = "$PRODUCT_INSTANCE_NAME"
+            hostname = "niubackup-phone"
+            ipv4 = "$ipv4"
+            dhcp = false
+
+            [network_identity]
+            network_name = "${esc(networkName)}"
+            network_secret = "${esc(networkSecret)}"
+
+            [[peer]]
+            uri = "${esc(publicNodeUri)}"
+
+            [flags]
+            secure_mode = true
         """.trimIndent()
     }
 }

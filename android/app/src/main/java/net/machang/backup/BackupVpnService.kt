@@ -30,6 +30,16 @@ class BackupVpnService : VpnService() {
         const val ACTION_START = "net.machang.backup.action.START"
         const val ACTION_STOP = "net.machang.backup.action.STOP"
         const val EXTRA_SECRET = "mesh_secret"
+
+        // M4c generalized start: a full config + TUN parameters, used by the
+        // product (account) mode. The legacy EXTRA_SECRET path is unchanged.
+        const val EXTRA_CONFIG = "mesh_config_toml"
+        const val EXTRA_INSTANCE_NAME = "mesh_instance_name"
+        const val EXTRA_TUN_IP = "mesh_tun_ip"
+        const val EXTRA_TUN_PREFIX = "mesh_tun_prefix"
+        const val EXTRA_ROUTE_NET = "mesh_route_net"
+        const val EXTRA_ROUTE_PREFIX = "mesh_route_prefix"
+        const val EXTRA_SESSION = "mesh_session_label"
         private const val CHANNEL_ID = "mesh"
         private const val NOTIF_ID = 1
     }
@@ -37,6 +47,7 @@ class BackupVpnService : VpnService() {
     @Volatile
     private var running = false
     private var tun: ParcelFileDescriptor? = null
+    private var notifText = "EasyTier 组网运行中 (10.200.0.3)"
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -46,6 +57,24 @@ class BackupVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             else -> {
+                val fullConfig = intent?.getStringExtra(EXTRA_CONFIG)
+                if (!fullConfig.isNullOrBlank()) {
+                    if (!running) {
+                        running = true
+                        val instance = intent.getStringExtra(EXTRA_INSTANCE_NAME)
+                            ?: EasyTierBridge.PRODUCT_INSTANCE_NAME
+                        val tunIp = intent.getStringExtra(EXTRA_TUN_IP) ?: "10.99.0.3"
+                        val tunPrefix = intent.getIntExtra(EXTRA_TUN_PREFIX, 24)
+                        val routeNet = intent.getStringExtra(EXTRA_ROUTE_NET) ?: "10.99.0.0"
+                        val routePrefix = intent.getIntExtra(EXTRA_ROUTE_PREFIX, 24)
+                        val session = intent.getStringExtra(EXTRA_SESSION) ?: "niubackup"
+                        thread(name = "mesh-start") {
+                            startMesh(fullConfig, instance, tunIp, tunPrefix,
+                                routeNet, routePrefix, session)
+                        }
+                    }
+                    return START_STICKY
+                }
                 val secret = intent?.getStringExtra(EXTRA_SECRET).orEmpty()
                 if (secret.isBlank()) {
                     AppLog.log("组网密钥为空，无法启动组网")
@@ -54,18 +83,25 @@ class BackupVpnService : VpnService() {
                 }
                 if (!running) {
                     running = true
-                    thread(name = "mesh-start") { startMesh(secret) }
+                    thread(name = "mesh-start") {
+                        startMesh(
+                            EasyTierBridge.buildConfig(secret), EasyTierBridge.INSTANCE_NAME,
+                            "10.200.0.3", 24, "10.200.0.0", 24, "machang-backup"
+                        )
+                    }
                 }
                 return START_STICKY
             }
         }
     }
 
-    private fun startMesh(secret: String) {
+    private fun startMesh(
+        config: String, instanceName: String, tunIp: String, tunPrefix: Int,
+        routeNet: String, routePrefix: Int, session: String
+    ) {
         // NOTE: foreground promotion happens only after establish() below —
         // the systemExempted FGS type requires this app to already be the
         // active VPN, otherwise startForeground throws SecurityException.
-        val config = EasyTierBridge.buildConfig(secret)
         val err = EasyTierBridge.startInstance(config)
         if (err.isNotEmpty()) {
             AppLog.log(err)
@@ -74,11 +110,12 @@ class BackupVpnService : VpnService() {
             return
         }
         AppLog.log("EasyTier 实例已启动，正在建立 TUN…")
+        notifText = "EasyTier 组网运行中 ($tunIp)"
 
         val builder = Builder()
-            .setSession("machang-backup")
-            .addAddress("10.200.0.3", 24)
-            .addRoute("10.200.0.0", 24)
+            .setSession(session)
+            .addAddress(tunIp, tunPrefix)
+            .addRoute(routeNet, routePrefix)
             .setMtu(1500)
         val pfd = try {
             builder.establish()
@@ -98,7 +135,7 @@ class BackupVpnService : VpnService() {
         }
         tun = pfd
         promoteToForeground()
-        val fdErr = EasyTierBridge.setTunFd(pfd.fd)
+        val fdErr = EasyTierBridge.setTunFd(instanceName, pfd.fd)
         if (fdErr.isNotEmpty()) {
             AppLog.log(fdErr)
         } else {
@@ -164,7 +201,7 @@ class BackupVpnService : VpnService() {
         }
         val notif: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("组网备份")
-            .setContentText("EasyTier 组网运行中 (10.200.0.3)")
+            .setContentText(notifText)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {

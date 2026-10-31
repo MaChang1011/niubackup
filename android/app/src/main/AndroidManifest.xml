@@ -25,10 +25,21 @@
 
     <application
         android:allowBackup="true"
-        android:label="组网备份"
+        android:label="牛备"
         android:requestLegacyExternalStorage="true"
+        android:usesCleartextTraffic="true"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".LibraryActivity"
+            android:exported="false" />
+        <activity
+            android:name=".RecordsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="false" />
 
         <activity
             android:name=".MainActivity"

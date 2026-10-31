@@ -31,3 +31,17 @@ Recipe (vendor build.sh equivalent, run manually because the tree came from a ta
   setTunFd. If the core expects a different order, the UI log + getLastError will show it.
 - DCIM walking needs the media permissions; on Android 11+ scoped storage the walk may
   see 0 files until "all files access" is granted (the app logs a hint in that case).
+
+## M4c addendum (2026-10-31)
+
+- New dependencies (Maven Central / Google via the existing mirrors):
+  androidx.media3 1.4.1 (exoplayer + ui) for tunnel-streamed playback and
+  androidx.work:work-runtime-ktx 2.9.1 for constrained auto-backup.
+  `gradle.properties`: android.useAndroidX=true (was false in the pure-
+  framework M2/M4a app).
+- Manifest: usesCleartextTraffic=true (dev account-service endpoint is
+  plain HTTP over the mesh; production gets HTTPS), label 牛备， and the
+  Library/Records/Player activities.
+- Verified: `./gradlew assembleDebug` BUILD SUCCESSFUL;
+  app-debug.apk 21,650,801 bytes. Not installed on a device this round.
+- Feature map and dev limitations: docs/m4c-notes.md (P3).
