@@ -1,8 +1,9 @@
 // 牛备 NiuBackup desktop frontend.
-// Talks to the Java engine's loopback control API via the endpoint the
-// Rust shell hands out (invoke engine_endpoint). Media bytes are fetched
-// with the token header and shown via blob URLs (img tags cannot set
-// headers).
+// All engine control-API traffic rides the Tauri command channel
+// (invoke api_request → the Rust shell performs the loopback HTTP call):
+// the WebView's own network stack cannot reach 127.0.0.1 on this
+// platform ("Connection refused" from libsoup while the port is fine).
+// Media bytes come back base64-wrapped and are shown via blob URLs.
 "use strict";
 const { invoke } = window.__TAURI__.core;
 
@@ -55,21 +56,28 @@ function revokeBlobs() { blobUrls.forEach((u) => URL.revokeObjectURL(u)); blobUr
 
 // ------------------------------------------------------------------ API
 
+function b64Bytes(b64) {
+  const bin = atob(b64 || "");
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function b64Text(b64) {
+  return new TextDecoder("utf-8").decode(b64Bytes(b64));
+}
+
 async function api(path, opts = {}) {
-  const res = await fetch(ep.base + path, {
+  const r = await invoke("api_request", {
     method: opts.method || "GET",
-    headers: {
-      "X-Control-Token": ep.token,
-      ...(opts.body ? { "Content-Type": "application/json" } : {}),
-    },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    path,
+    body: opts.body ? opts.body : null,
   });
-  const text = await res.text();
+  const text = b64Text(r.bodyBase64);
   let json = null;
   try { json = JSON.parse(text); } catch (e) { /* byte endpoints handled elsewhere */ }
-  if (!res.ok) {
-    const err = new Error((json && (json.error || json.detail)) || ("HTTP " + res.status));
-    err.status = res.status;
+  if (r.status < 200 || r.status >= 300) {
+    const err = new Error((json && (json.error || json.detail)) || ("HTTP " + r.status));
+    err.status = r.status;
     err.body = json;
     throw err;
   }
@@ -77,9 +85,12 @@ async function api(path, opts = {}) {
 }
 
 async function apiBlob(path) {
-  const res = await fetch(ep.base + path, { headers: { "X-Control-Token": ep.token } });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  return trackBlob(URL.createObjectURL(await res.blob()));
+  const r = await invoke("api_request", { method: "GET", path, body: null });
+  if (r.status < 200 || r.status >= 300) throw new Error("HTTP " + r.status);
+  const blob = new Blob([b64Bytes(r.bodyBase64)], {
+    type: r.contentType || "application/octet-stream",
+  });
+  return trackBlob(URL.createObjectURL(blob));
 }
 
 // ------------------------------------------------------------------ views

@@ -6,10 +6,14 @@
 //! control API (127.0.0.1 + per-process token in <data-dir>/control.json,
 //! see docs/tauri-shell.md). The frontend renders the API data; the shell
 //! only owns the process lifecycle, the tray, autostart, and small
-//! OS-level helpers (open path, config persistence).
+//! OS-level helpers (open path, config persistence). The frontend never
+//! fetches the loopback port itself (the WebView network stack cannot
+//! reach it on Linux) — every API call rides the `api_request` command.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -345,8 +349,9 @@ fn shell_info(app: AppHandle) -> ShellInfo {
     }
 }
 
-#[tauri::command]
-fn engine_endpoint(state: State<ShellState>) -> Result<Endpoint, String> {
+/// The cached endpoint if the engine child is still alive; otherwise
+/// re-discover it from control.json (the engine may have been restarted).
+fn ensure_endpoint(state: &State<ShellState>) -> Result<Endpoint, String> {
     if let Some(ep) = state.endpoint.lock().unwrap().clone() {
         // Re-validate the pid binding cheaply: if the child died, drop it.
         let alive = state
@@ -361,7 +366,203 @@ fn engine_endpoint(state: State<ShellState>) -> Result<Endpoint, String> {
         }
         *state.endpoint.lock().unwrap() = None;
     }
-    wait_endpoint(&state, Duration::from_secs(3))
+    wait_endpoint(state, Duration::from_secs(3))
+}
+
+#[tauri::command]
+fn engine_endpoint(state: State<ShellState>) -> Result<Endpoint, String> {
+    ensure_endpoint(&state)
+}
+
+// ------------------------------------------------------- control API proxy
+//
+// The frontend NEVER talks to the engine's loopback port directly: on
+// this platform the WebView's network stack (libsoup inside a sandboxed
+// network process) gets "Connection refused" for 127.0.0.1 even though
+// the port is healthy for every other client. All control-API traffic
+// therefore rides the Tauri command channel instead: the frontend calls
+// invoke("api_request", …) and the shell performs the HTTP round-trip
+// itself with a plain TcpStream. The response body always crosses as
+// base64 so binary endpoints (record thumbnails / previews) work the
+// same way as JSON ones.
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body_base64: String,
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode a `Transfer-Encoding: chunked` body; non-chunked input is
+/// returned unchanged when it does not parse as chunks.
+fn dechunk(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let line_end = match find_subslice(&data[pos..], b"\r\n") {
+            Some(i) => pos + i,
+            None => return data.to_vec(),
+        };
+        let size_str = match std::str::from_utf8(&data[pos..line_end]) {
+            Ok(s) => s.trim().split(';').next().unwrap_or(""),
+            Err(_) => return data.to_vec(),
+        };
+        let size = match usize::from_str_radix(size_str, 16) {
+            Ok(n) => n,
+            Err(_) => return data.to_vec(),
+        };
+        let start = line_end + 2;
+        if size == 0 {
+            return out;
+        }
+        if start + size > data.len() {
+            return data.to_vec();
+        }
+        out.extend_from_slice(&data[start..start + size]);
+        pos = start + size + 2; // skip trailing CRLF
+    }
+    out
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// One blocking HTTP/1.1 round-trip to the engine control API using only
+/// the standard library (no new crates — the build sandbox's registry
+/// access is fragile, and this surface is tiny).
+fn http_request(
+    ep: &Endpoint,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse, String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
+        .map_err(|e| format!("engine connect failed (port {}): {}", ep.port, e))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .map_err(|e| e.to_string())?;
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nx-control-token: {}\r\nconnection: close\r\n",
+        method, path, ep.port, ep.token
+    );
+    if let Some(b) = body {
+        req.push_str(&format!(
+            "content-type: application/json\r\ncontent-length: {}\r\n",
+            b.len()
+        ));
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("engine write failed: {}", e))?;
+    if let Some(b) = body {
+        stream
+            .write_all(b.as_bytes())
+            .map_err(|e| format!("engine write failed: {}", e))?;
+    }
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("engine read failed: {}", e))?;
+    let split = find_subslice(&raw, b"\r\n\r\n")
+        .ok_or_else(|| "engine response malformed (no header terminator)".to_string())?;
+    let head = std::str::from_utf8(&raw[..split])
+        .map_err(|_| "engine response head not utf8".to_string())?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("engine response malformed (status line {:?})", status_line))?;
+    let mut content_type = String::new();
+    let mut chunked = false;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-type" {
+                content_type = value;
+            } else if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
+            }
+        }
+    }
+    let body_bytes = &raw[split + 4..];
+    let body_bytes = if chunked {
+        dechunk(body_bytes)
+    } else {
+        body_bytes.to_vec()
+    };
+    Ok(ApiResponse {
+        status,
+        content_type,
+        body_base64: base64_encode(&body_bytes),
+    })
+}
+
+/// Frontend → engine control-API call over the Tauri channel. HTTP error
+/// statuses are NOT command errors: they return as a normal ApiResponse
+/// so the frontend keeps its existing status/body error handling. Only
+/// transport failures (engine down, bad response) reject the promise.
+#[tauri::command]
+async fn api_request(
+    state: State<'_, ShellState>,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<ApiResponse, String> {
+    let m = method.to_ascii_uppercase();
+    if m != "GET" && m != "POST" {
+        return Err(format!("unsupported method {}", method));
+    }
+    if !path.starts_with('/') {
+        return Err(format!("path must start with /: {}", path));
+    }
+    let ep = ensure_endpoint(&state)?;
+    let body_text = body.map(|v| v.to_string());
+    let (m2, p2) = (m.clone(), path.clone());
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        http_request(&ep, &m2, &p2, body_text.as_deref())
+    })
+    .await
+    .map_err(|e| format!("api task join failed: {}", e))?;
+    match &res {
+        Ok(r) => eprintln!("api {} {} -> {}", m, path, r.status),
+        Err(e) => eprintln!("api {} {} -> transport error: {}", m, path, e),
+    }
+    res
 }
 
 #[tauri::command]
@@ -457,11 +658,19 @@ pub fn run() {
     };
     tauri::Builder::default()
         .manage(state)
+        .on_page_load(|_webview, payload| {
+            eprintln!(
+                "page_load {:?} {}",
+                payload.event(),
+                payload.url()
+            );
+        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_shell_config,
             shell_info,
             engine_endpoint,
+            api_request,
             restart_engine,
             open_path,
             set_autostart,
@@ -482,6 +691,29 @@ pub fn run() {
                     eprintln!("engine spawn failed: {}", e);
                 }
             });
+
+            // Opt-in page diagnostic (NB_DESKTOP_DEBUG=1): log the
+            // webview's current URL and whether eval() reaches the page
+            // at all — settles "did the frontend even load" without a
+            // debugger.
+            if std::env::var("NB_DESKTOP_DEBUG").is_ok() {
+                let h3 = handle.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    if let Some(w) = h3.get_webview_window("main") {
+                        match w.url() {
+                            Ok(u) => eprintln!("diag webview url: {}", u),
+                            Err(e) => eprintln!("diag webview url err: {}", e),
+                        }
+                        let r = w.eval("document.title = 'DIAGSET ' + Date.now()");
+                        eprintln!("diag eval -> {:?}", r);
+                        std::thread::sleep(Duration::from_millis(400));
+                        if let Ok(t) = w.title() {
+                            eprintln!("diag window title: {}", t.replace('\n', " "));
+                        }
+                    }
+                });
+            }
 
             // Tray: status + 打开/退出.
             let open_item = MenuItem::with_id(app, "open", "打开牛备", true, None::<&str>)?;
