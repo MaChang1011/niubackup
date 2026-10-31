@@ -268,7 +268,7 @@ async function pollQrTicket() {
     try {
       ep = await invoke("restart_engine");
     } catch (e) { /* waitForAccount surfaces the failure */ }
-    await waitForAccount();
+    await waitForAccount(true);
   } else if (r.status === "scanned") {
     $("qrStatus").textContent = "已扫码，请在手机上确认";
   } else if (r.status === "expired" || r.status === "consumed" || r.status === "cancelled") {
@@ -304,7 +304,7 @@ $("loginCard").addEventListener("submit", async (ev) => {
     toast("登录成功，正在以新身份重启引擎…");
     ep = await invoke("restart_engine");
     $("loginPassword").value = "";
-    await waitForAccount();
+    await waitForAccount(false);
   } catch (e) {
     $("loginErr").textContent = loginErrorText(e);
   } finally {
@@ -323,7 +323,7 @@ function loginErrorText(e) {
   return "登录失败：" + (e.message || e);
 }
 
-async function waitForAccount() {
+async function waitForAccount(fromQr) {
   for (let i = 0; i < 40; i++) {
     try {
       status = await api("/status");
@@ -335,9 +335,15 @@ async function waitForAccount() {
     } catch (e) { /* engine still restarting */ }
     await new Promise((r) => setTimeout(r, 1200));
   }
-  $("loginErr").textContent = "引擎已重启，但仍未读到登录状态，请再试一次";
   show("login");
-  switchLoginTab("qr");
+  if (fromQr) {
+    switchLoginTab("qr");
+    $("qrStatus").textContent = "引擎已重启，但仍未读到登录状态，请刷新二维码重试";
+  } else {
+    // Back to the password tab so the error below is actually visible.
+    switchLoginTab("pwd");
+    $("loginErr").textContent = "引擎已重启，但仍未读到登录状态，请再试一次";
+  }
 }
 
 async function doLogout() {
