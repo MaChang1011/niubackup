@@ -3087,6 +3087,7 @@ final class ControlApi {
         } else {
             long exp = r.store.licenseExpiresAt(r.acct.userId);
             String quota = r.store.getMeta("quota_bytes");
+            Long[] disk = diskSpace(r.targetRoot);
             b.append(",\"account\":{\"account\":\"").append(MiniJson.esc(r.acct.account))
              .append("\",\"user_id\":\"").append(MiniJson.esc(r.acct.userId))
              .append("\",\"server\":\"").append(MiniJson.esc(r.acct.server))
@@ -3097,11 +3098,32 @@ final class ControlApi {
              .append(",\"license_expires_at\":").append(exp < 0 ? "null" : Long.toString(exp))
              .append(",\"storage\":{\"used_bytes\":").append(r.store.filesBytesTotal(r.acct.userId))
              .append(",\"quota_bytes\":").append(quota == null ? "null" : quota)
-             .append(",\"files\":").append(r.store.countFiles(r.acct.userId)).append('}')
+             .append(",\"files\":").append(r.store.countFiles(r.acct.userId))
+             .append(",\"disk_total_bytes\":").append(disk == null ? "null" : Long.toString(disk[0]))
+             .append(",\"disk_free_bytes\":").append(disk == null ? "null" : Long.toString(disk[1]))
+             .append('}')
              .append(",\"last_sync_ok_ms\":").append(r.lastSyncOkMs);
         }
         b.append(",\"server_time_ms\":").append(System.currentTimeMillis()).append('}');
         sendJson(ex, 200, b.toString());
+    }
+
+    /**
+     * {total, usable} bytes of the volume holding p, or null when the
+     * volume cannot be read — the desktop storage page is disk-based
+     * (the license quota is gone: open-source/perpetual), so /status
+     * reports real capacity and the UI never has to invent numbers.
+     */
+    private static Long[] diskSpace(Path p) {
+        try {
+            Path q = p;
+            while (q != null && !Files.exists(q)) q = q.getParent();
+            if (q == null) return null;
+            FileStore fs = Files.getFileStore(q);
+            return new Long[]{fs.getTotalSpace(), fs.getUsableSpace()};
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** Best-effort peer view from the sidecar's easytier-cli RPC portal. */

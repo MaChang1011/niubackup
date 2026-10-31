@@ -433,11 +433,16 @@ async function renderOverview() {
       (status.last_sync_ok_ms ? `\n上次同步 ${fmtDay(status.last_sync_ok_ms)}` : "");
   }
   const st = status.storage || {};
-  const pct = st.quota_bytes ? Math.min(100, (st.used_bytes / st.quota_bytes) * 100) : 0;
+  // Disk-based bar (quota abolished with the license): full = the
+  // volume's total capacity, fill = the volume's used fraction.
+  const hasDisk = typeof st.disk_total_bytes === "number" && st.disk_total_bytes > 0;
+  const diskUsed = hasDisk ? st.disk_total_bytes - (st.disk_free_bytes || 0) : 0;
+  const pct = hasDisk ? Math.min(100, (diskUsed / st.disk_total_bytes) * 100) : 0;
   $("ovBarFill").style.width = pct.toFixed(1) + "%";
   $("ovBarFill").classList.toggle("hot", pct >= 90);
-  $("ovStorageSub").textContent =
-    `已用 ${humanBytes(st.used_bytes)}${st.quota_bytes ? " / 配额 " + humanBytes(st.quota_bytes) : ""} · 共 ${st.files || 0} 个文件`;
+  $("ovStorageSub").textContent = hasDisk
+    ? `备份占用 ${humanBytes(st.used_bytes)} · 磁盘可用 ${humanBytes(st.disk_free_bytes)} / 总容量 ${humanBytes(st.disk_total_bytes)} · 共 ${st.files || 0} 个文件`
+    : `备份占用 ${humanBytes(st.used_bytes)} · 共 ${st.files || 0} 个文件`;
   // Auto-join notice (design v1.4): informational only, dismissible for
   // the session — there is no approval queue anymore.
   $("autoJoinBanner").hidden = bannerDismissed;
@@ -500,13 +505,22 @@ $("devRefresh").addEventListener("click", renderDevices);
 function renderStorage() {
   if (!status) return;
   const st = status.storage || {};
-  const pct = st.quota_bytes ? Math.min(100, (st.used_bytes / st.quota_bytes) * 100) : 0;
+  // Disk-based (quota abolished with the license): the bar's full
+  // scale is the volume's total capacity. 备份记录占用 (what the
+  // record store accounts for) and 磁盘已用 (the whole volume,
+  // including anything outside the backup records) are different
+  // numbers — keep them as separate, labelled rows.
+  const hasDisk = typeof st.disk_total_bytes === "number" && st.disk_total_bytes > 0;
+  const diskUsed = hasDisk ? st.disk_total_bytes - (st.disk_free_bytes || 0) : null;
+  const pct = hasDisk ? Math.min(100, (diskUsed / st.disk_total_bytes) * 100) : 0;
   $("stBarFill").style.width = pct.toFixed(1) + "%";
   $("stBarFill").classList.toggle("hot", pct >= 90);
   $("stKv").innerHTML = `
-    <dt>已用空间</dt><dd>${humanBytes(st.used_bytes)}</dd>
-    <dt>配额</dt><dd>${st.quota_bytes ? humanBytes(st.quota_bytes) : "不限（开源免费）"}</dd>
+    <dt>备份记录占用</dt><dd>${humanBytes(st.used_bytes)}</dd>
     <dt>已备份文件</dt><dd>${st.files || 0} 个</dd>
+    <dt>磁盘总容量</dt><dd>${hasDisk ? humanBytes(st.disk_total_bytes) : "未知"}</dd>
+    <dt>磁盘已用</dt><dd>${hasDisk ? humanBytes(diskUsed) : "未知"}</dd>
+    <dt>磁盘可用</dt><dd>${hasDisk ? humanBytes(st.disk_free_bytes) : "未知"}</dd>
     <dt>存储目录</dt><dd>${esc(status.receiver.target_dir || "")}</dd>
     <dt>数据目录</dt><dd>${esc(status.receiver.data_dir || "")}</dd>`;
 }
