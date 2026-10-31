@@ -79,6 +79,12 @@ public class AdminController {
         return ResponseEntity.ok(Util.body("devices", rows));
     }
 
+    /**
+     * Renew is retained for API compatibility but is a NO-OP: licenses are
+     * perpetual since 2026-10-31 (the product is open-source and free), so
+     * there is no expiry left to extend. The call still succeeds and is
+     * audited, but changes no data.
+     */
     @PostMapping("/users/{id}/license")
     public ResponseEntity<?> renewLicense(HttpServletRequest http, @PathVariable("id") long userId,
                                           @RequestBody Map<String, Object> req) {
@@ -92,13 +98,12 @@ public class AdminController {
         if (rows.isEmpty()) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Util.error("user_not_found"));
         }
-        Timestamp before = (Timestamp) rows.get(0).get("expires_at");
-        jdbc.update("UPDATE licenses SET expires_at = GREATEST(expires_at, now()) + (? * INTERVAL '1 day') WHERE user_id=?",
-                days, userId);
-        Timestamp after = jdbc.queryForObject("SELECT expires_at FROM licenses WHERE user_id=?", Timestamp.class, userId);
+        Timestamp current = (Timestamp) rows.get(0).get("expires_at");
         audit(admin, "license_renew", "user:" + userId,
-                "days=" + days + " expires " + before.toInstant() + " -> " + after.toInstant());
-        return ResponseEntity.ok(Util.body("user_id", userId, "expires_at", after.toInstant().toString()));
+                "no-op: licenses are perpetual (open-source free); days=" + days + " ignored");
+        return ResponseEntity.ok(Util.body("user_id", userId,
+                "expires_at", current == null ? null : current.toInstant().toString(),
+                "perpetual", true));
     }
 
     @PostMapping("/users/{id}/disable")

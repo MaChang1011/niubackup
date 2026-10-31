@@ -312,8 +312,13 @@ async function renderOverview() {
   }
   if (status.account) {
     $("ovAccount").textContent = status.account.account;
+    const licExp = status.license_expires_at;
     $("ovAccountSub").textContent =
-      `授权到期 ${fmtTime(status.license_expires_at)}` +
+      // null or beyond year 2100 = the perpetual sentinel (no expiry since
+      // 2026-10-31; the product is open-source and free)
+      (licExp && licExp < 4102444800000
+        ? `授权到期 ${fmtTime(licExp)}`
+        : "授权 永久（开源免费）") +
       (status.last_sync_ok_ms ? `\n上次同步 ${fmtDay(status.last_sync_ok_ms)}` : "");
   }
   const st = status.storage || {};

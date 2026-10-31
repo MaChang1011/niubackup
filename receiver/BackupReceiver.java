@@ -638,11 +638,9 @@ public class BackupReceiver {
             auth.device = dev;
         }
 
-        long expires = store.licenseExpiresAt(auth.userId);
-        if (expires < 0 || expires < System.currentTimeMillis()) {
-            log("license expired/absent for user=" + auth.userId);
-            return "LICENSE_EXPIRED";
-        }
+        // No license-expiry gate: licenses are perpetual since 2026-10-31
+        // (the product is open-source/free). Identity, approval and
+        // revocation checks above still apply unchanged.
 
         // Direct-only gate (§5.5): client declaration first, then our own view.
         String relayWhy = null;
@@ -714,7 +712,7 @@ public class BackupReceiver {
         }
         if (!"true".equals(v[0])) {
             log("auth fail (server validate: " + v[1] + ") device=" + auth.deviceId);
-            return "license_expired".equals(v[1]) ? "LICENSE_EXPIRED" : "AUTH";
+            return "AUTH";
         }
         // Learn the device + hash so future sessions validate offline.
         store.syncDevice(auth.userId, auth.deviceId,
@@ -2506,8 +2504,10 @@ final class AccountLink {
         }
         store.setMeta("last_sync_ok", Long.toString(System.currentTimeMillis()));
         return "synced " + devices.size() + " devices (" + approved + " approved, "
-                + pending + " pending), license expires "
-                + (lic[0] < 0 ? "?" : new java.util.Date(lic[0]).toString())
+                + pending + " pending), "
+                + (lic[0] < 0 || lic[0] > 4_102_444_800_000L // <0 = none on file; >2100 = perpetual sentinel
+                        ? "license perpetual"
+                        : "license expires " + new java.util.Date(lic[0]).toString())
                 + ", network " + st.networkName;
     }
 }

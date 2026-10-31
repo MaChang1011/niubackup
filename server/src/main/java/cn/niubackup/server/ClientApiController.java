@@ -110,14 +110,9 @@ public class ClientApiController {
             return ResponseEntity.ok(Util.body("valid", false, "reason", "user_disabled"));
         }
         Map<String, Object> lic = jdbc.queryForMap("SELECT * FROM licenses WHERE user_id=?", userId);
-        Instant now = Instant.now();
-        if (now.isBefore(((Timestamp) lic.get("starts_at")).toInstant())) {
-            return ResponseEntity.ok(Util.body("valid", false, "reason", "license_not_started"));
-        }
-        if (now.isAfter(((Timestamp) lic.get("expires_at")).toInstant())) {
-            return ResponseEntity.ok(Util.body("valid", false, "reason", "license_expired",
-                    "expires_at", ts(lic.get("expires_at"))));
-        }
+        // No expiry gate: licenses are perpetual (open-source free, decided
+        // 2026-10-31). expires_at is reported for information only and is
+        // never compared against the clock.
         return ResponseEntity.ok(Util.body("valid", true, "reason", "ok",
                 "expires_at", ts(lic.get("expires_at"))));
     }
@@ -152,10 +147,9 @@ public class ClientApiController {
     }
 
     private boolean licenseCurrentlyValid(long userId, Map<String, Object> lic) {
-        if (!auth.userActive(userId)) return false;
-        Instant now = Instant.now();
-        return !now.isBefore(((Timestamp) lic.get("starts_at")).toInstant())
-                && !now.isAfter(((Timestamp) lic.get("expires_at")).toInstant());
+        // Perpetual licensing (2026-10-31): a license is valid while the
+        // account is active; expiry no longer exists as a concept.
+        return auth.userActive(userId);
     }
 
     private static String ts(Object o) {

@@ -19,16 +19,23 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Account lifecycle: register (with 14-day trial license + per-user mesh
+ * Account lifecycle: register (with a perpetual license + per-user mesh
  * network), login, refresh (rotating), logout. Access/refresh tokens are
  * opaque random strings; only their SHA-256 hashes are stored (§13.7).
+ *
+ * Licensing has no expiry: the product is open-source and free (decided
+ * 2026-10-31, cancelling the original 14-day trial). expires_at is written
+ * as a far-future sentinel so every client/receiver version treats the
+ * license as valid forever; account disable, device revocation and device
+ * caps remain enforced.
  */
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
 
-    private static final long TRIAL_DAYS = 14;
-    private static final long TRIAL_QUOTA_BYTES = 1L << 40; // 1 TiB trial quota
+    /** Sentinel for "no expiry": licenses are perpetual (see class docs). */
+    private static final Instant PERPETUAL_EXPIRY = Instant.parse("9999-12-31T00:00:00Z");
+    private static final long DEFAULT_QUOTA_BYTES = 1L << 40; // 1 TiB default quota
 
     private final JdbcTemplate jdbc;
     private final BCryptPasswordEncoder encoder;
@@ -60,8 +67,8 @@ public class AuthController {
 
         Instant now = Instant.now();
         jdbc.update("INSERT INTO licenses(user_id, starts_at, expires_at, max_phones, max_pcs, quota_bytes) VALUES (?,?,?,?,?,?)",
-                userId, Timestamp.from(now), Timestamp.from(now.plus(TRIAL_DAYS, ChronoUnit.DAYS)),
-                2, 1, TRIAL_QUOTA_BYTES);
+                userId, Timestamp.from(now), Timestamp.from(PERPETUAL_EXPIRY),
+                2, 1, DEFAULT_QUOTA_BYTES);
         // Per-user mesh network (design §4: one network per household).
         String networkName = "nb-" + userId + "-" + Util.randSuffix(8);
         jdbc.update("INSERT INTO networks(user_id, network_name, network_secret) VALUES (?,?,?)",
