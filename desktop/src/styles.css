@@ -1,3 +1,10 @@
+/* The hidden attribute must always win. .boot/.login-wrap/.layout carry
+   author-level display:flex, which overrides the UA stylesheet's
+   [hidden]{display:none} — without this rule every view stays laid out at
+   height:100% stacked down the page, the boot view fills the window
+   forever, and show() in app.js appears to do nothing. */
+[hidden] { display: none !important; }
+
 /* 牛备 NiuBackup desktop — design v1.1, polish pass v1.2
    Palette: deep teal-blue primary #0E6B7E (dark band #0A4757), bull-orange
    accent #F28C28. Status: 已备份 green / 备份中 blue / 等待直连 amber / 仅PC有 slate.
