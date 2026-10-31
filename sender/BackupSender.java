@@ -293,8 +293,12 @@ public class BackupSender {
         catch (Exception e) { throw new IllegalStateException(e); }
     }
 
-    // ---------------------------------------------------------------- scan (M3.5, unchanged)
+    // ---------------------------------------------------------------- scan (M3.5)
 
+    // Per-file tolerance (2026-10-31, mirrored from the Android client): a
+    // file that cannot be stat'ed / opened / read (unreadable entry, file
+    // deleted mid-scan) is SKIPPED and counted instead of aborting the
+    // whole scan. Skipped files are simply absent from the manifest.
     static List<Entry> scan(Path root) throws IOException {
         List<Path> files = new ArrayList<>();
         try (Stream<Path> walk = Files.walk(root)) {
@@ -305,23 +309,39 @@ public class BackupSender {
         }
         HashCache cache = HashCache.load(root.resolve(HashCache.FILE_NAME));
         List<Entry> list = new ArrayList<>(files.size());
-        int total = files.size(), done = 0;
+        int total = files.size(), done = 0, skippedCount = 0;
         for (Path p : files) {
-            Entry e = new Entry();
-            e.path = root.relativize(p).toString().replace(File.separatorChar, '/');
-            e.size = Files.size(p);
-            e.mtime = Files.getLastModifiedTime(p).toMillis();
-            e.sha = cache.sha256(e.path, p, e.size, e.mtime);
-            list.add(e);
+            String rel = root.relativize(p).toString().replace(File.separatorChar, '/');
+            try {
+                Entry e = new Entry();
+                e.path = rel;
+                e.size = Files.size(p);
+                e.mtime = Files.getLastModifiedTime(p).toMillis();
+                e.sha = cache.sha256(e.path, p, e.size, e.mtime);
+                list.add(e);
+            } catch (Exception ex) { // per-file stat/open/read failure -> skip
+                skippedCount++;
+                System.out.println("  skipped unreadable file: " + rel
+                        + " (" + ex.getMessage() + ")");
+            }
             done++;
             if (done % 200 == 0 || done == total) {
                 System.out.println("  hash progress: " + done + "/" + total
                         + ", hashed " + cache.hashedCount() + ", cache hits " + cache.hitCount());
             }
         }
-        cache.persistIfDirty();
+        try {
+            cache.persistIfDirty();
+        } catch (IOException ex) {
+            // Bookkeeping only — the in-memory hashes are unaffected.
+            System.out.println("hash cache persist failed (backup continues): "
+                    + ex.getMessage());
+        }
         System.out.println("hash cache: " + cache.hitCount() + " hits, "
                 + cache.hashedCount() + " newly hashed (" + cache.file() + ")");
+        if (skippedCount > 0) {
+            System.out.println("scan skipped " + skippedCount + " unreadable file(s)");
+        }
         return list;
     }
 
@@ -409,7 +429,12 @@ final class HashCache {
         entries.put(relPath, new String[]{Long.toString(size), Long.toString(mtime), sha});
         hashed++;
         dirty = true;
-        if (hashed % FLUSH_EVERY == 0) persist();
+        if (hashed % FLUSH_EVERY == 0) {
+            // A cache-write hiccup must not be attributed to the file just
+            // hashed (the scan loop skips any file whose sha256() throws).
+            // dirty stays set, so the flush is retried on a later round.
+            try { persist(); } catch (IOException ignore) { /* retried later */ }
+        }
         return sha;
     }
 

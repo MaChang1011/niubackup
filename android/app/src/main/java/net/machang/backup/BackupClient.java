@@ -41,6 +41,13 @@ import java.util.function.IntSupplier;
  * metadata-only, and a first hash interrupted halfway resumes where it
  * stopped. The wire protocol is unchanged (v1).
  *
+ * Hotfix (2026-10-31): the scan tolerates per-file failures. A file that
+ * cannot be stat'ed / opened / read — ColorOS {@code .trashed-*} entries
+ * are the proven case (EACCES on open), as are files deleted mid-scan —
+ * is skipped and counted in {@link #lastSkippedCount} instead of aborting
+ * the whole session before it even connects. Skipped files are simply
+ * absent from the manifest (no record, no receipt implications).
+ *
  * M4a (protocol v2): when user_id / device_id / device token are configured,
  * the client speaks protocol v2 — HELLO carries the identity plus the
  * EasyTier route cost to the PC (1 = p2p direct, &gt;=2 relay, -1 unknown;
@@ -67,6 +74,8 @@ public class BackupClient {
     public volatile int lastOkCount;
     public volatile int lastFailCount;
     public volatile long lastBytesSent;
+    /** Files the most recent scan skipped as unreadable (see class doc). */
+    public volatile int lastSkippedCount;
 
     static final int PROTO = 1;
     public static final String DEFAULT_HOST = "10.200.0.2"; // laptop, mesh address
@@ -123,6 +132,9 @@ public class BackupClient {
             return 1;
         }
         logger.log("已扫描 " + entries.size() + " 个文件 (" + rootDir.getAbsolutePath() + ")");
+        if (lastSkippedCount > 0) {
+            logger.log("已跳过 " + lastSkippedCount + " 个无法读取的文件（逐条见上方扫描日志）");
+        }
         if (entries.isEmpty()) {
             logger.log("没有可备份的文件。若 DCIM 里明明有照片，请到系统设置给本应用「所有文件访问」权限后再试。");
             return 0;
@@ -221,7 +233,9 @@ public class BackupClient {
             logger.log("连接/传输失败: " + e.getMessage());
             return Math.max(failures, 1);
         }
-        logger.log(failures == 0 ? "全部文件已就位 ✔" : failures + " 个文件失败");
+        String tail = lastSkippedCount > 0
+                ? "，另跳过 " + lastSkippedCount + " 个无法读取的文件" : "";
+        logger.log((failures == 0 ? "全部文件已就位 ✔" : failures + " 个文件失败") + tail);
         return failures;
     }
 
@@ -274,12 +288,18 @@ public class BackupClient {
     }
 
     public List<Entry> scan(File root) throws IOException {
+        lastSkippedCount = 0;
+        List<String> skipped = new ArrayList<>();
         // Phase 1: collect files only (cheap metadata walk; unreadable dirs
         // under scoped storage are skipped silently, as before).
         List<File> files = new ArrayList<>();
         collectFiles(root, files);
         Collections.sort(files, (a, b) -> relPath(root, a).compareTo(relPath(root, b)));
         // Phase 2: hash only what the persistent cache cannot vouch for.
+        // Per-file failures land here: stat/open/read of ONE file (an
+        // EACCES .trashed-* entry, a file deleted after the walk) skips
+        // just that file — it must never abort the whole scan/session.
+        // Only scan-level failures (the root itself, the cache load) throw.
         File cacheFile = cacheDir != null
                 ? new File(cacheDir, HashCache.FILE_NAME)
                 : new File(root, HashCache.FILE_NAME);
@@ -287,20 +307,37 @@ public class BackupClient {
         List<Entry> list = new ArrayList<>(files.size());
         int total = files.size(), done = 0;
         for (File f : files) {
-            Entry e = new Entry();
-            e.path = relPath(root, f);
-            e.size = f.length();
-            e.mtime = f.lastModified();
-            e.sha = cache.sha256(e.path, f, e.size, e.mtime);
-            list.add(e);
+            String path = relPath(root, f);
+            try {
+                Entry e = new Entry();
+                e.path = path;
+                e.size = f.length();
+                e.mtime = f.lastModified();
+                e.sha = cache.sha256(e.path, f, e.size, e.mtime);
+                list.add(e);
+            } catch (Exception ex) { // per-file stat/open/read failure -> skip
+                skipped.add(path);
+                logger.log("跳过无法读取的文件: " + path + " (" + ex.getMessage() + ")");
+            }
             done++;
             if (done % 200 == 0 || done == total) {
                 logger.log("哈希进度: " + done + "/" + total
                         + "，新算 " + cache.hashedCount() + "，命中缓存 " + cache.hitCount());
             }
         }
-        cache.persistIfDirty();
+        try {
+            cache.persistIfDirty();
+        } catch (IOException e) {
+            // Cache persistence is bookkeeping: the hashes are all computed
+            // in memory already, so losing the flush must not fail the scan.
+            logger.log("哈希缓存保存失败（不影响本次备份）: " + e.getMessage());
+        }
         logger.log("哈希缓存: 命中 " + cache.hitCount() + "，新算 " + cache.hashedCount());
+        lastSkippedCount = skipped.size();
+        if (!skipped.isEmpty()) {
+            logger.log("扫描完成: " + list.size() + " 个文件可备份，已跳过 "
+                    + skipped.size() + " 个无法读取的文件");
+        }
         return list;
     }
 
@@ -312,11 +349,14 @@ public class BackupClient {
         File[] kids = dir.listFiles();
         if (kids == null) return; // unreadable (scoped storage) — skip silently
         for (File f : kids) {
-            if (f.isDirectory()) {
-                collectFiles(f, out);
-            } else if (f.isFile()) {
-                out.add(f);
-            }
+            // A single pathological entry must never abort the walk.
+            try {
+                if (f.isDirectory()) {
+                    collectFiles(f, out);
+                } else if (f.isFile()) {
+                    out.add(f);
+                }
+            } catch (Exception ignore) { /* skip this entry/subtree */ }
         }
     }
 
@@ -413,7 +453,12 @@ final class HashCache {
         entries.put(relPath, new String[]{Long.toString(size), Long.toString(mtime), sha});
         hashed++;
         dirty = true;
-        if (hashed % FLUSH_EVERY == 0) persist();
+        if (hashed % FLUSH_EVERY == 0) {
+            // A cache-write hiccup must not be attributed to the file just
+            // hashed (the scan loop skips any file whose sha256() throws).
+            // dirty stays set, so the flush is retried on a later round.
+            try { persist(); } catch (IOException ignore) { /* retried later */ }
+        }
         return sha;
     }
 

@@ -347,6 +347,7 @@ class MainActivity : Activity() {
                 append(SimpleDateFormat("HH:mm", Locale.US).format(Date()))
                 append(" · 成功 ${client.lastOkCount} 个 · ${fmtBytes(client.lastBytesSent)}")
                 if (failures > 0) append(" · 失败 $failures 个")
+                if (client.lastSkippedCount > 0) append(" · 跳过 ${client.lastSkippedCount} 个无法读取")
             }
             prefs().edit().putString(KEY_LAST_SESSION, summary).apply()
             if (identity != null && PcConn.isAccountMode(this)) {
